@@ -1,0 +1,10 @@
+train:
+  exp_name: i2_01_cross_attention
+
+model:
+  fusion_mode: cross_attention
+
+loss:
+  temporal_proto_current_weight: 0.005
+  temporal_proto_future_weight: 0.0
+  temporal_risk_calibration_weight: 0.10

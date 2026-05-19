@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -m py_compile \"fusion\\\\mm_dataset.py\" \"fusion\\\\train.py\" \"fusion\\\\complementarity.py\")",
+      "PowerShell(py -3 -m py_compile \"fusion\\\\mm_dataset.py\" \"fusion\\\\train.py\" \"fusion\\\\complementarity.py\")",
+      "WebSearch",
+      "WebFetch(domain:scholar.google.com)",
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"d:\\\\code\\\\detection\\\\config\\\\final\")"
+    ]
+  }
+}

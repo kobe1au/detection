@@ -1,0 +1,8 @@
+train:
+  exp_name: i1_02_proto_current_010
+
+model:
+  fusion_mode: concat
+
+loss:
+  temporal_proto_current_weight: 0.10

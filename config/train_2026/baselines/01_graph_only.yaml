@@ -1,0 +1,5 @@
+train:
+  exp_name: b_01_graph_only
+
+model:
+  fusion_mode: graph

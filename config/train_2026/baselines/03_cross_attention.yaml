@@ -1,0 +1,5 @@
+train:
+  exp_name: b_03_cross_attention
+
+model:
+  fusion_mode: cross_attention

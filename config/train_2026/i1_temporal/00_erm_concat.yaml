@@ -1,0 +1,5 @@
+train:
+  exp_name: i1_00_erm_concat
+
+model:
+  fusion_mode: concat

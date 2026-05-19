@@ -1,0 +1,19 @@
+train:
+  exp_name: i3_00_fixed_no_gate
+
+model:
+  fusion_mode: ours
+  alignment:
+    enabled: true
+    adaptive_bias: true
+    drift_guided: true
+    bonus_scale: 1.0
+    context_scale: 0.35
+  gate:
+    mode: fixed
+
+loss:
+  temporal_proto_current_weight: 0.005
+  temporal_proto_future_weight: 0.0
+  temporal_risk_calibration_weight: 0.10
+  semantic_alignment_weight: 0.03

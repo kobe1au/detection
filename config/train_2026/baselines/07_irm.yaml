@@ -1,0 +1,8 @@
+train:
+  exp_name: b_07_irm
+
+model:
+  fusion_mode: concat
+
+loss:
+  irm_weight: 0.10

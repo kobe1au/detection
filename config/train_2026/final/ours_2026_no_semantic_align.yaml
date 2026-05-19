@@ -1,0 +1,21 @@
+train:
+  exp_name: final_no_semantic_align
+
+model:
+  fusion_mode: ours
+  alignment:
+    enabled: false
+    adaptive_bias: false
+    drift_guided: true
+    bonus_scale: 0.0
+    context_scale: 0.0
+  gate:
+    mode: learned
+    quality_inputs: true
+    drift_inputs: true
+
+loss:
+  temporal_proto_current_weight: 0.005
+  temporal_proto_future_weight: 0.0
+  temporal_risk_calibration_weight: 0.10
+  semantic_alignment_weight: 0.0
