@@ -131,14 +131,3 @@ loss:
   # branch_aux_weight 用于 Stage 2，保留弱监督以避免 gate 把某个分支压死。
   stage1_branch_aux_weight: 0.30
   branch_aux_weight: 0.10
-
-  # Deprecated no-op baseline knobs kept temporarily for train.py schema compatibility.
-  # Their implementations have been removed from fusion/losses.py.
-  temporal_contrastive_weight: 0.0
-  temporal_temperature: 0.2
-  temporal_same_year_positive_weight: 0.25
-  groupdro_weight: 0.0
-  groupdro_temperature: 0.2
-  temporal_risk_var_weight: 0.0
-  irm_weight: 0.0
-  coral_weight: 0.0
