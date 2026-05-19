@@ -163,6 +163,24 @@ class TemporalPrototypeMemory(nn.Module):
             ),
         )
         self.register_buffer(
+            "initialized",
+            torch.zeros(
+                self.num_domains,
+                self.num_classes,
+                self.num_clusters,
+                dtype=torch.bool,
+            ),
+        )
+        self.register_buffer(
+            "inherited",
+            torch.zeros(
+                self.num_domains,
+                self.num_classes,
+                self.num_clusters,
+                dtype=torch.bool,
+            ),
+        )
+        self.register_buffer(
             "spread",
             torch.zeros(
                 self.num_domains,
@@ -176,6 +194,8 @@ class TemporalPrototypeMemory(nn.Module):
     def reset(self):
         self.prototypes.copy_(F.normalize(torch.randn_like(self.prototypes), dim=-1))
         self.seen.zero_()
+        self.initialized.zero_()
+        self.inherited.zero_()
         self.spread.zero_()
 
     @torch.no_grad()
@@ -190,11 +210,15 @@ class TemporalPrototypeMemory(nn.Module):
             mean_clusters_per_seen_cell = float(
                 occupied.sum(dim=2)[occupied_cells_mask].float().mean().item()
             )
+        initialized = self.initialized
+        inherited = self.inherited
         return {
             "occupied_cells": float(occupied_cells),
             "total_cells": float(total_cells),
             "occupied_clusters": float(occupied_clusters),
             "mean_clusters_per_seen_cell": mean_clusters_per_seen_cell,
+            "initialized_clusters": float(initialized.sum().item()),
+            "inherited_clusters": float(inherited.sum().item()),
         }
 
     def _valid_label_time_mask(self, labels: torch.Tensor, time_ids: torch.Tensor) -> torch.Tensor:
@@ -222,6 +246,12 @@ class TemporalPrototypeMemory(nn.Module):
         if seen_domains.numel() == 0:
             return None
         return int(seen_domains[-1].item())
+
+    def _clamp_velocity(self, velocity: torch.Tensor) -> torch.Tensor:
+        max_norm = max(float(ArchitectureConstants.PROTO_MAX_VELOCITY_NORM), 1e-8)
+        norm = velocity.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        scale = (max_norm / norm).clamp(max=1.0)
+        return velocity * scale
 
     def _select_diverse_centers(
         self,
@@ -303,12 +333,13 @@ class TemporalPrototypeMemory(nn.Module):
             group_feats = feats[mask]
             group_weights = weights[mask]
 
-            seen_clusters = self.seen[dom_i, c_i] > 0
-            unseen_idx = torch.where(~seen_clusters)[0]
-            current_seen_clusters = int(seen_clusters.sum().item())
+            observed_clusters = self.seen[dom_i, c_i] > 0
+            assignable_clusters = self.initialized[dom_i, c_i] | observed_clusters
+            unseen_idx = torch.where(~assignable_clusters)[0]
+            current_assignable_clusters = int(assignable_clusters.sum().item())
             observed_count = int(self.seen[dom_i, c_i].sum().item()) + int(group_feats.size(0))
             target_clusters = self._target_cluster_count(observed_count)
-            num_new = max(0, min(int(unseen_idx.numel()), target_clusters - current_seen_clusters))
+            num_new = max(0, min(int(unseen_idx.numel()), target_clusters - current_assignable_clusters))
             if num_new > 0:
                 carried = 0
                 # Keep cluster identities comparable across years. If cluster k
@@ -330,13 +361,14 @@ class TemporalPrototypeMemory(nn.Module):
                         device=self.spread.device,
                         dtype=self.spread.dtype,
                     )
-                    self.seen[dom_i, c_i, k_i] = 1
+                    self.initialized[dom_i, c_i, k_i] = True
+                    self.inherited[dom_i, c_i, k_i] = True
                     carried += 1
 
-                seen_clusters = self.seen[dom_i, c_i] > 0
+                assignable_clusters = self.initialized[dom_i, c_i] | (self.seen[dom_i, c_i] > 0)
                 remaining_new = num_new - carried
-                unseen_idx = torch.where(~seen_clusters)[0]
-                existing = self.prototypes[dom_i, c_i, seen_clusters]
+                unseen_idx = torch.where(~assignable_clusters)[0]
+                existing = self.prototypes[dom_i, c_i, assignable_clusters]
                 if remaining_new <= 0:
                     new_centers = group_feats[:0]
                 else:
@@ -352,13 +384,14 @@ class TemporalPrototypeMemory(nn.Module):
                         device=self.prototypes.device,
                         dtype=self.prototypes.dtype,
                     )
-                    self.seen[dom_i, c_i, k_i] = 1
+                    self.initialized[dom_i, c_i, k_i] = True
+                    self.inherited[dom_i, c_i, k_i] = False
 
-            seen_clusters = self.seen[dom_i, c_i] > 0
-            if not seen_clusters.any():
+            assignable_clusters = self.initialized[dom_i, c_i] | (self.seen[dom_i, c_i] > 0)
+            if not assignable_clusters.any():
                 continue
 
-            cluster_ids = torch.where(seen_clusters)[0]
+            cluster_ids = torch.where(assignable_clusters)[0]
             cluster_proto = self.prototypes[dom_i, c_i, cluster_ids].to(
                 device=group_feats.device,
                 dtype=group_feats.dtype,
@@ -391,6 +424,8 @@ class TemporalPrototypeMemory(nn.Module):
                     dim=-1,
                 ).to(device=old.device, dtype=old.dtype)
                 self.seen[dom_i, c_i, k_i] += int(cmask.sum().item())
+                self.initialized[dom_i, c_i, k_i] = True
+                self.inherited[dom_i, c_i, k_i] = False
 
     def get_loss_quality_gated(
         self,
@@ -468,7 +503,7 @@ class TemporalPrototypeMemory(nn.Module):
         previous_seen = (domain_ids[:, None, None] > 0) & (self.seen[prev_ids] > 0)
 
         has_trajectory = current_seen & previous_seen
-        velocity = current - previous
+        velocity = self._clamp_velocity(current - previous)
         future = F.normalize(current + float(velocity_scale) * velocity, dim=-1)
 
         if int(min_history) <= 1:
@@ -496,7 +531,9 @@ class TemporalPrototypeMemory(nn.Module):
                     device=self.prototypes.device,
                     dtype=self.prototypes.dtype,
                 ).view(-1, 1)
-                cls_velocity = self.prototypes[latest, c, k] - self.prototypes[prev, c, k]
+                cls_velocity = self._clamp_velocity(
+                    self.prototypes[latest, c, k] - self.prototypes[prev, c, k]
+                )
                 extrapolated = F.normalize(
                     self.prototypes[latest, c, k].view(1, -1)
                     + float(velocity_scale) * gap * cls_velocity.view(1, -1),
@@ -623,7 +660,12 @@ class TemporalPrototypeMemory(nn.Module):
 
                 both = valid_class & future_valid_class
                 future_only = (~valid_class) & future_valid_class
-                class_dist = torch.where(both, 0.7 * class_dist + 0.3 * future_dist, class_dist)
+                cluster_rel, _ = self._cluster_reliability(time_ids, device=z.device, dtype=z.dtype)
+                future_rel = cluster_rel.masked_fill(~future_valid, 0.0).max(dim=2).values
+                max_blend = float(ArchitectureConstants.PROTO_FUTURE_BLEND_MAX)
+                future_weight = (max_blend * future_rel).clamp(0.0, max_blend)
+                blended = (1.0 - future_weight) * class_dist + future_weight * future_dist
+                class_dist = torch.where(both, blended, class_dist)
                 class_dist = torch.where(future_only, future_dist, class_dist)
                 valid_class = valid_class | future_valid_class
 

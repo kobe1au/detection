@@ -939,13 +939,14 @@ class MalwareModelWithXAttn(nn.Module):
             if n_m <= 0 or t_m <= 0:
                 continue
 
-            local_mask = m[:n_m, :t_m].to(device=device, dtype=torch.bool)
+            local_weight = m[:n_m, :t_m].to(device=device, dtype=dtype).clamp(0.0, 1.0)
+            local_mask = local_weight > 0.0
             if not local_mask.any():
                 continue
 
-            node_w = local_mask.any(dim=1).to(dtype)
+            node_w = local_weight.max(dim=1).values
             node_w = node_w * node_key_mask[i, :n_m].to(dtype)
-            api_w = local_mask.any(dim=0).to(dtype)
+            api_w = local_weight.max(dim=0).values
 
             node_denom = node_w.sum().clamp_min(1.0)
             api_denom = api_w.sum().clamp_min(1.0)
@@ -960,7 +961,7 @@ class MalwareModelWithXAttn(nn.Module):
             node_cov = node_w.sum() / max(float(n_m), 1.0)
             api_cov = api_w.sum() / max(float(t_m), 1.0)
             coverage[i, 0] = (node_cov * api_cov).sqrt().clamp(0.0, 1.0)
-            density[i, 0] = local_mask.float().mean().clamp(0.0, 1.0)
+            density[i, 0] = local_weight.mean().clamp(0.0, 1.0)
 
         if align_scale is not None:
             scale = align_scale.view(B, -1)[:, :1].to(device=device, dtype=dtype)
@@ -978,6 +979,25 @@ class MalwareModelWithXAttn(nn.Module):
         )
 
         return xattn_pooled, coverage.detach(), density.detach()
+
+    @staticmethod
+    def _summarize_alignment_masks(masks, batch_size: int, device, dtype):
+        coverage = torch.zeros((batch_size,), device=device, dtype=dtype)
+        density = torch.zeros((batch_size,), device=device, dtype=dtype)
+        if masks is None:
+            return coverage, density
+
+        for i, m in enumerate(masks):
+            if i >= batch_size or m is None or m.numel() == 0:
+                continue
+            weight = m.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+            if weight.numel() == 0:
+                continue
+            node_cov = (weight.max(dim=1).values > 0.0).to(dtype).mean()
+            api_cov = (weight.max(dim=0).values > 0.0).to(dtype).mean()
+            coverage[i] = (node_cov * api_cov).sqrt().clamp(0.0, 1.0)
+            density[i] = weight.mean().clamp(0.0, 1.0)
+        return coverage, density
 
     def _select_xattn_nodes(self, node_emb, graph_batch, masks, batch_size: int):
         if (
@@ -1007,7 +1027,7 @@ class MalwareModelWithXAttn(nn.Module):
                     m = masks[i]
                     n = min(int(m.size(0)), int(idx.numel()))
                     if n > 0:
-                        align_rows = m[:n].any(dim=1).to(device=device)
+                        align_rows = (m[:n].to(device=device).float() > 0.0).any(dim=1)
 
                 if align_rows is not None and align_rows.any():
                     aligned = torch.where(align_rows)[0]
@@ -1125,6 +1145,18 @@ class MalwareModelWithXAttn(nn.Module):
         if time_ids is not None:
             extra["time_ids"] = time_ids
 
+        alignment_coverage_prior = None
+        alignment_density_prior = None
+        if masks is not None and self.fusion_mode == "ours":
+            alignment_coverage_prior, alignment_density_prior = self._summarize_alignment_masks(
+                masks,
+                B,
+                device,
+                dtype,
+            )
+            extra["alignment_coverage_prior"] = alignment_coverage_prior.detach()
+            extra["alignment_density_prior"] = alignment_density_prior.detach()
+
         if self.fusion_mode == "api":
             risk_feature = _set_temporal_features(api_emb, projected_feature=temporal_api_feature)
             if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
@@ -1193,6 +1225,12 @@ class MalwareModelWithXAttn(nn.Module):
             api_align, graph_align = self.build_alignment_features(api_emb, graph_emb)
             if api_align is not None and graph_align is not None:
                 semantic_quality = raw_qs[:, 2].detach().clamp(0.0, 1.0)
+                if alignment_coverage_prior is not None and alignment_density_prior is not None:
+                    coverage_gate = alignment_coverage_prior.detach().view(-1).clamp(0.0, 1.0)
+                    density_gate = alignment_density_prior.detach().view(-1).clamp(0.0, 1.0).sqrt()
+                    semantic_quality = semantic_quality * coverage_gate * density_gate
+                    extra["semantic_alignment_coverage_gate"] = coverage_gate.detach()
+                    extra["semantic_alignment_density_gate"] = density_gate.detach()
                 if self.use_alignment_drift_guidance and alignment_temporal_drift is not None:
                     drift_gate = (
                         0.25
@@ -1278,14 +1316,11 @@ class MalwareModelWithXAttn(nn.Module):
                             if n_m <= 0 or t_m <= 0:
                                 continue
 
-                            local_mask = m[:n_m, :t_m].to(device=device, dtype=torch.bool)
+                            local_weight = m[:n_m, :t_m].to(device=device, dtype=dtype).clamp(0.0, 1.0)
+                            local_mask = local_weight > 0.0
                             row_has_alignment = local_mask.any(dim=1, keepdim=True)
                             local_bias = torch.zeros((n_m, t_m), device=device, dtype=dtype)
-                            local_bias = torch.where(
-                                local_mask,
-                                bonus[i, 0, 0, 0],
-                                local_bias,
-                            )
+                            local_bias = bonus[i, 0, 0, 0] * local_weight
                             local_bias = torch.where(
                                 row_has_alignment & (~local_mask),
                                 penalty[i, 0, 0, 0],

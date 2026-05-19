@@ -244,18 +244,33 @@ class MultiModalMalwareDataset(Dataset):
         method_api_edge_index: torch.Tensor,
         num_nodes: int,
         num_api: int,
-        api_relevance_mask: torch.Tensor | None = None,
+        api_strong_mask: torch.Tensor | None = None,
+        api_weak_mask: torch.Tensor | None = None,
     ):
-        mask = torch.zeros((num_nodes, max(num_api, 1)), dtype=torch.bool)
+        mask = torch.zeros((num_nodes, max(num_api, 1)), dtype=torch.float32)
         if num_nodes <= 0 or num_api <= 0 or method_api_edge_index.numel() == 0:
             return mask, 0.0
         src, dst = method_api_edge_index[0], method_api_edge_index[1]
         valid = (src >= 0) & (src < num_nodes) & (dst >= 0) & (dst < num_api)
-        if isinstance(api_relevance_mask, torch.Tensor) and api_relevance_mask.numel() == num_api:
-            valid = valid & api_relevance_mask.to(device=dst.device, dtype=torch.bool)[dst.clamp(0, num_api - 1)]
-        if valid.any():
-            mask[src[valid], dst[valid]] = True
-        q_align = float(mask.any(dim=1).float().mean().item()) if num_nodes > 0 else 0.0
+        if not valid.any():
+            return mask, 0.0
+
+        edge_weight = torch.zeros((method_api_edge_index.size(1),), dtype=torch.float32, device=dst.device)
+        safe_dst = dst.clamp(0, num_api - 1)
+        if isinstance(api_weak_mask, torch.Tensor) and api_weak_mask.numel() == num_api:
+            weak = api_weak_mask.to(device=dst.device, dtype=torch.bool)[safe_dst]
+            edge_weight = torch.where(weak, torch.full_like(edge_weight, 0.5), edge_weight)
+        if isinstance(api_strong_mask, torch.Tensor) and api_strong_mask.numel() == num_api:
+            strong = api_strong_mask.to(device=dst.device, dtype=torch.bool)[safe_dst]
+            edge_weight = torch.where(strong, torch.ones_like(edge_weight), edge_weight)
+
+        weak_valid = valid & (edge_weight >= 0.5)
+        if weak_valid.any():
+            mask[src[weak_valid], dst[weak_valid]] = 0.5
+        strong_valid = valid & (edge_weight >= 1.0)
+        if strong_valid.any():
+            mask[src[strong_valid], dst[strong_valid]] = 1.0
+        q_align = float((mask.max(dim=1).values > 0.0).float().mean().item()) if num_nodes > 0 else 0.0
         return mask, q_align
 
     def _limit_api_events(
@@ -359,7 +374,8 @@ class MultiModalMalwareDataset(Dataset):
         sensitive_mask: torch.Tensor,
     ) -> float:
         if isinstance(mask, torch.Tensor) and mask.numel() > 0:
-            node_cover = float(mask.any(dim=1).float().mean().item())
+            weighted_mask = mask.float().clamp(0.0, 1.0)
+            node_cover = float((weighted_mask.max(dim=1).values > 0.0).float().mean().item())
         else:
             node_cover = 0.0
 
@@ -370,7 +386,8 @@ class MultiModalMalwareDataset(Dataset):
             and sensitive_mask.numel() == mask.size(0)
             and sensitive_mask.bool().any()
         ):
-            sens_cover = float(mask[sensitive_mask.bool()].any(dim=1).float().mean().item())
+            sens_weight = mask.float().clamp(0.0, 1.0)[sensitive_mask.bool()]
+            sens_cover = float((sens_weight.max(dim=1).values > 0.0).float().mean().item())
         else:
             sens_cover = node_cover
 
@@ -388,7 +405,7 @@ class MultiModalMalwareDataset(Dataset):
             edge_index=torch.zeros((2, 0), dtype=torch.long),
             y=torch.tensor(label, dtype=torch.long),
         )
-        data.attn_mask = torch.zeros((1, 1), dtype=torch.bool)
+        data.attn_mask = torch.zeros((1, 1), dtype=torch.float32)
         data.sensitive_mask = torch.zeros((1,), dtype=torch.uint8)
         data.api_ids = torch.zeros((0,), dtype=torch.long)
         data.api_type_ids = torch.zeros((0,), dtype=torch.long)
@@ -450,7 +467,7 @@ class MultiModalMalwareDataset(Dataset):
         return {
             "x": x,
             "edge_index": torch.empty((2, 0), dtype=torch.long),
-            "mask": torch.empty((1, 0), dtype=torch.bool),
+            "mask": torch.empty((1, 0), dtype=torch.float32),
             "sensitive_mask": torch.zeros((1,), dtype=torch.uint8),
             "api_ids": api_ids,
             "api_type_ids": api_type_ids,
@@ -484,7 +501,7 @@ class MultiModalMalwareDataset(Dataset):
             return {
                 "x": x,
                 "edge_index": edge_index,
-                "mask": torch.zeros((n, 0), dtype=torch.bool, device=x.device),
+                "mask": torch.zeros((n, 0), dtype=torch.float32, device=x.device),
                 "sensitive_mask": sensitive_mask,
                 "api_ids": torch.empty((0,), dtype=torch.long, device=x.device),
                 "api_type_ids": torch.empty((0,), dtype=torch.long, device=x.device),
@@ -544,12 +561,13 @@ class MultiModalMalwareDataset(Dataset):
             # only keep method-API edges linked to sensitive API events.
             if n > 0 and num_api > 0 and api_sensitive_mask.numel() == num_api:
                 # 只有同时满足 sensitive flag 和非 other API type 的 API 才参与 alignment。
-                api_relevance = (api_sensitive_mask > 0.5) & (api_type_ids > 0)
-                mask, _ = self._build_method_api_mask(local_method_api, n, num_api, api_relevance)
+                api_strong = (api_sensitive_mask > 0.5) & (api_type_ids > 0)
+                api_weak = ((api_in_graph_mask > 0.5) | (api_type_ids > 0)) & (~api_strong)
+                mask, _ = self._build_method_api_mask(local_method_api, n, num_api, api_strong, api_weak)
             else:
-                mask = torch.empty((n, max(num_api, 1)), dtype=torch.bool, device=x.device)
+                mask = torch.zeros((n, max(num_api, 1)), dtype=torch.float32, device=x.device)
         else:
-            mask = torch.empty((n, 0), dtype=torch.bool, device=x.device)
+            mask = torch.empty((n, 0), dtype=torch.float32, device=x.device)
 
         return {
             "x": x,
@@ -675,7 +693,7 @@ class MultiModalMalwareDataset(Dataset):
 
         if self.fusion_mode == "ours" and self.need_alignment_mask:
             mask_device = total_masks[0].device if total_masks else edge_device
-            final_mask = torch.zeros((node_offset, max(api_offset, 1)), dtype=torch.bool, device=mask_device)
+            final_mask = torch.zeros((node_offset, max(api_offset, 1)), dtype=torch.float32, device=mask_device)
             cur_n, cur_t = 0, 0
             for m, api_part in zip(total_masks, total_api_ids):
                 n = int(m.size(0))
@@ -691,7 +709,7 @@ class MultiModalMalwareDataset(Dataset):
                 cur_n += n
                 cur_t += real_t
         else:
-            final_mask = torch.empty((node_offset, 0), dtype=torch.bool, device=edge_device)
+            final_mask = torch.empty((node_offset, 0), dtype=torch.float32, device=edge_device)
 
         q_api = (
             self._compute_api_intrinsic_quality(

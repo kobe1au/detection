@@ -242,7 +242,7 @@ _CSV_HEADER = [
     "train_alignment_drift_gate", "train_semantic_drift_gate",
     "train_gate_temporal_drift", "train_gate_disagreement", "train_gate_entropy",
     "train_gate_api", "train_gate_graph", "train_gate_joint",
-    "val_loss", "val_cls_loss", "val_f1", "val_acc", "val_aurc",
+    "val_loss", "val_cls_loss", "val_f1", "val_acc", "val_softmax_aurc", "val_hybrid_aurc",
     "val_temporal_drift", "val_temporal_risk", "val_temporal_risk_error_auc",
     "val_temporal_risk_aurc", "val_temporal_risk_gap", "val_alignment_temporal_drift",
     "val_alignment_drift_gate", "val_semantic_drift_gate",
@@ -365,6 +365,54 @@ def _temporal_risk_diagnostics(risk_scores, correct_arr):
         "risk_correct": risk_correct,
         "risk_wrong": risk_wrong,
     }
+
+
+def _hybrid_confidence(softmax_conf, risk_scores):
+    softmax_conf = np.asarray(softmax_conf, dtype=np.float64).reshape(-1)
+    risk_scores = np.asarray(risk_scores, dtype=np.float64).reshape(-1)
+    if softmax_conf.shape[0] == 0 or risk_scores.shape[0] != softmax_conf.shape[0]:
+        return softmax_conf
+    risk_scores = np.clip(risk_scores, 0.0, 1.0)
+    return np.clip(softmax_conf * (1.0 - risk_scores), 0.0, 1.0)
+
+
+def _gate_diagnostics(gate_weights, correct=None, risk=None, q_api=None, q_graph=None):
+    if not gate_weights:
+        return {}
+    gw = np.asarray(gate_weights, dtype=np.float64)
+    if gw.ndim != 2 or gw.shape[1] != 3 or gw.shape[0] == 0:
+        return {}
+    gw = np.clip(gw, 1e-8, 1.0)
+    entropy = float((-(gw * np.log(gw)).sum(axis=1) / np.log(3.0)).mean())
+    out = {
+        "entropy": entropy,
+        "std": gw.std(axis=0).tolist(),
+    }
+
+    def _mean_by_mask(name, values, high_name=None):
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if arr.shape[0] != gw.shape[0]:
+            return
+        if high_name is None:
+            mask = arr >= 0.5
+            out[f"{name}_ge_0.5"] = gw[mask].mean(axis=0).tolist() if mask.any() else None
+            out[f"{name}_lt_0.5"] = gw[~mask].mean(axis=0).tolist() if (~mask).any() else None
+        else:
+            q1, q2 = np.quantile(arr, [1.0 / 3.0, 2.0 / 3.0])
+            low = arr <= q1
+            high = arr >= q2
+            out[f"{name}_low"] = gw[low].mean(axis=0).tolist() if low.any() else None
+            out[f"{high_name}_high"] = gw[high].mean(axis=0).tolist() if high.any() else None
+
+    if correct is not None:
+        _mean_by_mask("correct", correct)
+    if risk is not None:
+        _mean_by_mask("risk", risk, high_name="risk")
+    if q_api is not None:
+        _mean_by_mask("qapi", q_api, high_name="qapi")
+    if q_graph is not None:
+        _mean_by_mask("qgraph", q_graph, high_name="qgraph")
+    return out
 
 
 def _extract_gate_weight_stds(extra):
@@ -677,6 +725,11 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
     skipped = failed = total_valid = 0
     all_preds, all_labels, all_confs = [], [], []
     all_temporal_risks = []
+    all_gate_weights = []
+    all_gate_correct = []
+    all_gate_risk = []
+    all_gate_qapi = []
+    all_gate_qgraph = []
     times = []
 
     if device.type == "cuda":
@@ -696,6 +749,7 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
         qapi, qg, qa, papi, pg, tids = ex
         bs = y.size(0)
         total_valid += bs
+        batch_gate_ok = False
 
         with get_amp_context(device, enabled=use_amp):
             t0 = _time.perf_counter()
@@ -709,6 +763,12 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
             wi, wg, wj, ok = _extract_gate_weights(extra)
             if ok:
                 sum_wi += wi; sum_wg += wg; sum_wj += wj; num_w += 1
+                gate_values = extra.get("gate_weights")
+                if isinstance(gate_values, torch.Tensor) and gate_values.numel() > 0:
+                    gv = gate_values.detach().float().cpu()
+                    if gv.ndim == 2 and gv.size(0) == bs and gv.size(1) == 3:
+                        all_gate_weights.extend(gv.tolist())
+                        batch_gate_ok = True
             wi_std, wg_std, wj_std, ok_std = _extract_gate_weight_stds(extra)
             if ok_std:
                 sum_wi_std += wi_std; sum_wg_std += wg_std; sum_wj_std += wj_std; num_w_std += 1
@@ -775,9 +835,17 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(y.cpu().tolist())
         all_confs.extend(conf.cpu().tolist())
+        if batch_gate_ok:
+            batch_correct = (preds == y).detach().float().cpu().tolist()
+            all_gate_correct.extend(batch_correct)
+            all_gate_qapi.extend(qapi.detach().float().view(-1).cpu().tolist())
+            all_gate_qgraph.extend(qg.detach().float().view(-1).cpu().tolist())
+            risk_values = extra.get("temporal_risk_score")
+            if isinstance(risk_values, torch.Tensor) and risk_values.numel() == bs:
+                all_gate_risk.extend(risk_values.detach().float().view(-1).cpu().tolist())
 
     if not all_labels:
-        return (0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        return (0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0)
 
@@ -790,14 +858,24 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
     correct_arr = (pred_arr == label_arr).astype(np.float64)
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     acc = accuracy_score(all_labels, all_preds)
-    aurc_v = float(aurc(conf_arr, correct_arr))
+    softmax_aurc_v = float(aurc(conf_arr, correct_arr))
     risk_diag = _temporal_risk_diagnostics(all_temporal_risks, correct_arr)
+    hybrid_conf = _hybrid_confidence(conf_arr, all_temporal_risks)
+    hybrid_aurc_v = float(aurc(hybrid_conf, correct_arr))
+    gate_diag = _gate_diagnostics(
+        all_gate_weights,
+        correct=all_gate_correct,
+        risk=(all_gate_risk if len(all_gate_risk) == len(all_gate_weights) else None),
+        q_api=(all_gate_qapi if len(all_gate_qapi) == len(all_gate_weights) else None),
+        q_graph=(all_gate_qgraph if len(all_gate_qgraph) == len(all_gate_weights) else None),
+    )
 
     aw = (sum_wi/max(num_w,1), sum_wg/max(num_w,1), sum_wj/max(num_w,1))
 
     if logger:
         logger.info(f"[eval][epoch {epoch}] loss={avg_loss:.4f} F1={f1:.4f} "
-                    f"Acc={acc:.4f} AURC={aurc_v:.4f} "
+                    f"Acc={acc:.4f} softmax_AURC={softmax_aurc_v:.4f} "
+                    f"hybrid_AURC={hybrid_aurc_v:.4f} "
                     f"avg_w=({aw[0]:.3f},{aw[1]:.3f},{aw[2]:.3f}) "
                     f"std_w=({sum_wi_std/max(num_w_std,1):.3f},"
                     f"{sum_wg_std/max(num_w_std,1):.3f},{sum_wj_std/max(num_w_std,1):.3f}) "
@@ -826,6 +904,17 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
                 f"mean_correct={risk_diag['risk_correct']:.4f} "
                 f"mean_wrong={risk_diag['risk_wrong']:.4f}"
             )
+        if gate_diag:
+            std = gate_diag.get("std", [0.0, 0.0, 0.0])
+            logger.info(
+                f"[eval][epoch {epoch}] gate-diagnostics: "
+                f"weight_entropy={gate_diag.get('entropy', 0.0):.4f} "
+                f"std=({std[0]:.3f},{std[1]:.3f},{std[2]:.3f}) "
+                f"correct={gate_diag.get('correct_ge_0.5')} "
+                f"wrong={gate_diag.get('correct_lt_0.5')} "
+                f"risk_low={gate_diag.get('risk_low')} "
+                f"risk_high={gate_diag.get('risk_high')}"
+            )
         if times and total_valid > 0:
             ts = sum(times)
             logger.info(f"[eval][epoch {epoch}] ⏱ per_sample={ts/total_valid*1000:.2f}ms "
@@ -835,7 +924,7 @@ def eval_one_epoch(model, loader, criterion, device, epoch, num_epochs=1,
             logger.info(f"[eval][epoch {epoch}] ⏱ peak_gpu={peak:.1f}MB")
 
     return (
-        avg_loss, avg_cls, f1, acc, aurc_v, aw[0], aw[1], aw[2],
+        avg_loss, avg_cls, f1, acc, softmax_aurc_v, hybrid_aurc_v, aw[0], aw[1], aw[2],
         sum_temporal_drift/max(num_temporal_drift, 1),
         sum_temporal_risk/max(num_temporal_risk, 1),
         risk_diag["error_auc"],
@@ -869,7 +958,7 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
                               num_epochs, use_amp=False, logger=None, tag="val"):
     metrics = {}
     for y, dl in sorted(year_loaders.items()):
-        (loss, cls, f1, acc, aurc_v, aw_api, aw_graph, aw_joint,
+        (loss, cls, f1, acc, softmax_aurc_v, hybrid_aurc_v, aw_api, aw_graph, aw_joint,
          temporal_drift, temporal_risk, temporal_risk_error_auc,
          temporal_risk_aurc, temporal_risk_gap,
          align_temporal_drift, align_drift_gate, semantic_drift_gate,
@@ -880,7 +969,8 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
             "loss": loss,
             "f1": f1,
             "acc": acc,
-            "aurc": aurc_v,
+            "softmax_aurc": softmax_aurc_v,
+            "hybrid_aurc": hybrid_aurc_v,
             "gate_api": aw_api,
             "gate_graph": aw_graph,
             "gate_joint": aw_joint,
@@ -897,7 +987,7 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
             "gate_entropy": gate_entropy,
         }
     if logger and metrics:
-        lines = [f"{y}:F1={m['f1']:.3f}/AURC={m['aurc']:.3f}"
+        lines = [f"{y}:F1={m['f1']:.3f}/softmax_AURC={m['softmax_aurc']:.3f}"
                  for y, m in sorted(metrics.items())]
         logger.info(f"[{tag}][epoch {epoch}] yearly: " + " | ".join(lines))
     return metrics
@@ -986,6 +1076,48 @@ def collect_calibrated_probs(model, calibrator, loader, device, use_amp=False):
         raise RuntimeError("collect_calibrated_probs: no valid batches collected")
     
     return np.concatenate(all_p), np.concatenate(all_y)
+
+
+@torch.no_grad()
+def collect_calibrated_outputs(model, calibrator, loader, device, use_amp=False):
+    model.eval()
+    calibrator.eval()
+    all_p, all_y, all_risk = [], [], []
+    for batch in loader:
+        if batch is None:
+            continue
+        r = prepare_batch(
+            batch,
+            device,
+            skip_graph=False,
+            skip_masks=(model.fusion_mode != "ours" or not getattr(model, "use_alignment_bias", False)),
+        )
+        if r[2] is None:
+            continue
+        graph, masks, y, _, ex, _ = r
+        qapi, qg, qa, papi, pg, tids = ex
+        with get_amp_context(device, enabled=use_amp):
+            logits, extra = model(
+                graph_data=graph,
+                explicit_qs=(qapi, qg, qa, papi, pg),
+                time_ids=tids,
+                masks=masks,
+            )
+        all_p.append(calibrator(logits.float()).detach().cpu().numpy())
+        all_y.append(y.detach().cpu().numpy())
+        risk_values = extra.get("temporal_risk_score") if isinstance(extra, dict) else None
+        if isinstance(risk_values, torch.Tensor) and risk_values.numel() == y.size(0):
+            all_risk.append(risk_values.detach().float().view(-1).cpu().numpy())
+
+    if not all_p or not all_y:
+        raise RuntimeError("collect_calibrated_outputs: no valid batches collected")
+
+    probs = np.concatenate(all_p)
+    labels = np.concatenate(all_y)
+    risk_count = sum(int(x.shape[0]) for x in all_risk)
+    risks = np.concatenate(all_risk) if risk_count == labels.shape[0] else None
+    return probs, labels, risks
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -1258,7 +1390,7 @@ def main():
             epoch, epochs, loss_cfg=epoch_loss_cfg, logger=logger, use_amp=use_amp,
             grad_accum_steps=int(c_train["grad_accum_steps"]))
 
-        (val_loss, val_cls, val_f1, val_acc, val_aurc,
+        (val_loss, val_cls, val_f1, val_acc, val_softmax_aurc, val_hybrid_aurc,
          val_gate_api, val_gate_graph, val_gate_joint,
          val_temporal_drift, val_temporal_risk, val_temporal_risk_error_auc,
          val_temporal_risk_aurc, val_temporal_risk_gap, val_align_temporal_drift,
@@ -1317,7 +1449,8 @@ def main():
             train_gate_graph=tr_gate_graph,
             train_gate_joint=tr_gate_joint,
             val_loss=val_loss, val_cls_loss=val_cls, val_f1=val_f1, val_acc=val_acc,
-            val_aurc=val_aurc,
+            val_softmax_aurc=val_softmax_aurc,
+            val_hybrid_aurc=val_hybrid_aurc,
             val_temporal_drift=val_temporal_drift,
             val_temporal_risk=val_temporal_risk,
             val_temporal_risk_error_auc=val_temporal_risk_error_auc,
@@ -1342,7 +1475,8 @@ def main():
 
         logger.info(
             f"[Epoch {epoch:03d}] train: loss={tr_loss:.4f} f1={tr_f1:.4f} | "
-            f"val: loss={val_loss:.4f} f1={val_f1:.4f} aurc={val_aurc:.4f} | "
+            f"val: loss={val_loss:.4f} f1={val_f1:.4f} "
+            f"softmax_aurc={val_softmax_aurc:.4f} hybrid_aurc={val_hybrid_aurc:.4f} | "
             f"sel={selection_score:.4f}")
         temporal_memory = getattr(model, "temporal_prototype_memory", None)
         if temporal_memory is not None and hasattr(temporal_memory, "occupancy_stats"):
@@ -1351,6 +1485,8 @@ def main():
                 f"[Epoch {epoch:03d}] proto_clusters: "
                 f"cells={int(proto_stats['occupied_cells'])}/{int(proto_stats['total_cells'])} "
                 f"clusters={int(proto_stats['occupied_clusters'])} "
+                f"initialized={int(proto_stats.get('initialized_clusters', 0))} "
+                f"inherited={int(proto_stats.get('inherited_clusters', 0))} "
                 f"mean_per_cell={proto_stats['mean_clusters_per_seen_cell']:.2f}"
             )
 
@@ -1409,20 +1545,27 @@ def main():
     dl_test = DataLoader(ds_test, batch_size=eval_batch_size, shuffle=False, **test_lk)
     test_year_loaders = build_year_subset_loaders(ds_test, eval_batch_size, test_lk)
 
-    test_loss, test_cls, test_f1, test_acc, test_aurc, *_ = eval_one_epoch(
+    test_loss, test_cls, test_f1, test_acc, test_softmax_aurc, test_hybrid_aurc, *_ = eval_one_epoch(
         model, dl_test, criterion, device, epoch=0, num_epochs=1,
         use_amp=use_amp, logger=logger)
     logger.info(f"🏆 TEST: loss={test_loss:.4f} F1={test_f1:.4f} "
-                f"Acc={test_acc:.4f} AURC={test_aurc:.4f}")
+                f"Acc={test_acc:.4f} softmax_AURC={test_softmax_aurc:.4f} "
+                f"hybrid_AURC={test_hybrid_aurc:.4f}")
 
     # ── Selective classification on calibrated probs ──
-    test_probs, test_labels = collect_calibrated_probs(model, calibrator, dl_test, device, use_amp)
+    test_probs, test_labels, test_risks = collect_calibrated_outputs(model, calibrator, dl_test, device, use_amp)
     test_preds = test_probs.argmax(axis=1)
     test_conf = test_probs.max(axis=1)
     test_correct = (test_preds == test_labels).astype(np.float64)
+    test_hybrid_conf = _hybrid_confidence(test_conf, test_risks) if test_risks is not None else test_conf
+    logger.info(
+        f"Selective calibrated summary: softmax_AURC={aurc(test_conf,test_correct):.4f} "
+        f"hybrid_AURC={aurc(test_hybrid_conf,test_correct):.4f}"
+    )
     logger.info(
         f"🎯 Selective (calibrated): AURC={aurc(test_conf,test_correct):.4f} "
-        f"E-AURC={eaurc(test_conf,test_correct):.4f} | "
+        f"softmax_E-AURC={eaurc(test_conf,test_correct):.4f} "
+        f"hybrid_AURC={aurc(test_hybrid_conf,test_correct):.4f} | "
         f"risk@cov0.8={risk_at_coverage(test_conf,test_correct,0.8):.4f} "
         f"risk@cov0.9={risk_at_coverage(test_conf,test_correct,0.9):.4f} | "
         f"cov@risk≤1%={coverage_at_risk(test_conf,test_correct,0.01):.4f} "
@@ -1479,21 +1622,24 @@ def main():
         dl_extra = DataLoader(ds_extra, batch_size=eval_batch_size, shuffle=False, **extra_lk)
         extra_year_loaders = build_year_subset_loaders(ds_extra, eval_batch_size, extra_lk)
 
-        extra_loss, extra_cls, extra_f1, extra_acc, extra_aurc, *_ = eval_one_epoch(
+        extra_loss, extra_cls, extra_f1, extra_acc, extra_softmax_aurc, extra_hybrid_aurc, *_ = eval_one_epoch(
             model, dl_extra, criterion, device, epoch=0, num_epochs=1,
             use_amp=use_amp, logger=logger)
         logger.info(
             f"EXTRA_TEST[{extra_name}]: loss={extra_loss:.4f} F1={extra_f1:.4f} "
-            f"Acc={extra_acc:.4f} AURC={extra_aurc:.4f}"
+            f"Acc={extra_acc:.4f} softmax_AURC={extra_softmax_aurc:.4f} "
+            f"hybrid_AURC={extra_hybrid_aurc:.4f}"
         )
 
-        extra_probs, extra_labels = collect_calibrated_probs(model, calibrator, dl_extra, device, use_amp)
+        extra_probs, extra_labels, extra_risks = collect_calibrated_outputs(model, calibrator, dl_extra, device, use_amp)
         extra_preds = extra_probs.argmax(axis=1)
         extra_conf = extra_probs.max(axis=1)
         extra_correct = (extra_preds == extra_labels).astype(np.float64)
+        extra_hybrid_conf = _hybrid_confidence(extra_conf, extra_risks) if extra_risks is not None else extra_conf
         logger.info(
-            f"Selective[{extra_name}] calibrated: AURC={aurc(extra_conf,extra_correct):.4f} "
-            f"E-AURC={eaurc(extra_conf,extra_correct):.4f} | "
+            f"Selective[{extra_name}] calibrated: softmax_AURC={aurc(extra_conf,extra_correct):.4f} "
+            f"softmax_E-AURC={eaurc(extra_conf,extra_correct):.4f} "
+            f"hybrid_AURC={aurc(extra_hybrid_conf,extra_correct):.4f} | "
             f"risk@cov0.8={risk_at_coverage(extra_conf,extra_correct,0.8):.4f} "
             f"risk@cov0.9={risk_at_coverage(extra_conf,extra_correct,0.9):.4f} | "
             f"cov@risk<=1%={coverage_at_risk(extra_conf,extra_correct,0.01):.4f} "
