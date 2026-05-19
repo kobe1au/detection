@@ -414,16 +414,28 @@ class TemporalPrototypeMemory(nn.Module):
                 cw_flat = self._normalize_weights(group_weights[cmask]).to(sample_spread.device)
                 batch_spread = (cw_flat * sample_spread).sum().to(device=self.spread.device, dtype=self.spread.dtype)
                 new_count = int(cmask.sum().item())
-                total_count = max(old_count + new_count, 1)
-                old_spread = self.spread[dom_i, c_i, k_i]
-                self.spread[dom_i, c_i, k_i] = (
-                    old_spread * float(old_count) + batch_spread * float(new_count)
-                ) / float(total_count)
-                self.prototypes[dom_i, c_i, k_i] = F.normalize(
-                    self.momentum * old + (1.0 - self.momentum) * new,
-                    dim=-1,
-                ).to(device=old.device, dtype=old.dtype)
-                self.seen[dom_i, c_i, k_i] += int(cmask.sum().item())
+
+                if old_count <= 0:
+                    # First real observation for this year-class-cluster.
+                    # If the cluster was initialized from a historical prototype, do not let
+                    # that historical prior dominate the first observed current-year center.
+                    self.prototypes[dom_i, c_i, k_i] = new.to(
+                        device=old.device,
+                        dtype=old.dtype,
+                    )
+                    self.spread[dom_i, c_i, k_i] = batch_spread
+                else:
+                    total_count = max(old_count + new_count, 1)
+                    old_spread = self.spread[dom_i, c_i, k_i]
+                    self.spread[dom_i, c_i, k_i] = (
+                        old_spread * float(old_count) + batch_spread * float(new_count)
+                    ) / float(total_count)
+                    self.prototypes[dom_i, c_i, k_i] = F.normalize(
+                        self.momentum * old + (1.0 - self.momentum) * new,
+                        dim=-1,
+                    ).to(device=old.device, dtype=old.dtype)
+
+                self.seen[dom_i, c_i, k_i] += new_count
                 self.initialized[dom_i, c_i, k_i] = True
                 self.inherited[dom_i, c_i, k_i] = False
 

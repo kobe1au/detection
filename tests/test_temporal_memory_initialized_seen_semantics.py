@@ -41,6 +41,33 @@ class TemporalMemoryInitializedSeenTest(unittest.TestCase):
         self.assertTrue(bool(inherited_only.any().item()))
         self.assertTrue(bool(memory.initialized[1, 0][inherited_only].all().item()))
 
+    def test_first_observation_overwrites_inherited_prior_before_ema(self):
+        memory = TemporalPrototypeMemory(
+            num_domains=2,
+            num_classes=1,
+            feature_dim=2,
+            momentum=0.99,
+            num_clusters=1,
+        )
+
+        memory.update_weighted(
+            torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        )
+
+        memory.update_weighted(
+            torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+            torch.zeros(2, dtype=torch.long),
+            torch.ones(2, dtype=torch.long),
+        )
+
+        proto = memory.prototypes[1, 0, 0]
+        expected = torch.tensor([0.0, 1.0], dtype=proto.dtype, device=proto.device)
+
+        self.assertTrue(torch.allclose(proto, expected, atol=1e-4))
+        self.assertEqual(int(memory.seen[1, 0, 0].item()), 2)
+        self.assertFalse(bool(memory.inherited[1, 0, 0].item()))
 
 if __name__ == "__main__":
     unittest.main()
