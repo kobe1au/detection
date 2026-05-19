@@ -17,11 +17,6 @@ BASELINES=(
   "config/train_2026/baselines/01_graph_only.yaml"
   "config/train_2026/baselines/02_concat_erm.yaml"
   "config/train_2026/baselines/03_cross_attention.yaml"
-  "config/train_2026/baselines/04_temporal_supcon.yaml"
-  "config/train_2026/baselines/05_groupdro.yaml"
-  "config/train_2026/baselines/06_vrex.yaml"
-  "config/train_2026/baselines/07_irm.yaml"
-  "config/train_2026/baselines/08_coral.yaml"
 )
 
 I1_TEMPORAL=(

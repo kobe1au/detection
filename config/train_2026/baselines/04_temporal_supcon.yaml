@@ -1,8 +1,0 @@
-train:
-  exp_name: b_04_temporal_supcon
-
-model:
-  fusion_mode: concat
-
-loss:
-  temporal_contrastive_weight: 0.05

@@ -1,8 +1,0 @@
-train:
-  exp_name: b_08_coral
-
-model:
-  fusion_mode: concat
-
-loss:
-  coral_weight: 0.03

@@ -162,10 +162,6 @@ def validate_full_config(cfg):
         "temporal_proto_temperature", "temporal_proto_velocity_scale",
         "temporal_proto_min_history", "semantic_alignment_weight",
         "branch_aux_weight", "stage1_branch_aux_weight",
-        "temporal_contrastive_weight", "temporal_temperature",
-        "temporal_same_year_positive_weight", "groupdro_weight",
-        "groupdro_temperature", "temporal_risk_var_weight", "irm_weight",
-        "coral_weight",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -404,11 +400,6 @@ def _stage_loss_cfg(loss_cfg: dict, stage: str) -> dict:
         cfg["temporal_proto_future_weight"] = 0.0
         cfg["temporal_risk_calibration_weight"] = 0.0
         cfg["semantic_alignment_weight"] = 0.0
-        cfg["temporal_contrastive_weight"] = 0.0
-        cfg["groupdro_weight"] = 0.0
-        cfg["temporal_risk_var_weight"] = 0.0
-        cfg["irm_weight"] = 0.0
-        cfg["coral_weight"] = 0.0
         cfg["branch_aux_weight"] = float(cfg["stage1_branch_aux_weight"])
     return cfg
 
@@ -1050,8 +1041,6 @@ def main():
         _loss_weight("temporal_proto_current_weight") > 0.0
         or _loss_weight("temporal_proto_future_weight") > 0.0
         or _loss_weight("temporal_risk_calibration_weight") > 0.0
-        or _loss_weight("coral_weight") > 0.0
-        or _loss_weight("temporal_contrastive_weight") > 0.0
     )
 
     need_alignment_mask = _fm == "ours" and bool(c_alignment["enabled"])

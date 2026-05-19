@@ -72,11 +72,6 @@ I3 固定使用完整 I1 + I2。
 | B1 | `config/train_2026/baselines/01_graph_only.yaml` | Graph 单模态 |
 | B2 | `config/train_2026/baselines/02_concat_erm.yaml` | concat ERM |
 | B3 | `config/train_2026/baselines/03_cross_attention.yaml` | 普通 cross-attention |
-| B4 | `config/train_2026/baselines/04_temporal_supcon.yaml` | Cross-year SupCon |
-| B5 | `config/train_2026/baselines/05_groupdro.yaml` | GroupDRO |
-| B6 | `config/train_2026/baselines/06_vrex.yaml` | V-REx |
-| B7 | `config/train_2026/baselines/07_irm.yaml` | IRM |
-| B8 | `config/train_2026/baselines/08_coral.yaml` | CORAL |
 
 ## Final Ablation
 

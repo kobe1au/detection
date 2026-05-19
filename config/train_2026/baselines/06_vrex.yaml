@@ -1,8 +1,0 @@
-train:
-  exp_name: b_06_vrex
-
-model:
-  fusion_mode: concat
-
-loss:
-  temporal_risk_var_weight: 0.10

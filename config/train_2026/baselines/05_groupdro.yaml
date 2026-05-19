@@ -1,8 +1,0 @@
-train:
-  exp_name: b_05_groupdro
-
-model:
-  fusion_mode: concat
-
-loss:
-  groupdro_weight: 0.10

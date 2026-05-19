@@ -125,8 +125,6 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
         float(c_loss["temporal_proto_current_weight"]) > 0.0
         or float(c_loss["temporal_proto_future_weight"]) > 0.0
         or float(c_loss["temporal_risk_calibration_weight"]) > 0.0
-        or float(c_loss["coral_weight"]) > 0.0
-        or float(c_loss["temporal_contrastive_weight"]) > 0.0
     )
     model = MalwareModelWithXAttn(
         num_classes=int(c_model["num_classes"]),
