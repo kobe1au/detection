@@ -1,0 +1,10 @@
+train:
+  exp_name: i1_05_proto_current_future_risk
+
+model:
+  fusion_mode: concat
+
+loss:
+  temporal_proto_current_weight: 0.005
+  temporal_proto_future_weight: 0.001
+  temporal_risk_calibration_weight: 0.10

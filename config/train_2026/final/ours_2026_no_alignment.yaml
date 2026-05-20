@@ -1,16 +1,18 @@
 train:
-  exp_name: i1_05_ours_fixed_proto_trajectory
+  exp_name: final_no_alignment
 
 model:
   fusion_mode: ours
   alignment:
     enabled: false
     adaptive_bias: false
-    drift_guided: false
+    drift_guided: true
     bonus_scale: 0.0
     context_scale: 0.0
   gate:
-    mode: fixed
+    mode: learned
+    quality_inputs: true
+    drift_inputs: true
 
 loss:
   temporal_proto_current_weight: 0.005

@@ -1,5 +1,5 @@
 train:
-  exp_name: i2_03_semantic_loss_only
+  exp_name: i2_03_global_semantic_alignment_only
 
 model:
   fusion_mode: ours

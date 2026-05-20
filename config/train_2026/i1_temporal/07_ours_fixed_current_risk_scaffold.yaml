@@ -1,5 +1,5 @@
 train:
-  exp_name: i1_04_ours_fixed_scaffold_erm
+  exp_name: i1_07_ours_fixed_current_risk_scaffold
 
 model:
   fusion_mode: ours
@@ -13,6 +13,7 @@ model:
     mode: fixed
 
 loss:
-  temporal_proto_current_weight: 0.0
+  temporal_proto_current_weight: 0.005
   temporal_proto_future_weight: 0.0
+  temporal_risk_calibration_weight: 0.10
   semantic_alignment_weight: 0.0
