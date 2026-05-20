@@ -1,3 +1,4 @@
+# current 权重敏感性实验
 train:
   exp_name: i1_02_proto_current_010
 
