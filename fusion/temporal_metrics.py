@@ -26,16 +26,14 @@ def compute_aut(year_metric: Dict[int, float], clip=True) -> float:
     return float(np.trapz(values, x=years_arr) / horizon)
 
 def compute_aut_suite(year_metrics: Dict[int, Dict[str, float]]) -> Dict[str, float]:
-    """
-    Compute AUT for all metric names that appear in any year.
-    """
     if not year_metrics:
         return {}
 
     metric_names = sorted({k for metrics in year_metrics.values() for k in metrics.keys()})
+    unbounded = {"loss", "cls_loss"}
 
     out = {}
     for m in metric_names:
         per_year = {y: v[m] for y, v in year_metrics.items() if m in v}
-        out[f"AUT_{m}"] = compute_aut(per_year)
+        out[f"AUT_{m}"] = compute_aut(per_year, clip=(m not in unbounded))
     return out

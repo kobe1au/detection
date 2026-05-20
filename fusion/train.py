@@ -1798,11 +1798,12 @@ def main():
     )
     logger.info(
         f"🎯 Selective (calibrated): AURC={aurc(test_conf,test_correct):.4f} "
-        f"softmax_E-AURC={eaurc(test_conf,test_correct):.4f} |"
-        f"risk@cov0.8={risk_at_coverage(test_conf,test_correct,0.8):.4f} "
-        f"risk@cov0.9={risk_at_coverage(test_conf,test_correct,0.9):.4f} | "
-        f"cov@risk≤1%={coverage_at_risk(test_conf,test_correct,0.01):.4f} "
-        f"cov@risk≤5%={coverage_at_risk(test_conf,test_correct,0.05):.4f}")
+        f"softmax_E-AURC={eaurc(test_conf,test_correct):.4f} | "
+        f"error@cov0.8={risk_at_coverage(test_conf,test_correct,0.8):.4f} "
+        f"error@cov0.9={risk_at_coverage(test_conf,test_correct,0.9):.4f} | "
+        f"coverage@error≤1%={coverage_at_risk(test_conf,test_correct,0.01):.4f} "
+        f"coverage@error≤5%={coverage_at_risk(test_conf,test_correct,0.05):.4f}"
+    )
 
     # ── Per-year AUT ──
     if test_year_loaders:
@@ -1888,10 +1889,10 @@ def main():
             f"Selective[{extra_name}] calibrated: "
             f"softmax_AURC={aurc(extra_conf, extra_correct):.4f} "
             f"softmax_E-AURC={eaurc(extra_conf, extra_correct):.4f} | "
-            f"risk@cov0.8={risk_at_coverage(extra_conf, extra_correct, 0.8):.4f} "
-            f"risk@cov0.9={risk_at_coverage(extra_conf, extra_correct, 0.9):.4f} | "
-            f"cov@risk<=1%={coverage_at_risk(extra_conf, extra_correct, 0.01):.4f} "
-            f"cov@risk<=5%={coverage_at_risk(extra_conf, extra_correct, 0.05):.4f}"
+            f"error@cov0.8={risk_at_coverage(extra_conf, extra_correct, 0.8):.4f} "
+            f"error@cov0.9={risk_at_coverage(extra_conf, extra_correct, 0.9):.4f} | "
+            f"coverage@error<=1%={coverage_at_risk(extra_conf, extra_correct, 0.01):.4f} "
+            f"coverage@error<=5%={coverage_at_risk(extra_conf, extra_correct, 0.05):.4f}"
         )
 
         if extra_year_loaders:

@@ -34,7 +34,7 @@ class TriBranchGate(nn.Module):
 
     Typical q_dim=9:
       [q_api, q_graph, q_align, pert_api, pert_graph,
-       temporal_drift, branch_disagreement, entropy, api_alive, graph_alive]
+       branch_disagreement, entropy, api_alive, graph_alive]
 
     Output:
       [w_api, w_graph, w_joint]
