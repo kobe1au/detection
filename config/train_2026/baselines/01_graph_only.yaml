@@ -3,4 +3,3 @@ model:
 
 train:
   exp_name: baseline_graph_only_2024
-

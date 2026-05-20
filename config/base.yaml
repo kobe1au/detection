@@ -43,7 +43,6 @@ model:
   alignment:
     enabled: false
     adaptive_bias: false
-    drift_guided: false
     penalty_scale: 0.0
     bonus_scale: 0.0
     context_scale: 0.0
@@ -73,7 +72,7 @@ train:
   lr: 0.0003
   weight_decay: 0.01
   warmup_epochs: 3
-  warmup_stage_epochs: 8
+  warmup_stage_epochs: 0
   historical_epochs: 60
   adaptation_epochs: 0
   adaptation_ratio: 1.0
@@ -89,8 +88,8 @@ loss:
   class_aware_alignment_same_class_weight: 0.0
   class_aware_alignment_temperature: 0.2
 
-  stage1_branch_aux_weight: 0.30
-  branch_aux_weight: 0.10
+  stage1_branch_aux_weight: 0.0
+  branch_aux_weight: 0.0
 
   gate_oracle_weight: 0.0
   gate_oracle_temperature: 0.5

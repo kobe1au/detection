@@ -12,5 +12,4 @@ train:
   adaptation_epochs: 10
   adaptation_ratio: 0.10
   replay_ratio: 0.25
-  replay_strategy: static
-
+  replay_strategy: dynamic_year_class

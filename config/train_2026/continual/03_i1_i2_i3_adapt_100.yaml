@@ -7,7 +7,6 @@ model:
   alignment:
     enabled: true
     adaptive_bias: true
-    drift_guided: true
     penalty_scale: 0.5
     bonus_scale: 1.0
     context_scale: 0.35
@@ -15,7 +14,7 @@ model:
     mode: learned
     quality_inputs: true
     uncertainty_inputs: true
-    detach: false
+    detach: true
 
 train:
   exp_name: continual_b3_i1_i2_i3_adapt_100
@@ -24,14 +23,13 @@ train:
   adaptation_epochs: 10
   adaptation_ratio: 1.00
   replay_ratio: 0.25
-  replay_strategy: static
+  replay_strategy: dynamic_year_class
 
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
   gate_oracle_weight: 0.05
-  gate_oracle_temperature: 0.7
+  gate_oracle_temperature: 0.5
   gate_oracle_smoothing: 0.10
   gate_oracle_start_phase: adaptation
   gate_oracle_adaptation_only: true
-

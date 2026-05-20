@@ -114,18 +114,11 @@ def load_checkpoint_config(base_cfg: dict[str, Any], ckpt_path: str) -> dict[str
 
 def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareModelWithXAttn:
     c_model = cfg["model"]
-    c_loss = cfg["loss"]
     c_api = c_model["api_encoder"]
     c_graph = c_model["graph_encoder"]
     c_alignment = c_model["alignment"]
     c_gate = c_model["gate"]
-    c_temporal = c_model["temporal"]
     fusion_mode = str(c_model["fusion_mode"])
-    need_temporal_features = (
-        float(c_loss["temporal_proto_current_weight"]) > 0.0
-        or float(c_loss["temporal_proto_future_weight"]) > 0.0
-        or float(c_loss["temporal_risk_calibration_weight"]) > 0.0
-    )
     model = MalwareModelWithXAttn(
         num_classes=int(c_model["num_classes"]),
         api_emb_dim=TrainingConstants.API_EMB_DIM,
@@ -134,7 +127,6 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
         max_nodes_gnn=int(c_model["max_nodes_gnn"]),
         max_xattn_nodes=int(c_model["max_xattn_nodes"]),
         in_feat_dim=int(c_model.get("in_feat_dim", TrainingConstants.IN_FEAT_DIM)),
-        use_temporal_regularization=need_temporal_features,
         xattn_heads=TrainingConstants.XATTN_HEADS,
         fusion_mode=fusion_mode,
         graph_encoder_type=str(c_graph["type"]),
@@ -153,25 +145,11 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
         alignment_context_scale=float(c_alignment["context_scale"]),
         use_alignment_bias=bool(c_alignment["enabled"]),
         use_adaptive_alignment_bias=bool(c_alignment["adaptive_bias"]),
-        use_alignment_drift_guidance=bool(c_alignment.get("drift_guided", True)),
         use_quality_gate_inputs=bool(c_gate["quality_inputs"]),
-        use_drift_gate=bool(c_gate["drift_inputs"]),
+        use_uncertainty_gate=bool(c_gate["uncertainty_inputs"]),
         gate_mode=str(c_gate.get("mode", "learned")),
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,
-        temporal_num_domains=int(c_temporal.get("num_domains", 1)),
-        temporal_prototype_momentum=float(c_temporal["prototype_momentum"]),
-        temporal_prototype_clusters=int(c_temporal["prototype_clusters"]),
-        temporal_drift_velocity_scale=float(c_loss["temporal_proto_velocity_scale"]),
-        temporal_drift_min_history=int(c_loss["temporal_proto_min_history"]),
-        use_future_temporal_drift=(
-            bool(c_temporal.get("use_future_drift", True))
-            and (
-                float(c_loss.get("temporal_proto_future_weight", 0.0)) > 0.0
-                or float(c_loss.get("temporal_risk_calibration_weight", 0.0)) > 0.0
-            )
-        ),
-        use_temporal_risk_calibration=(float(c_loss.get("temporal_risk_calibration_weight", 0.0)) > 0.0),
     ).to(device)
     return model
 
@@ -182,16 +160,6 @@ def load_model(spec: ModelSpec, device: torch.device) -> MalwareModelWithXAttn:
     in_proj_key = next((k for k in state.keys() if k.endswith("graph_encoder.in_proj.weight")), None)
     if in_proj_key is not None and getattr(state[in_proj_key], "ndim", 0) == 2:
         spec.cfg.setdefault("model", {})["in_feat_dim"] = int(state[in_proj_key].shape[1])
-    proto_key = next((k for k in state.keys() if k.endswith("temporal_prototype_memory.prototypes")), None)
-    if proto_key is not None and getattr(state[proto_key], "ndim", 0) == 4:
-        spec.cfg.setdefault("model", {}).setdefault("temporal", {})["num_domains"] = int(state[proto_key].shape[0])
-        spec.cfg.setdefault("model", {}).setdefault("temporal", {})["prototype_clusters"] = int(state[proto_key].shape[2])
-    elif proto_key is not None and getattr(state[proto_key], "ndim", 0) == 3:
-        raise ValueError(
-            f"{spec.name}: legacy 3D temporal prototype checkpoint is incompatible "
-            "with the current year-label-cluster prototype model. Retrain this "
-            "checkpoint from the current codebase."
-        )
     model = build_model_from_cfg(spec.cfg, device)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:

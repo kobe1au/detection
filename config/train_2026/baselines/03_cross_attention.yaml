@@ -3,4 +3,3 @@ model:
 
 train:
   exp_name: baseline_cross_attention_2024
-

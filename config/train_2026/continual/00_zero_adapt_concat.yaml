@@ -6,4 +6,3 @@ train:
   epochs: 60
   historical_epochs: 60
   adaptation_epochs: 0
-

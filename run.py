@@ -21,7 +21,7 @@ EXPERIMENTS = [
     "./config/train_2026/continual/01_i1_adapt_010.yaml",
     "./config/train_2026/continual/02_i1_i2_adapt_010.yaml",
     "./config/train_2026/continual/03_i1_i2_i3_adapt_010.yaml",
-    "./config/train_2026/continual/04_i1_i2_i3_dynamic_replay_adapt_010.yaml",
+    "./config/train_2026/continual/04_i1_i2_i3_static_replay_adapt_010.yaml",
 ]
 
 
@@ -36,4 +36,3 @@ for override in EXPERIMENTS:
         ],
         check=True,
     )
-
