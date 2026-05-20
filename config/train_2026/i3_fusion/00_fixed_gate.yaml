@@ -1,5 +1,6 @@
-train:
-  exp_name: i3_00_fixed_no_gate
+data:
+  adapt_pt_dir: "pts/adapt"
+  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
 
 model:
   fusion_mode: ours
@@ -13,9 +14,19 @@ model:
   gate:
     mode: fixed
     quality_inputs: false
-    drift_inputs: false
+    uncertainty_inputs: false
+    detach: true
+
+train:
+  exp_name: i3_fixed_gate_adapt_010
+  epochs: 70
+  historical_epochs: 60
+  adaptation_epochs: 10
+  adaptation_ratio: 0.10
+  replay_ratio: 0.25
 
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
   gate_oracle_weight: 0.0
+

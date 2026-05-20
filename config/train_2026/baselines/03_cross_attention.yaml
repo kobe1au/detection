@@ -1,10 +1,6 @@
-train:
-  exp_name: b_03_cross_attention
-
 model:
   fusion_mode: cross_attention
 
-loss:
- 
-  semantic_alignment_weight: 0.0
-  gate_oracle_weight: 0.0
+train:
+  exp_name: baseline_cross_attention_2024
+

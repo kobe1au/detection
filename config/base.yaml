@@ -1,5 +1,5 @@
 # 2026 main experiment base config.
-# Default protocol: 2018-2021 historical train / 2022 validation / 2024 final test.
+# Protocol: 2018-2021 historical train / 2022 validation / 2024 final test.
 # Continual configs explicitly set 2023 as the recent-year adaptation pool.
 
 data:
@@ -43,7 +43,7 @@ model:
   alignment:
     enabled: false
     adaptive_bias: false
-    drift_guided: true
+    drift_guided: false
     penalty_scale: 0.0
     bonus_scale: 0.0
     context_scale: 0.0
@@ -51,7 +51,7 @@ model:
   gate:
     mode: fixed
     quality_inputs: false
-    drift_inputs: false
+    uncertainty_inputs: false
     detach: true
 
 train:
@@ -78,13 +78,13 @@ train:
   adaptation_epochs: 0
   adaptation_ratio: 1.0
   replay_ratio: 0.25
+  replay_strategy: static
   eta_min: 0.000001
   label_smoothing: 0.05
   patience: 10
   min_delta: 0.0001
 
 loss:
-
   semantic_alignment_weight: 0.0
   class_aware_alignment_same_class_weight: 0.0
   class_aware_alignment_temperature: 0.2

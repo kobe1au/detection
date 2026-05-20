@@ -1,5 +1,6 @@
-train:
-  exp_name: i2_04_method_aware_context
+data:
+  adapt_pt_dir: "pts/adapt"
+  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
 
 model:
   fusion_mode: ours
@@ -10,9 +11,16 @@ model:
     penalty_scale: 0.5
     bonus_scale: 1.0
     context_scale: 0.35
-  gate:
-    mode: fixed
+
+train:
+  exp_name: i2_method_mask_only_adapt_010
+  epochs: 70
+  historical_epochs: 60
+  adaptation_epochs: 10
+  adaptation_ratio: 0.10
+  replay_ratio: 0.25
 
 loss:
   semantic_alignment_weight: 0.0
   class_aware_alignment_same_class_weight: 0.0
+

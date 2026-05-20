@@ -1,9 +1,0 @@
-train:
-  exp_name: i2_00_temporal_concat
-
-model:
-  fusion_mode: concat
-
-loss:
-  semantic_alignment_weight: 0.0
-  class_aware_alignment_same_class_weight: 0.0

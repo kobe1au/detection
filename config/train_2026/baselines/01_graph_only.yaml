@@ -1,9 +1,6 @@
-train:
-  exp_name: b_01_graph_only
-
 model:
   fusion_mode: graph
 
-loss:
-  branch_aux_weight: 0.0
-  stage1_branch_aux_weight: 0.0
+train:
+  exp_name: baseline_graph_only_2024
+

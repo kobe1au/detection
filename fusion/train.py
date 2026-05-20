@@ -212,7 +212,7 @@ def validate_full_config(cfg):
     }
     allowed_api = {"type", "num_hash_buckets", "type_vocab_size", "max_seq_len", "layers", "heads"}
     allowed_graph = {"type", "hidden", "heads", "layers", "use_behavior_hint", "drop_extracted_behavior_hints"}
-    allowed_alignment = {"enabled", "adaptive_bias", "penalty_scale", "bonus_scale", "context_scale"}
+    allowed_alignment = {"enabled", "adaptive_bias", "drift_guided", "penalty_scale", "bonus_scale", "context_scale"}
     allowed_gate = {"mode", "quality_inputs", "uncertainty_inputs", "detach"}
     allowed_train = {
         "exp_name", "seed", "device", "use_amp", "epochs", "batch_size",

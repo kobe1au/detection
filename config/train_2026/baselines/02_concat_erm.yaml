@@ -1,10 +1,6 @@
-train:
-  exp_name: b_02_concat_erm
-
 model:
   fusion_mode: concat
 
-loss:
- 
-  semantic_alignment_weight: 0.0
-  gate_oracle_weight: 0.0
+train:
+  exp_name: baseline_concat_erm_2024
+

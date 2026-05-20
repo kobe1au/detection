@@ -1,9 +1,6 @@
-train:
-  exp_name: b_00_api_only
-
 model:
   fusion_mode: api
 
-loss:
-  branch_aux_weight: 0.0
-  stage1_branch_aux_weight: 0.0
+train:
+  exp_name: baseline_api_only_2024
+

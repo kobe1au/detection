@@ -1,17 +1,6 @@
 data:
   adapt_pt_dir: "pts/adapt"
   adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
-  test_pt_dir: "pts/test"
-  test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
-  extra_tests: []
-
-train:
-  exp_name: continual_02_i1_i2_adapt_020
-  epochs: 70
-  historical_epochs: 60
-  adaptation_epochs: 10
-  adaptation_ratio: 0.20
-  replay_ratio: 0.25
 
 model:
   fusion_mode: ours
@@ -22,13 +11,17 @@ model:
     penalty_scale: 0.5
     bonus_scale: 1.0
     context_scale: 0.35
-  gate:
-    mode: fixed
-    quality_inputs: false
-    drift_inputs: false
+
+train:
+  exp_name: continual_b2_i1_i2_adapt_020
+  epochs: 70
+  historical_epochs: 60
+  adaptation_epochs: 10
+  adaptation_ratio: 0.20
+  replay_ratio: 0.25
+  replay_strategy: static
 
 loss:
- 
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
-  gate_oracle_weight: 0.0
+

@@ -13,13 +13,12 @@ model:
     context_scale: 0.35
 
 train:
-  exp_name: continual_b2_i1_i2_adapt_100
+  exp_name: i2_full_class_aware_alignment_adapt_010
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 1.00
+  adaptation_ratio: 0.10
   replay_ratio: 0.25
-  replay_strategy: static
 
 loss:
   semantic_alignment_weight: 0.03
