@@ -1,44 +1,27 @@
-# 2026 主实验基础配置。
-# 目标：从头训练，避免额外训练分支混入主实验。
+# 2026 main experiment base config.
+# Default protocol: 2018-2021 historical train / 2022 validation / 2024 final test.
+# Continual configs explicitly set 2023 as the recent-year adaptation pool.
 
 data:
-  # DATA_ROOT 下的输出目录，例如 /root/autodl-tmp/experiments。
   out_dir: "experiments"
 
-  # DATA_ROOT 下的 PT 特征目录。
   train_pt_dir: "pts/train"
   val_pt_dir: "pts/val"
   test_pt_dir: "pts/test"
 
-  # Current protocol: 2018-2021 train / 2022 val / 2024 final test.
-  # Continual configs set adapt_csv to the 2023 adaptation pool explicitly.
-
-  # DATA_ROOT 下的时间划分 CSV。主实验：2018-2021 train / 2022 val / 2023 test。
-  # 2024 不参与调参，作为更长时间跨度的漂移压力测试。
   train_csv: "resource/dataset_split_2018_2024/train.csv"
   adapt_pt_dir: null
   adapt_csv: null
   val_csv: "resource/dataset_split_2018_2024/val.csv"
   test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
-
-  # Default main protocol reports 2024 as final test; no extra test is needed.
-
-  # 补充/压力测试集：训练完成后在同一个 best checkpoint 和同一个 2022 校准器上额外评估。
   extra_tests: []
 
-  # 每个样本最多保留的 API 事件数；应与 api_encoder.max_seq_len 保持一致。
   max_api_events_per_sample: 1024
 
 model:
   num_classes: 2
-
-  # 可选：api / graph / concat / cross_attention / ours。
   fusion_mode: concat
-
-  # 图节点截断。12288 约覆盖当前统计的 p95 total_nodes；显存不足再降到 8192。
   max_nodes_gnn: 12288
-
-  # cross-attention 参与节点数。1024 比 512 保留更多图上下文，但会更慢。
   max_xattn_nodes: 1024
 
   api_encoder:
@@ -58,29 +41,19 @@ model:
     drop_extracted_behavior_hints: true
 
   temporal:
-    # year-label-cluster 原型 EMA 动量；越大越稳，越小越敏感。
     prototype_momentum: 0.95
-    # 每个“年份-标签”维护的子原型数量，用于刻画 APK 类内多峰分布。
-    # 建议先固定为 4；样本量明显增加后再试 2/4/6。
     prototype_clusters: 4
-    # 是否把外推 future prototype 作为 drift/risk 特征。
-    # 注意：这不是 future prototype loss；loss 权重由 temporal_proto_future_weight 控制。
     use_future_drift: true
 
   alignment:
-    # 创新点2：method-aware API-Graph 对齐 bias 和对齐上下文。
     enabled: false
     adaptive_bias: false
-    # 是否用创新点1得到的 temporal drift 调节对齐强度；高漂移样本会降低强制对齐。
     drift_guided: true
     penalty_scale: 0.0
     bonus_scale: 0.0
     context_scale: 0.0
 
   gate:
-    # 创新点3：门控是否接收质量信号、漂移信号。
-    # mode=fixed 表示固定三分支平均，用于真正的 no learned gate 消融。
-    # mode=learned 表示学习 API / Graph / Joint 三分支权重。
     mode: fixed
     quality_inputs: false
     drift_inputs: false
@@ -105,9 +78,6 @@ train:
   lr: 0.0003
   weight_decay: 0.01
   warmup_epochs: 3
-  # Stage 1 表征 warm-up 轮数。仅对 concat/cross_attention/ours 等多模态模型生效；
-  # API-only/Graph-only 自动跳过。Stage 1 固定 gate、关闭 future/alignment，只保留判别学习、
-  # 单模态辅助监督和 current prototype。
   warmup_stage_epochs: 8
   historical_epochs: 60
   adaptation_epochs: 0
@@ -115,34 +85,27 @@ train:
   replay_ratio: 0.25
   eta_min: 0.000001
   label_smoothing: 0.05
-
-  # best checkpoint 使用按年份评估的时间泛化分数；这里保留早停的最小必要参数。
   patience: 10
   min_delta: 0.0001
 
 loss:
-  # 创新点1：year-label-cluster 原型约束。current 负责当前年份局部子簇聚合，future 负责子簇演化趋势约束。
   temporal_proto_current_weight: 0.0
   temporal_proto_future_weight: 0.0
-  # I1 risk estimator：用 prototype drift 预测样本错误风险。
-  # 该损失只训练轻量 risk calibrator，不反向强拉 API/Graph 表征。
   temporal_risk_calibration_weight: 0.0
   temporal_proto_temperature: 0.2
   temporal_proto_velocity_scale: 0.5
   temporal_proto_min_history: 2
 
-  # 创新点2：API-Graph 语义对齐辅助损失。
   semantic_alignment_weight: 0.0
   class_aware_alignment_same_class_weight: 0.0
   class_aware_alignment_temperature: 0.2
 
-  # 多模态公平训练：API / Graph / Joint 分支辅助分类损失。
-  # stage1_branch_aux_weight 用于 Stage 1，防止融合层过早偏向单模态；
-  # branch_aux_weight 用于 Stage 2，保留弱监督以避免 gate 把某个分支压死。
   stage1_branch_aux_weight: 0.30
   branch_aux_weight: 0.10
+
   gate_oracle_weight: 0.0
   gate_oracle_temperature: 0.5
   gate_oracle_smoothing: 0.0
   gate_oracle_start_epoch: 0
+  gate_oracle_start_phase: null
   gate_oracle_adaptation_only: false

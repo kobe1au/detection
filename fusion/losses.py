@@ -100,6 +100,10 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
     gate_oracle_start_epoch = int(loss_cfg.get("gate_oracle_start_epoch", 0))
     if epoch < gate_oracle_start_epoch:
         gate_oracle_weight = 0.0
+    gate_oracle_start_phase = str(loss_cfg.get("gate_oracle_start_phase", "") or "").lower()
+    if gate_oracle_start_phase:
+        if str(loss_cfg.get("_continual_phase", "historical")).lower() != gate_oracle_start_phase:
+            gate_oracle_weight = 0.0
     if bool(loss_cfg.get("gate_oracle_adaptation_only", False)):
         if str(loss_cfg.get("_continual_phase", "historical")) != "adaptation":
             gate_oracle_weight = 0.0

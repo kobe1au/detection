@@ -3,3 +3,7 @@ train:
 
 model:
   fusion_mode: api
+
+loss:
+  branch_aux_weight: 0.0
+  stage1_branch_aux_weight: 0.0

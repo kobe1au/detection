@@ -1,12 +1,12 @@
 train:
-  exp_name: final_no_alignment
+  exp_name: final_ours_2026_no_alignment
 
 model:
   fusion_mode: ours
   alignment:
     enabled: false
     adaptive_bias: false
-    drift_guided: true
+    penalty_scale: 0.0
     bonus_scale: 0.0
     context_scale: 0.0
   gate:
@@ -15,7 +15,9 @@ model:
     drift_inputs: true
 
 loss:
-  temporal_proto_current_weight: 0.005
-  temporal_proto_future_weight: 0.001
-  temporal_risk_calibration_weight: 0.10
   semantic_alignment_weight: 0.0
+  class_aware_alignment_same_class_weight: 0.0
+  gate_oracle_weight: 0.05
+  gate_oracle_smoothing: 0.10
+  gate_oracle_start_phase: adaptation
+  gate_oracle_adaptation_only: true

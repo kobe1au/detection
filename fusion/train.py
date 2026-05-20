@@ -166,7 +166,8 @@ def validate_full_config(cfg):
         "branch_aux_weight", "stage1_branch_aux_weight",
         "class_aware_alignment_same_class_weight", "class_aware_alignment_temperature",
         "gate_oracle_weight", "gate_oracle_temperature",
-        "gate_oracle_smoothing", "gate_oracle_start_epoch", "gate_oracle_adaptation_only",
+        "gate_oracle_smoothing", "gate_oracle_start_epoch", "gate_oracle_start_phase",
+        "gate_oracle_adaptation_only",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -223,6 +224,7 @@ def validate_full_config(cfg):
             "gate_oracle_temperature",
             "gate_oracle_smoothing",
             "gate_oracle_start_epoch",
+            "gate_oracle_start_phase",
             "gate_oracle_adaptation_only",
         },
     )
@@ -1785,7 +1787,10 @@ def main():
     dl_test = DataLoader(ds_test, batch_size=eval_batch_size, shuffle=False, **test_lk)
     test_year_loaders = build_year_subset_loaders(ds_test, eval_batch_size, test_lk)
 
-    test_loss, test_cls, test_f1, test_acc, test_softmax_aurc, test_hybrid_aurc, *_ = eval_one_epoch(
+    (
+        test_loss, test_cls, test_f1, test_acc, test_softmax_aurc, test_hybrid_aurc,
+        test_gate_api, test_gate_graph, test_gate_joint, *_
+    ) = eval_one_epoch(
         model, dl_test, criterion, device, epoch=0, num_epochs=1,
         use_amp=use_amp, logger=logger)
     logger.info(f"🏆 TEST: loss={test_loss:.4f} F1={test_f1:.4f} "
@@ -1805,6 +1810,40 @@ def main():
         f"FNR={det_metrics['fnr']:.4f} AUROC={det_metrics['auroc']:.4f} "
         f"AUPRC={det_metrics['auprc']:.4f}"
     )
+    final_metrics_path = os.path.join(ckpt_dir, f"final_metrics_{exp_name}.csv")
+    test_year = (
+        str(ds_test.unique_years[0])
+        if len(getattr(ds_test, "unique_years", [])) == 1
+        else "combined"
+    )
+    with open(final_metrics_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "exp_name", "adaptation_ratio", "phase", "test_year",
+                "macro_f1", "malware_recall", "fnr", "auroc", "auprc",
+                "softmax_aurc", "hybrid_aurc",
+                "gate_api", "gate_graph", "gate_joint",
+            ],
+        )
+        w.writeheader()
+        w.writerow({
+            "exp_name": exp_name,
+            "adaptation_ratio": float(c_train.get("adaptation_ratio", 0.0)),
+            "phase": "final_test",
+            "test_year": test_year,
+            "macro_f1": f"{test_f1:.6f}",
+            "malware_recall": f"{det_metrics['malware_recall']:.6f}",
+            "fnr": f"{det_metrics['fnr']:.6f}",
+            "auroc": f"{det_metrics['auroc']:.6f}",
+            "auprc": f"{det_metrics['auprc']:.6f}",
+            "softmax_aurc": f"{test_softmax_aurc:.6f}",
+            "hybrid_aurc": f"{test_hybrid_aurc:.6f}",
+            "gate_api": f"{test_gate_api:.6f}",
+            "gate_graph": f"{test_gate_graph:.6f}",
+            "gate_joint": f"{test_gate_joint:.6f}",
+        })
+    logger.info(f"Final metrics CSV: {final_metrics_path}")
     logger.info(
         f"Selective calibrated summary: softmax_AURC={aurc(test_conf,test_correct):.4f} "
         f"hybrid_AURC={aurc(test_hybrid_conf,test_correct):.4f}"

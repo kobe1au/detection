@@ -1,6 +1,6 @@
 data:
-  adapt_pt_dir: "pts/test"
-  adapt_csv: "resource/dataset_split_2018_2024/test_2023.csv"
+  adapt_pt_dir: "pts/adapt"
+  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
   test_pt_dir: "pts/test"
   test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
   extra_tests: []
@@ -19,6 +19,7 @@ model:
     enabled: true
     adaptive_bias: true
     drift_guided: true
+    penalty_scale: 0.5
     bonus_scale: 1.0
     context_scale: 0.35
   gate:
@@ -34,5 +35,5 @@ loss:
   class_aware_alignment_same_class_weight: 0.25
   gate_oracle_weight: 0.05
   gate_oracle_smoothing: 0.10
-  gate_oracle_start_epoch: 61
+  gate_oracle_start_phase: adaptation
   gate_oracle_adaptation_only: true

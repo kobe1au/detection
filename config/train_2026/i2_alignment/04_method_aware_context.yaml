@@ -6,14 +6,13 @@ model:
   alignment:
     enabled: true
     adaptive_bias: true
-    drift_guided: false
+    drift_guided: true
+    penalty_scale: 0.5
     bonus_scale: 1.0
     context_scale: 0.35
   gate:
     mode: fixed
 
 loss:
-  temporal_proto_current_weight: 0.005
-  temporal_proto_future_weight: 0.0
-  temporal_risk_calibration_weight: 0.10
   semantic_alignment_weight: 0.0
+  class_aware_alignment_same_class_weight: 0.0

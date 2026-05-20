@@ -1,4 +1,3 @@
-# future prototype 主实验，弱监督版本（权重较小）
 train:
   exp_name: i1_03_proto_future_weak
 
@@ -6,5 +5,6 @@ model:
   fusion_mode: concat
 
 loss:
-  temporal_proto_current_weight: 0.05
+  temporal_proto_current_weight: 0.005
   temporal_proto_future_weight: 0.001
+  temporal_risk_calibration_weight: 0.0

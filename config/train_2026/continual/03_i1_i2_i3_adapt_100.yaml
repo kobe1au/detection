@@ -6,11 +6,11 @@ data:
   extra_tests: []
 
 train:
-  exp_name: continual_ours_2026_adapt_005
+  exp_name: continual_03_i1_i2_i3_adapt_100
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 0.05
+  adaptation_ratio: 1.0
   replay_ratio: 0.25
 
 model:

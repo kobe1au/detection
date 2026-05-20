@@ -1,10 +1,17 @@
 data:
+  adapt_pt_dir: "pts/adapt"
+  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
   test_pt_dir: "pts/test"
   test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
   extra_tests: []
 
 train:
-  exp_name: continual_00_zero_adapt_concat
+  exp_name: continual_01_i1_adapt_020
+  epochs: 70
+  historical_epochs: 60
+  adaptation_epochs: 10
+  adaptation_ratio: 0.20
+  replay_ratio: 0.25
 
 model:
   fusion_mode: concat
