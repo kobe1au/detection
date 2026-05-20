@@ -32,7 +32,7 @@ class TriBranchGate(nn.Module):
     """
     Three-branch softmax gate for API + Graph fusion.
 
-    Typical q_dim=10:
+    Typical q_dim=9:
       [q_api, q_graph, q_align, pert_api, pert_graph,
        temporal_drift, branch_disagreement, entropy, api_alive, graph_alive]
 
@@ -44,7 +44,7 @@ class TriBranchGate(nn.Module):
         self,
         api_dim: int,
         graph_dim: int,
-        q_dim: int = 10,
+        q_dim: int = 9,
         hidden: int | None = None,
     ):
         super().__init__()

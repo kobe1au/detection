@@ -4,7 +4,7 @@ from typing import Dict
 import numpy as np
 
 
-def compute_aut(year_metric: Dict[int, float]) -> float:
+def compute_aut(year_metric: Dict[int, float], clip=True) -> float:
     if not year_metric:
         return 0.0
 
@@ -12,7 +12,8 @@ def compute_aut(year_metric: Dict[int, float]) -> float:
     values = np.array([year_metric[y] for y in years_sorted], dtype=np.float64)
 
     values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-    values = np.clip(values, 0.0, 1.0)
+    if clip:
+        values = np.clip(values, 0.0, 1.0)
 
     if len(values) == 1:
         return float(values[0])

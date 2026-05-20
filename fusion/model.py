@@ -928,6 +928,7 @@ class MalwareModelWithXAttn(nn.Module):
                     xattn_node_emb,
                     xattn_graph_batch,
                     max_num_nodes=self.max_xattn_nodes,
+                    batch_size=B,
                 )
                 max_nodes_dense = node_dense.size(1)
 
