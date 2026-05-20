@@ -4,9 +4,11 @@ import argparse
 import copy
 import csv
 import gc
+import hashlib
 import logging
 import os
 import random
+import subprocess
 import time as _time
 from typing import Any, Dict
 
@@ -16,7 +18,7 @@ import torch.nn as nn
 import yaml
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, recall_score, roc_auc_score
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset, Sampler
 from tqdm import tqdm
 
 from fusion.mm_dataset import MultiModalMalwareDataset, hierarchical_collate_fn
@@ -110,6 +112,33 @@ def read_split_years(csv_path: str) -> list[int]:
         raise ValueError(f"No valid years found in CSV: {csv_path}")
     return sorted(years)
 
+def preflight_validate_protocol(cfg, train_csv, adapt_csv, val_csv, test_csv):
+    train_years = read_split_years(train_csv)
+    val_years = read_split_years(val_csv)
+    test_years = read_split_years(test_csv)
+
+    if adapt_csv:
+        adapt_years = read_split_years(adapt_csv)
+        if min(adapt_years) <= max(train_years):
+            raise ValueError(
+                f"adapt_csv should be strictly newer than train_csv: "
+                f"train={train_years}, adapt={adapt_years}"
+            )
+
+        he = int(cfg["train"].get("historical_epochs", 0))
+        ae = int(cfg["train"].get("adaptation_epochs", 0))
+        if he <= 0 or ae <= 0:
+            raise ValueError("continual adaptation requires historical_epochs > 0 and adaptation_epochs > 0")
+
+    phase = str(cfg["loss"].get("gate_oracle_start_phase", "") or "").lower()
+    if phase and phase not in {"historical", "adaptation"}:
+        raise ValueError(f"gate_oracle_start_phase must be historical/adaptation/empty, got {phase}")
+
+    if min(val_years) < min(train_years):
+        raise ValueError(f"val years look older than train years: train={train_years}, val={val_years}")
+
+    if min(test_years) < min(train_years):
+        raise ValueError(f"test years look older than train years: train={train_years}, test={test_years}")
 
 def build_global_domain_years(*csv_paths: str) -> list[int]:
     years = set()
@@ -131,6 +160,13 @@ def validate_full_config(cfg):
     for k in ("data", "model", "train", "loss"):
         if k not in cfg:
             raise ValueError(f"missing config key: {k}")
+    
+    replay_strategy = str(cfg["train"].get("replay_strategy", "static")).lower()
+    if replay_strategy not in {"static", "dynamic_year_class"}:
+        raise ValueError(
+            "train.replay_strategy must be one of: "
+            "static, dynamic_year_class"
+        )
 
     allowed_top = {"data", "model", "train", "loss"}
     allowed_data = {
@@ -156,6 +192,7 @@ def validate_full_config(cfg):
         "warmup_epochs", "eta_min", "label_smoothing", "patience",
         "min_delta", "warmup_stage_epochs",
         "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
+        "replay_strategy",
     }
     allowed_loss = {
         "semantic_alignment_weight",
@@ -210,7 +247,7 @@ def validate_full_config(cfg):
         "train",
         cfg["train"],
         allowed_train,
-        optional={"historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio"},
+        optional={"historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio","replay_strategy"},
     )
     _require_keys(
         "loss",
@@ -253,6 +290,39 @@ def save_config_snapshot(cfg, path):
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(copy.deepcopy(cfg), f, allow_unicode=True, sort_keys=False)
 
+def get_git_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def config_hash(cfg: dict) -> str:
+    dumped = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=True)
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()[:12]
+
+
+def save_run_metadata(path, cfg, model):
+    total_params, trainable_params = count_params(model)
+    metadata = {
+        "git_sha": get_git_sha(),
+        "config_hash": config_hash(cfg),
+        "num_params": int(total_params),
+        "trainable_params": int(trainable_params),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f, allow_unicode=True, sort_keys=False)
+    return metadata
 
 # ═══════════════════════════════════════════════════════════════════════
 # CSV metrics (simplified — no more reject_rate/keep_f1/corrected_acc)
@@ -264,7 +334,8 @@ _CSV_HEADER = [
     "train_cls", "train_alignment", "train_branch_aux", "train_gate_oracle",
     "train_uncertainty", "train_gate_disagreement", "train_gate_entropy",
     "train_gate_api", "train_gate_graph", "train_gate_joint",
-    "val_loss", "val_cls_loss", "val_f1", "val_acc", "val_softmax_aurc",
+    "val_loss", "val_cls_loss", "val_f1", "val_acc",
+    "val_softmax_aurc", "val_softmax_eaurc",
     "val_uncertainty", "val_gate_disagreement", "val_gate_entropy",
     "val_gate_api", "val_gate_graph", "val_gate_joint",
     "lr", "best_score", "is_best", "no_improve",
@@ -397,6 +468,67 @@ def _gate_diagnostics(gate_weights, correct=None, q_api=None, q_graph=None):
         _mean_by_mask("qgraph", q_graph, high_name="qgraph")
     return out
 
+def _compute_bucket_metrics(values, labels, preds, prefix: str):
+    """
+    Split a continuous diagnostic value into low/mid/high tertiles and compute macro-F1.
+
+    Used for:
+      - alignment_coverage
+      - alignment_density
+      - q_align
+    """
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    preds = np.asarray(preds, dtype=np.int64).reshape(-1)
+
+    out = {
+        f"{prefix}_low_f1": 0.0,
+        f"{prefix}_mid_f1": 0.0,
+        f"{prefix}_high_f1": 0.0,
+        f"{prefix}_low_n": 0,
+        f"{prefix}_mid_n": 0,
+        f"{prefix}_high_n": 0,
+    }
+
+    if values.size == 0 or values.size != labels.size or labels.size != preds.size:
+        return out
+
+    valid = np.isfinite(values)
+    if valid.sum() < 3:
+        return out
+
+    v = values[valid]
+    y = labels[valid]
+    p = preds[valid]
+
+    q1, q2 = np.quantile(v, [1.0 / 3.0, 2.0 / 3.0])
+
+    masks = {
+        "low": v <= q1,
+        "mid": (v > q1) & (v < q2),
+        "high": v >= q2,
+    }
+
+    for name, mask in masks.items():
+        n = int(mask.sum())
+        out[f"{prefix}_{name}_n"] = n
+        if n > 0:
+            out[f"{prefix}_{name}_f1"] = float(
+                f1_score(y[mask], p[mask], average="macro", zero_division=0)
+            )
+
+    return out
+
+
+def _format_bucket_metrics(metrics: dict[str, float], prefix: str) -> str:
+    return (
+        f"{prefix}_low_f1={metrics.get(f'{prefix}_low_f1', 0.0):.4f}"
+        f"/n={int(metrics.get(f'{prefix}_low_n', 0))} "
+        f"{prefix}_mid_f1={metrics.get(f'{prefix}_mid_f1', 0.0):.4f}"
+        f"/n={int(metrics.get(f'{prefix}_mid_n', 0))} "
+        f"{prefix}_high_f1={metrics.get(f'{prefix}_high_f1', 0.0):.4f}"
+        f"/n={int(metrics.get(f'{prefix}_high_n', 0))}"
+    )
 
 def _extract_gate_weight_stds(extra):
     gw = extra.get("gate_weights")
@@ -462,6 +594,165 @@ def _balanced_sample_indices(
     selected.sort()
     return selected
 
+def _dataset_label_year_groups(dataset, group_by_year: bool = False):
+    """Build label or year-label groups over raw dataset indices."""
+    groups: dict[tuple[int, int] | int, list[int]] = {}
+
+    labels = getattr(dataset, "labels", None)
+    sample_sids = getattr(dataset, "sample_sids", None)
+    sid_to_year = getattr(dataset, "sid_to_year", None)
+    samples = getattr(dataset, "samples", None)
+
+    for idx in range(len(dataset)):
+        label = None
+        year = None
+
+        if labels is not None and sample_sids is not None and idx < len(sample_sids):
+            sid = sample_sids[idx]
+            if sid in labels:
+                label = int(labels[sid])
+            if sid_to_year is not None and sid in sid_to_year:
+                year = int(sid_to_year[sid])
+
+        if label is None and samples is not None and idx < len(samples):
+            sample = samples[idx]
+            if len(sample) >= 2:
+                label = int(sample[1])
+            if len(sample) >= 4:
+                year = int(sample[3])
+
+        if label is None:
+            continue
+
+        group = (int(year), int(label)) if group_by_year and year is not None else int(label)
+        groups.setdefault(group, []).append(idx)
+
+    return groups
+
+
+def _count_group_samples(groups, ratio: float, min_per_group: int = 1) -> int:
+    ratio = float(ratio)
+    if ratio >= 1.0:
+        return sum(len(v) for v in groups.values())
+    if ratio <= 0.0:
+        return 0
+
+    total = 0
+    for indices in groups.values():
+        if not indices:
+            continue
+        keep = int(round(len(indices) * ratio))
+        keep = max(min_per_group, keep)
+        total += min(keep, len(indices))
+    return total
+
+
+class YearClassBalancedReplaySampler(Sampler[int]):
+    """
+    Dynamic sampler for continual adaptation.
+
+    Dataset layout must be:
+      ConcatDataset([adapt_dataset, historical_dataset])
+
+    Each epoch samples:
+      - adaptation samples balanced by class
+      - replay samples balanced by year x class
+    """
+
+    def __init__(
+        self,
+        adapt_dataset,
+        historical_dataset,
+        adaptation_ratio: float,
+        replay_ratio: float,
+        seed: int,
+        min_per_group: int = 1,
+    ):
+        self.adapt_dataset = adapt_dataset
+        self.historical_dataset = historical_dataset
+        self.adaptation_ratio = float(adaptation_ratio)
+        self.replay_ratio = float(replay_ratio)
+        self.seed = int(seed)
+        self.min_per_group = int(min_per_group)
+        self.epoch = 0
+
+        self.hist_offset = len(adapt_dataset)
+
+        self.adapt_groups = _dataset_label_year_groups(
+            adapt_dataset,
+            group_by_year=False,
+        )
+        self.replay_groups = _dataset_label_year_groups(
+            historical_dataset,
+            group_by_year=True,
+        )
+
+        self.num_adapt_samples = _count_group_samples(
+            self.adapt_groups,
+            self.adaptation_ratio,
+            min_per_group=self.min_per_group,
+        )
+        self.num_replay_samples = _count_group_samples(
+            self.replay_groups,
+            self.replay_ratio,
+            min_per_group=self.min_per_group,
+        )
+
+        if self.num_adapt_samples <= 0:
+            raise ValueError(
+                "dynamic_year_class replay requested, but adaptation_ratio "
+                "selected no adaptation samples"
+            )
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _sample_groups(self, groups, ratio: float, rng: random.Random, offset: int = 0):
+        ratio = float(ratio)
+        if ratio <= 0.0:
+            return []
+
+        selected = []
+        for _, indices in sorted(groups.items()):
+            if not indices:
+                continue
+
+            shuffled = list(indices)
+            rng.shuffle(shuffled)
+
+            if ratio >= 1.0:
+                keep = len(shuffled)
+            else:
+                keep = int(round(len(shuffled) * ratio))
+                keep = max(self.min_per_group, keep)
+                keep = min(keep, len(shuffled))
+
+            selected.extend([offset + idx for idx in shuffled[:keep]])
+
+        return selected
+
+    def __iter__(self):
+        rng = random.Random(self.seed + 1000003 * self.epoch)
+
+        adapt_indices = self._sample_groups(
+            self.adapt_groups,
+            self.adaptation_ratio,
+            rng,
+            offset=0,
+        )
+        replay_indices = self._sample_groups(
+            self.replay_groups,
+            self.replay_ratio,
+            rng,
+            offset=self.hist_offset,
+        )
+
+        indices = adapt_indices + replay_indices
+        rng.shuffle(indices)
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_adapt_samples + self.num_replay_samples
 
 def _build_continual_adaptation_loader(
     historical_dataset,
@@ -473,7 +764,38 @@ def _build_continual_adaptation_loader(
     train_cfg = cfg["train"]
     adapt_ratio = float(train_cfg.get("adaptation_ratio", 1.0))
     replay_ratio = float(train_cfg.get("replay_ratio", 0.25))
+    replay_strategy = str(train_cfg.get("replay_strategy", "static")).lower()
     seed = int(train_cfg.get("seed", 42))
+
+    if replay_strategy == "dynamic_year_class":
+        sampler = YearClassBalancedReplaySampler(
+            adapt_dataset=adapt_dataset,
+            historical_dataset=historical_dataset,
+            adaptation_ratio=adapt_ratio,
+            replay_ratio=replay_ratio,
+            seed=seed,
+            min_per_group=1,
+        )
+
+        # Important: sampler and shuffle cannot be used together.
+        # generator is only useful for RandomSampler; keep worker_init_fn but drop generator here.
+        dl_kwargs = dict(loader_kwargs)
+        dl_kwargs.pop("generator", None)
+
+        loader = DataLoader(
+            ConcatDataset([adapt_dataset, historical_dataset]),
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=False,
+            **dl_kwargs,
+        )
+        return loader, sampler.num_adapt_samples, sampler.num_replay_samples
+
+    if replay_strategy != "static":
+        raise ValueError(
+            f"Unsupported replay_strategy={replay_strategy}; "
+            "expected static or dynamic_year_class"
+        )
 
     adapt_indices = _balanced_sample_indices(adapt_dataset, adapt_ratio, seed)
     replay_indices = _balanced_sample_indices(
@@ -483,11 +805,16 @@ def _build_continual_adaptation_loader(
         min_per_group=1,
         group_by_year=True,
     )
+
     if not adapt_indices:
-        raise ValueError("continual adaptation requested, but adaptation_ratio selected no samples")
+        raise ValueError(
+            "continual adaptation requested, but adaptation_ratio selected no samples"
+        )
+
     datasets = [Subset(adapt_dataset, adapt_indices)]
     if replay_indices:
         datasets.append(Subset(historical_dataset, replay_indices))
+
     loader = DataLoader(
         ConcatDataset(datasets),
         batch_size=batch_size,
@@ -527,6 +854,13 @@ def train_one_epoch(
     sum_align = 0.0
     sum_branch_aux = 0.0
     sum_gate_oracle = 0.0
+
+    sum_oracle_api = 0.0
+    sum_oracle_graph = 0.0
+    sum_oracle_joint = 0.0
+    num_oracle = 0
+    sum_oracle_entropy = 0.0
+    num_oracle_entropy = 0
 
     sum_uncertainty = 0.0
     num_uncertainty = 0
@@ -663,6 +997,19 @@ def train_one_epoch(
             if ok_uncertainty:
                 sum_uncertainty += uncertainty * bs
                 num_uncertainty += bs
+            
+            oracle_mean = extra.get("gate_oracle_target_mean")
+            if isinstance(oracle_mean, torch.Tensor) and oracle_mean.numel() == 3:
+                om = oracle_mean.detach().float().cpu()
+                sum_oracle_api += float(om[0])
+                sum_oracle_graph += float(om[1])
+                sum_oracle_joint += float(om[2])
+                num_oracle += 1
+
+            oracle_entropy = extra.get("gate_oracle_entropy")
+            if isinstance(oracle_entropy, torch.Tensor) and oracle_entropy.numel() > 0:
+                sum_oracle_entropy += float(oracle_entropy.detach().float().mean()) * bs
+                num_oracle_entropy += bs
 
             gate_disagreement, ok_gate_disagreement = _extract_extra_mean(extra, "gate_disagreement")
             if ok_gate_disagreement:
@@ -780,6 +1127,10 @@ def train_one_epoch(
             f"valid={total_valid} failed={failed} skipped={skipped} "
             f"optim_steps={optimizer_steps} grad_accum={grad_accum_steps} "
             f"avg_w=({avg_gate_api:.3f},{avg_gate_graph:.3f},{avg_gate_joint:.3f}) "
+            f"oracle=({sum_oracle_api / max(num_oracle, 1):.3f},"
+            f"{sum_oracle_graph / max(num_oracle, 1):.3f},"
+            f"{sum_oracle_joint / max(num_oracle, 1):.3f}) "
+            f"oracle_ent={sum_oracle_entropy / max(num_oracle_entropy, 1):.3f} "
             f"std_w=({sum_wi_std / max(num_w_std, 1):.3f},"
             f"{sum_wg_std / max(num_w_std, 1):.3f},"
             f"{sum_wj_std / max(num_w_std, 1):.3f}) "
@@ -820,6 +1171,7 @@ def eval_one_epoch(
     num_epochs=1,
     use_amp=False,
     logger=None,
+    dump_path: str | None = None
 ):
     model.eval()
 
@@ -865,7 +1217,12 @@ def eval_one_epoch(
     all_gate_qapi = []
     all_gate_qgraph = []
 
+    all_qalign = []
+    all_align_coverage = []
+    all_align_density = []
+
     times = []
+    dump_rows = []
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -890,9 +1247,10 @@ def eval_one_epoch(
             failed += r[-1]
             continue
 
-        graph, masks, y, _, ex, nf = r
+        graph, masks, y, sids, ex, nf = r
         failed += nf
         qapi, qg, qa, papi, pg, tids = ex
+        years = batch.get("years")
 
         bs = y.size(0)
         total_valid += bs
@@ -971,6 +1329,116 @@ def eval_one_epoch(
         all_labels.extend(y.detach().cpu().tolist())
         all_confs.extend(conf.detach().cpu().tolist())
 
+        # Per-sample diagnostics for I2 alignment bucket analysis.
+        all_qalign.extend(qa.detach().float().view(-1).cpu().tolist())
+
+        def _append_extra_vector(key, target_list):
+            value = extra.get(key) if isinstance(extra, dict) else None
+            if isinstance(value, torch.Tensor):
+                value = value.detach().float().view(-1)
+                if value.numel() == bs:
+                    target_list.extend(value.cpu().tolist())
+                    return True
+            target_list.extend([float("nan")] * bs)
+            return False
+
+        ok_cov = _append_extra_vector("alignment_coverage", all_align_coverage)
+        if not ok_cov:
+            # If xattn alignment stats are unavailable, try prior mask coverage.
+            del all_align_coverage[-bs:]
+            _append_extra_vector("alignment_coverage_prior", all_align_coverage)
+
+        ok_den = _append_extra_vector("alignment_density", all_align_density)
+        if not ok_den:
+            del all_align_density[-bs:]
+            _append_extra_vector("alignment_density_prior", all_align_density)
+
+        if dump_path:
+            bs_local = y.size(0)
+
+            def _tensor_vec(t, default=float("nan")):
+                if isinstance(t, torch.Tensor) and t.numel() == bs_local:
+                    return t.detach().float().view(-1).cpu().tolist()
+                if isinstance(t, torch.Tensor) and t.numel() > 0:
+                    flat = t.detach().float().view(-1)
+                    if flat.numel() == bs_local:
+                        return flat.cpu().tolist()
+                return [default] * bs_local
+
+            def _extra_vec(key, default=float("nan")):
+                value = extra.get(key) if isinstance(extra, dict) else None
+                return _tensor_vec(value, default=default)
+
+            sid_values = list(sids) if sids is not None else ["" for _ in range(bs_local)]
+
+            if isinstance(years, torch.Tensor) and years.numel() == bs_local:
+                year_values = years.detach().view(-1).cpu().tolist()
+            else:
+                year_values = ["" for _ in range(bs_local)]
+
+            label_values = y.detach().view(-1).cpu().tolist()
+            pred_values = preds.detach().view(-1).cpu().tolist()
+            conf_values = conf.detach().float().view(-1).cpu().tolist()
+            correct_values = (preds == y).detach().long().view(-1).cpu().tolist()
+
+            q_api_values = _tensor_vec(qapi)
+            q_graph_values = _tensor_vec(qg)
+            q_align_values = _tensor_vec(qa)
+            pert_api_values = _tensor_vec(papi)
+            pert_graph_values = _tensor_vec(pg)
+
+            uncertainty_values = _extra_vec("uncertainty_score")
+            disagreement_values = _extra_vec("gate_disagreement")
+            entropy_values = _extra_vec("gate_entropy")
+
+            # Prefer actual xattn alignment stats; fall back to prior mask stats.
+            coverage_values = _extra_vec("alignment_coverage")
+            if all(np.isnan(v) for v in coverage_values):
+                coverage_values = _extra_vec("alignment_coverage_prior")
+
+            density_values = _extra_vec("alignment_density")
+            if all(np.isnan(v) for v in density_values):
+                density_values = _extra_vec("alignment_density_prior")
+
+            gate_values = extra.get("gate_weights") if isinstance(extra, dict) else None
+            if (
+                isinstance(gate_values, torch.Tensor)
+                and gate_values.ndim == 2
+                and gate_values.size(0) == bs_local
+                and gate_values.size(1) == 3
+            ):
+                gate_cpu = gate_values.detach().float().cpu()
+                gate_api_values = gate_cpu[:, 0].tolist()
+                gate_graph_values = gate_cpu[:, 1].tolist()
+                gate_joint_values = gate_cpu[:, 2].tolist()
+            else:
+                gate_api_values = [float("nan")] * bs_local
+                gate_graph_values = [float("nan")] * bs_local
+                gate_joint_values = [float("nan")] * bs_local
+
+            for i in range(bs_local):
+                dump_rows.append({
+                    "sample_id": sid_values[i],
+                    "year": year_values[i],
+                    "label": int(label_values[i]),
+                    "pred": int(pred_values[i]),
+                    "confidence": float(conf_values[i]),
+                    "correct": int(correct_values[i]),
+                    "q_api": float(q_api_values[i]),
+                    "q_graph": float(q_graph_values[i]),
+                    "q_align": float(q_align_values[i]),
+                    "pert_api": float(pert_api_values[i]),
+                    "pert_graph": float(pert_graph_values[i]),
+                    "gate_api": float(gate_api_values[i]),
+                    "gate_graph": float(gate_graph_values[i]),
+                    "gate_joint": float(gate_joint_values[i]),
+                    "uncertainty_score": float(uncertainty_values[i]),
+                    "gate_disagreement": float(disagreement_values[i]),
+                    "gate_entropy": float(entropy_values[i]),
+                    "alignment_coverage": float(coverage_values[i]),
+                    "alignment_density": float(density_values[i]),
+                })
+
         if batch_gate_ok:
             all_gate_correct.extend((preds == y).detach().float().cpu().tolist())
             all_gate_qapi.extend(qapi.detach().float().view(-1).cpu().tolist())
@@ -983,6 +1451,7 @@ def eval_one_epoch(
             0.0,  # f1
             0.0,  # acc
             1.0,  # softmax aurc
+            1.0,  # softmax eaurc
             0.0,  # gate api
             0.0,  # gate graph
             0.0,  # gate joint
@@ -1003,6 +1472,7 @@ def eval_one_epoch(
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     acc = accuracy_score(all_labels, all_preds)
     softmax_aurc_v = float(aurc(conf_arr, correct_arr))
+    softmax_eaurc_v = float(eaurc(conf_arr, correct_arr))
 
     avg_gate_api = sum_wi / max(num_w, 1)
     avg_gate_graph = sum_wg / max(num_w, 1)
@@ -1017,6 +1487,16 @@ def eval_one_epoch(
         correct=all_gate_correct,
         q_api=(all_gate_qapi if len(all_gate_qapi) == len(all_gate_weights) else None),
         q_graph=(all_gate_qgraph if len(all_gate_qgraph) == len(all_gate_weights) else None),
+    )
+
+    align_cov_bucket = _compute_bucket_metrics(
+        all_align_coverage, all_labels, all_preds, "align_cov"
+    )
+    align_density_bucket = _compute_bucket_metrics(
+        all_align_density, all_labels, all_preds, "align_density"
+    )
+    q_align_bucket = _compute_bucket_metrics(
+        all_qalign, all_labels, all_preds, "q_align"
     )
 
     if logger:
@@ -1049,6 +1529,13 @@ def eval_one_epoch(
                 f"qgraph_low={gate_diag.get('qgraph_low')} "
                 f"qgraph_high={gate_diag.get('qgraph_high')}"
             )
+            
+        logger.info(
+            f"[eval][epoch {epoch}] alignment-buckets: "
+            f"{_format_bucket_metrics(align_cov_bucket, 'align_cov')} | "
+            f"{_format_bucket_metrics(align_density_bucket, 'align_density')} | "
+            f"{_format_bucket_metrics(q_align_bucket, 'q_align')}"
+        )
 
         if times and total_valid > 0:
             total_time = sum(times)
@@ -1062,12 +1549,48 @@ def eval_one_epoch(
             peak = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
             logger.info(f"[eval][epoch {epoch}] peak_gpu={peak:.1f}MB")
 
+    if dump_path and dump_rows:
+        dump_dir = os.path.dirname(dump_path)
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+
+        fieldnames = [
+            "sample_id",
+            "year",
+            "label",
+            "pred",
+            "confidence",
+            "correct",
+            "q_api",
+            "q_graph",
+            "q_align",
+            "pert_api",
+            "pert_graph",
+            "gate_api",
+            "gate_graph",
+            "gate_joint",
+            "uncertainty_score",
+            "gate_disagreement",
+            "gate_entropy",
+            "alignment_coverage",
+            "alignment_density",
+        ]
+
+        with open(dump_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(dump_rows)
+
+        if logger:
+            logger.info(f"[eval][epoch {epoch}] per-sample dump saved: {dump_path}")
+
     return (
         avg_loss,
         avg_cls,
         f1,
         acc,
         softmax_aurc_v,
+        softmax_eaurc_v,
         avg_gate_api,
         avg_gate_graph,
         avg_gate_joint,
@@ -1102,6 +1625,7 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
             f1,
             acc,
             softmax_aurc_v,
+            softmax_eaurc_v,
             aw_api,
             aw_graph,
             aw_joint,
@@ -1119,6 +1643,7 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
             "f1": f1,
             "acc": acc,
             "softmax_aurc": softmax_aurc_v,
+            "softmax_eaurc": softmax_eaurc_v,
             "gate_api": aw_api,
             "gate_graph": aw_graph,
             "gate_joint": aw_joint,
@@ -1294,6 +1819,9 @@ def main():
         resolve_path(data_root, spec["test_csv"])
         for spec in extra_test_specs
     ]
+
+    preflight_validate_protocol(cfg, train_csv_path, adapt_csv_path, val_csv_path)
+
     domain_years = build_global_domain_years(
         train_csv_path,
         *( [adapt_csv_path] if adapt_csv_path else [] ),
@@ -1409,7 +1937,8 @@ def main():
         )
         logger.info(
             "Continual adaptation loader | "
-            f"adapt_samples={n_adapt} replay_samples={n_replay} "
+            f"strategy={str(c_train.get('replay_strategy', 'static'))} "
+            f"adapt_samples_per_epoch={n_adapt} replay_samples_per_epoch={n_replay} "
             f"adapt_ratio={float(c_train.get('adaptation_ratio', 1.0)):.3f} "
             f"replay_ratio={float(c_train.get('replay_ratio', 0.25)):.3f}"
         )
@@ -1460,6 +1989,17 @@ def main():
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,
     ).to(device)
+
+    metadata_path = os.path.join(ckpt_dir, "run_metadata.yaml")
+    run_metadata = save_run_metadata(metadata_path, cfg, model)
+    logger.info(
+        "Run metadata | "
+        f"git_sha={run_metadata['git_sha']} "
+        f"config_hash={run_metadata['config_hash']} "
+        f"num_params={run_metadata['num_params']} "
+        f"trainable_params={run_metadata['trainable_params']} "
+        f"path={metadata_path}"
+    )
 
     start_epoch, best_score, no_improve = 1, float("-inf"), 0
 
@@ -1563,6 +2103,11 @@ def main():
         epoch_loss_cfg["_continual_phase"] = continual_phase
         epoch_loader = dl_adapt if continual_phase == "adaptation" else dl_tr
 
+        if continual_phase == "adaptation":
+            sampler = getattr(epoch_loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+
         (
             tr_loss,
             tr_f1,
@@ -1588,6 +2133,7 @@ def main():
             val_f1,
             val_acc,
             val_softmax_aurc,
+            val_softmax_eaurc,
             val_gate_api,
             val_gate_graph,
             val_gate_joint,
@@ -1641,6 +2187,7 @@ def main():
             train_gate_joint=tr_gate_joint,
             val_loss=val_loss, val_cls_loss=val_cls, val_f1=val_f1, val_acc=val_acc,
             val_softmax_aurc=val_softmax_aurc,
+            val_softmax_eaurc=val_softmax_eaurc,
             val_uncertainty=val_uncertainty,
             val_gate_disagreement=val_gate_disagreement,
             val_gate_entropy=val_gate_entropy,
@@ -1658,7 +2205,8 @@ def main():
         logger.info(
             f"[Epoch {epoch:03d}] train: loss={tr_loss:.4f} f1={tr_f1:.4f} | "
             f"val: loss={val_loss:.4f} f1={val_f1:.4f} "
-            f"softmax_aurc={val_softmax_aurc:.4f}| "
+            f"softmax_aurc={val_softmax_aurc:.4f} "
+            f"softmax_eaurc={val_softmax_eaurc:.4f} | "
             f"sel={selection_score:.4f}")
         early_stop_allowed = (
             stage_name != "warmup"
@@ -1719,12 +2267,16 @@ def main():
     dl_test = DataLoader(ds_test, batch_size=eval_batch_size, shuffle=False, **test_lk)
     test_year_loaders = build_year_subset_loaders(ds_test, eval_batch_size, test_lk)
 
+    eval_dump_dir = os.path.join(ckpt_dir, "eval_dumps")
+    test_dump_path = os.path.join(eval_dump_dir, f"eval_dump_{exp_name}_test.csv")
+
     (
         test_loss,
         test_cls,
         test_f1,
         test_acc,
         test_softmax_aurc,
+        test_softmax_eaurc,
         test_gate_api,
         test_gate_graph,
         test_gate_joint,
@@ -1733,7 +2285,8 @@ def main():
         test_gate_entropy,
     ) = eval_one_epoch(
         model, dl_test, criterion, device, epoch=0, num_epochs=1,
-        use_amp=use_amp, logger=logger
+        use_amp=use_amp, logger=logger,
+        dump_path=test_dump_path,
     )
 
     logger.info(
@@ -1768,7 +2321,7 @@ def main():
             fieldnames=[
                 "exp_name", "adaptation_ratio", "phase", "test_year",
                 "macro_f1", "malware_recall", "fnr", "auroc", "auprc",
-                "softmax_aurc",
+                "softmax_aurc","softmax_eaurc",
                 "gate_api", "gate_graph", "gate_joint",
                 "uncertainty", "gate_disagreement", "gate_entropy",
             ]
@@ -1785,6 +2338,7 @@ def main():
             "auroc": f"{det_metrics['auroc']:.6f}",
             "auprc": f"{det_metrics['auprc']:.6f}",
             "softmax_aurc": f"{test_softmax_aurc:.6f}",
+            "softmax_eaurc": f"{test_softmax_eaurc:.6f}",
             "gate_api": f"{test_gate_api:.6f}",
             "gate_graph": f"{test_gate_graph:.6f}",
             "gate_joint": f"{test_gate_joint:.6f}",
@@ -1856,12 +2410,19 @@ def main():
         dl_extra = DataLoader(ds_extra, batch_size=eval_batch_size, shuffle=False, **extra_lk)
         extra_year_loaders = build_year_subset_loaders(ds_extra, eval_batch_size, extra_lk)
 
+        extra_dump_path = os.path.join(
+            ckpt_dir,
+            "eval_dumps",
+            f"eval_dump_{exp_name}_{_safe_eval_name(extra_name)}.csv",
+        )
+
         (
             extra_loss,
             extra_cls,
             extra_f1,
             extra_acc,
             extra_softmax_aurc,
+            extra_softmax_eaurc,
             extra_gate_api,
             extra_gate_graph,
             extra_gate_joint,
@@ -1870,12 +2431,14 @@ def main():
             extra_gate_entropy,
         ) = eval_one_epoch(
             model, dl_extra, criterion, device, epoch=0, num_epochs=1,
-            use_amp=use_amp, logger=logger
+            use_amp=use_amp, logger=logger,
+            dump_path=extra_dump_path,
         )
 
         logger.info(
             f"EXTRA_TEST[{extra_name}]: loss={extra_loss:.4f} F1={extra_f1:.4f} "
             f"Acc={extra_acc:.4f} softmax_AURC={extra_softmax_aurc:.4f} "
+            f"softmax_E-AURC={extra_softmax_eaurc:.4f} "
             f"uncertainty={extra_uncertainty:.4f}"
         )
 

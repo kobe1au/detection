@@ -172,6 +172,14 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             if smoothing > 0.0:
                 smoothing = min(max(smoothing, 0.0), 1.0)
                 oracle = (1.0 - smoothing) * oracle + smoothing / oracle.size(1)
+
+            oracle_detached = oracle.detach()
+            extra["gate_oracle_target_mean"] = oracle_detached.mean(dim=0)
+            extra["gate_oracle_entropy"] = -(
+                oracle_detached.clamp_min(1e-8)
+                * oracle_detached.clamp_min(1e-8).log()
+            ).sum(dim=1)
+
             log_gate = torch.log(gate_weights.float().clamp_min(1e-8))
             loss_gate_oracle = _safe(F.kl_div(log_gate, oracle, reduction="batchmean"))
 

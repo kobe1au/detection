@@ -50,8 +50,10 @@ class TriBranchGate(nn.Module):
         super().__init__()
         hidden = hidden or ArchitectureConstants.GATE_HIDDEN_DIM
 
+        self.q_dim = int(q_dim)
+
         self.net = nn.Sequential(
-            nn.Linear(api_dim + graph_dim + q_dim, hidden),
+            nn.Linear(api_dim + graph_dim + self.q_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 3),
         )
@@ -68,6 +70,10 @@ class TriBranchGate(nn.Module):
         graph_emb: torch.Tensor,
         qs: torch.Tensor,
     ) -> torch.Tensor:
+        if qs.size(-1) != self.q_dim:
+            raise ValueError(
+                f"TriBranchGate expected q_dim={self.q_dim}, got {qs.size(-1)}"
+            )
         x = torch.cat([api_emb, graph_emb, qs], dim=-1)
         return torch.softmax(self.net(x), dim=-1)
 
