@@ -112,10 +112,23 @@ def read_split_years(csv_path: str) -> list[int]:
         raise ValueError(f"No valid years found in CSV: {csv_path}")
     return sorted(years)
 
-def preflight_validate_protocol(cfg, train_csv, adapt_csv, val_csv, test_csv):
+def preflight_validate_protocol(
+    cfg,
+    train_csv,
+    adapt_csv,
+    val_csv,
+    test_csv,
+    extra_test_csvs=None,
+):
     train_years = read_split_years(train_csv)
     val_years = read_split_years(val_csv)
     test_years = read_split_years(test_csv)
+
+    extra_test_csvs = extra_test_csvs or []
+    extra_test_years = []
+    for extra_csv in extra_test_csvs:
+        years = read_split_years(extra_csv)
+        extra_test_years.append((extra_csv, years))
 
     if adapt_csv:
         adapt_years = read_split_years(adapt_csv)
@@ -128,17 +141,33 @@ def preflight_validate_protocol(cfg, train_csv, adapt_csv, val_csv, test_csv):
         he = int(cfg["train"].get("historical_epochs", 0))
         ae = int(cfg["train"].get("adaptation_epochs", 0))
         if he <= 0 or ae <= 0:
-            raise ValueError("continual adaptation requires historical_epochs > 0 and adaptation_epochs > 0")
+            raise ValueError(
+                "continual adaptation requires historical_epochs > 0 "
+                "and adaptation_epochs > 0"
+            )
 
     phase = str(cfg["loss"].get("gate_oracle_start_phase", "") or "").lower()
     if phase and phase not in {"historical", "adaptation"}:
-        raise ValueError(f"gate_oracle_start_phase must be historical/adaptation/empty, got {phase}")
+        raise ValueError(
+            f"gate_oracle_start_phase must be historical/adaptation/empty, got {phase}"
+        )
 
     if min(val_years) < min(train_years):
-        raise ValueError(f"val years look older than train years: train={train_years}, val={val_years}")
+        raise ValueError(
+            f"val years look older than train years: train={train_years}, val={val_years}"
+        )
 
     if min(test_years) < min(train_years):
-        raise ValueError(f"test years look older than train years: train={train_years}, test={test_years}")
+        raise ValueError(
+            f"test years look older than train years: train={train_years}, test={test_years}"
+        )
+
+    for extra_csv, years in extra_test_years:
+        if min(years) < min(train_years):
+            raise ValueError(
+                f"extra test years look older than train years: "
+                f"train={train_years}, extra_csv={extra_csv}, extra={years}"
+            )
 
 def build_global_domain_years(*csv_paths: str) -> list[int]:
     years = set()
@@ -1654,7 +1683,11 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
 
     if logger and metrics:
         lines = [
-            f"{y}:F1={m['f1']:.3f}/softmax_AURC={m['softmax_aurc']:.3f}"
+            (
+                f"{y}:F1={m['f1']:.3f}"
+                f"/AURC={m['softmax_aurc']:.3f}"
+                f"/E-AURC={m['softmax_eaurc']:.3f}"
+            )
             for y, m in sorted(metrics.items())
         ]
         logger.info(f"[{tag}][epoch {epoch}] yearly: " + " | ".join(lines))
@@ -1820,7 +1853,14 @@ def main():
         for spec in extra_test_specs
     ]
 
-    preflight_validate_protocol(cfg, train_csv_path, adapt_csv_path, val_csv_path)
+    preflight_validate_protocol(
+        cfg,
+        train_csv_path,
+        adapt_csv_path,
+        val_csv_path,
+        test_csv_path,
+        extra_test_csv_paths,
+    )
 
     domain_years = build_global_domain_years(
         train_csv_path,
@@ -2303,6 +2343,8 @@ def main():
     det_metrics = _binary_detection_metrics(test_labels, test_probs, test_preds)
     test_conf = test_probs.max(axis=1)
     test_correct = (test_preds == test_labels).astype(np.float64)
+    cal_softmax_aurc = float(aurc(test_conf, test_correct))
+    cal_softmax_eaurc = float(eaurc(test_conf, test_correct))
     logger.info(
         "Final detection metrics: "
         f"F1={test_f1:.4f} MalwareRecall={det_metrics['malware_recall']:.4f} "
@@ -2321,7 +2363,10 @@ def main():
             fieldnames=[
                 "exp_name", "adaptation_ratio", "phase", "test_year",
                 "macro_f1", "malware_recall", "fnr", "auroc", "auprc",
-                "softmax_aurc","softmax_eaurc",
+                "raw_softmax_aurc",
+                "raw_softmax_eaurc",
+                "cal_softmax_aurc",
+                "cal_softmax_eaurc",
                 "gate_api", "gate_graph", "gate_joint",
                 "uncertainty", "gate_disagreement", "gate_entropy",
             ]
@@ -2337,8 +2382,10 @@ def main():
             "fnr": f"{det_metrics['fnr']:.6f}",
             "auroc": f"{det_metrics['auroc']:.6f}",
             "auprc": f"{det_metrics['auprc']:.6f}",
-            "softmax_aurc": f"{test_softmax_aurc:.6f}",
-            "softmax_eaurc": f"{test_softmax_eaurc:.6f}",
+            "raw_softmax_aurc": f"{test_softmax_aurc:.6f}",
+            "raw_softmax_eaurc": f"{test_softmax_eaurc:.6f}",
+            "cal_softmax_aurc": f"{cal_softmax_aurc:.6f}",
+            "cal_softmax_eaurc": f"{cal_softmax_eaurc:.6f}",
             "gate_api": f"{test_gate_api:.6f}",
             "gate_graph": f"{test_gate_graph:.6f}",
             "gate_joint": f"{test_gate_joint:.6f}",
@@ -2348,11 +2395,13 @@ def main():
         })
     logger.info(f"Final metrics CSV: {final_metrics_path}")
     logger.info(
-        f"Selective calibrated summary: softmax_AURC={aurc(test_conf,test_correct):.4f} "
+        f"Selective calibrated summary: "
+        f"softmax_AURC={cal_softmax_aurc:.4f} "
+        f"softmax_E-AURC={cal_softmax_eaurc:.4f}"
     )
     logger.info(
-        f"🎯 Selective (calibrated): AURC={aurc(test_conf,test_correct):.4f} "
-        f"softmax_E-AURC={eaurc(test_conf,test_correct):.4f} | "
+        f"🎯 Selective (calibrated): AURC={cal_softmax_aurc:.4f} "
+        f"softmax_E-AURC={cal_softmax_eaurc:.4f} | "
         f"error@cov0.8={risk_at_coverage(test_conf,test_correct,0.8):.4f} "
         f"error@cov0.9={risk_at_coverage(test_conf,test_correct,0.9):.4f} | "
         f"coverage@error≤1%={coverage_at_risk(test_conf,test_correct,0.01):.4f} "
@@ -2448,10 +2497,14 @@ def main():
         extra_preds = extra_probs.argmax(axis=1)
         extra_conf = extra_probs.max(axis=1)
         extra_correct = (extra_preds == extra_labels).astype(np.float64)
+
+        extra_cal_softmax_aurc = float(aurc(extra_conf, extra_correct))
+        extra_cal_softmax_eaurc = float(eaurc(extra_conf, extra_correct))
+
         logger.info(
             f"Selective[{extra_name}] calibrated: "
-            f"softmax_AURC={aurc(extra_conf, extra_correct):.4f} "
-            f"softmax_E-AURC={eaurc(extra_conf, extra_correct):.4f} | "
+            f"softmax_AURC={extra_cal_softmax_aurc:.4f} "
+            f"softmax_E-AURC={extra_cal_softmax_eaurc:.4f} | "
             f"error@cov0.8={risk_at_coverage(extra_conf, extra_correct, 0.8):.4f} "
             f"error@cov0.9={risk_at_coverage(extra_conf, extra_correct, 0.9):.4f} | "
             f"coverage@error<=1%={coverage_at_risk(extra_conf, extra_correct, 0.01):.4f} "
