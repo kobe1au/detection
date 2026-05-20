@@ -6,7 +6,7 @@ data:
   extra_tests: []
 
 train:
-  exp_name: continual_ours_2026_adapt_010
+  exp_name: continual_01_i1_adapt_010
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
@@ -14,25 +14,18 @@ train:
   replay_ratio: 0.25
 
 model:
-  fusion_mode: ours
+  fusion_mode: concat
   alignment:
-    enabled: true
-    adaptive_bias: true
-    drift_guided: true
-    bonus_scale: 1.0
-    context_scale: 0.35
+    enabled: false
   gate:
-    mode: learned
-    quality_inputs: true
-    drift_inputs: true
+    mode: fixed
+    quality_inputs: false
+    drift_inputs: false
 
 loss:
   temporal_proto_current_weight: 0.0
   temporal_proto_future_weight: 0.0
   temporal_risk_calibration_weight: 0.0
-  semantic_alignment_weight: 0.03
-  class_aware_alignment_same_class_weight: 0.25
-  gate_oracle_weight: 0.05
-  gate_oracle_smoothing: 0.10
-  gate_oracle_start_epoch: 61
-  gate_oracle_adaptation_only: true
+  semantic_alignment_weight: 0.0
+  class_aware_alignment_same_class_weight: 0.0
+  gate_oracle_weight: 0.0

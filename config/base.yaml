@@ -10,19 +10,21 @@ data:
   val_pt_dir: "pts/val"
   test_pt_dir: "pts/test"
 
+  # Current protocol: 2018-2021 train / 2022 val / 2024 final test.
+  # Continual configs set adapt_csv to the 2023 adaptation pool explicitly.
+
   # DATA_ROOT 下的时间划分 CSV。主实验：2018-2021 train / 2022 val / 2023 test。
   # 2024 不参与调参，作为更长时间跨度的漂移压力测试。
   train_csv: "resource/dataset_split_2018_2024/train.csv"
   adapt_pt_dir: null
   adapt_csv: null
   val_csv: "resource/dataset_split_2018_2024/val.csv"
-  test_csv: "resource/dataset_split_2018_2024/test_2023.csv"
+  test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
+
+  # Default main protocol reports 2024 as final test; no extra test is needed.
 
   # 补充/压力测试集：训练完成后在同一个 best checkpoint 和同一个 2022 校准器上额外评估。
-  extra_tests:
-    - name: "stress_2024"
-      test_pt_dir: "pts/test"
-      test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
+  extra_tests: []
 
   # 每个样本最多保留的 API 事件数；应与 api_encoder.max_seq_len 保持一致。
   max_api_events_per_sample: 1024
@@ -141,3 +143,6 @@ loss:
   branch_aux_weight: 0.10
   gate_oracle_weight: 0.0
   gate_oracle_temperature: 0.5
+  gate_oracle_smoothing: 0.0
+  gate_oracle_start_epoch: 0
+  gate_oracle_adaptation_only: false

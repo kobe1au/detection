@@ -97,6 +97,12 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
     semantic_align_weight = float(loss_cfg["semantic_alignment_weight"])
     branch_aux_weight = float(loss_cfg["branch_aux_weight"])
     gate_oracle_weight = float(loss_cfg.get("gate_oracle_weight", 0.0))
+    gate_oracle_start_epoch = int(loss_cfg.get("gate_oracle_start_epoch", 0))
+    if epoch < gate_oracle_start_epoch:
+        gate_oracle_weight = 0.0
+    if bool(loss_cfg.get("gate_oracle_adaptation_only", False)):
+        if str(loss_cfg.get("_continual_phase", "historical")) != "adaptation":
+            gate_oracle_weight = 0.0
 
     loss_cls = criterion(logits, y)
     if not torch.isfinite(loss_cls).all():
@@ -246,6 +252,10 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             )
             temp = max(float(loss_cfg.get("gate_oracle_temperature", 0.5)), 1e-4)
             oracle = torch.softmax(-branch_losses.detach() / temp, dim=1)
+            smoothing = float(loss_cfg.get("gate_oracle_smoothing", 0.0))
+            if smoothing > 0.0:
+                smoothing = min(max(smoothing, 0.0), 1.0)
+                oracle = (1.0 - smoothing) * oracle + smoothing / oracle.size(1)
             log_gate = torch.log(gate_weights.float().clamp_min(1e-8))
             loss_gate_oracle = _safe(F.kl_div(log_gate, oracle, reduction="batchmean"))
 

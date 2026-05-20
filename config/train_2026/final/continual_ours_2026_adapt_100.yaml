@@ -33,3 +33,6 @@ loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
   gate_oracle_weight: 0.05
+  gate_oracle_smoothing: 0.10
+  gate_oracle_start_epoch: 61
+  gate_oracle_adaptation_only: true

@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import yaml
 from dotenv import load_dotenv
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, average_precision_score, f1_score, recall_score, roc_auc_score
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
@@ -166,6 +166,7 @@ def validate_full_config(cfg):
         "branch_aux_weight", "stage1_branch_aux_weight",
         "class_aware_alignment_same_class_weight", "class_aware_alignment_temperature",
         "gate_oracle_weight", "gate_oracle_temperature",
+        "gate_oracle_smoothing", "gate_oracle_start_epoch", "gate_oracle_adaptation_only",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -220,6 +221,9 @@ def validate_full_config(cfg):
             "class_aware_alignment_temperature",
             "gate_oracle_weight",
             "gate_oracle_temperature",
+            "gate_oracle_smoothing",
+            "gate_oracle_start_epoch",
+            "gate_oracle_adaptation_only",
         },
     )
 
@@ -254,7 +258,7 @@ def save_config_snapshot(cfg, path):
 # ═══════════════════════════════════════════════════════════════════════
 
 _CSV_HEADER = [
-    "epoch", "stage", "train_loss", "train_f1", "train_acc",
+    "epoch", "stage", "continual_phase", "train_loss", "train_f1", "train_acc",
     "train_cls", "train_temporal", "train_proto_current", "train_proto_future",
     "train_alignment", "train_branch_aux", "train_risk_calib", "train_drift",
     "train_gate_oracle",
@@ -396,6 +400,36 @@ def _hybrid_confidence(softmax_conf, risk_scores):
     return np.clip(softmax_conf * (1.0 - risk_scores), 0.0, 1.0)
 
 
+def _binary_detection_metrics(labels, probs, preds=None):
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.ndim == 2 and probs.shape[1] >= 2:
+        malware_score = probs[:, 1]
+        pred_labels = probs.argmax(axis=1) if preds is None else np.asarray(preds, dtype=np.int64).reshape(-1)
+    else:
+        malware_score = probs.reshape(-1)
+        pred_labels = (malware_score >= 0.5).astype(np.int64) if preds is None else np.asarray(preds, dtype=np.int64).reshape(-1)
+
+    if labels.shape[0] == 0 or pred_labels.shape[0] != labels.shape[0]:
+        return {
+            "malware_recall": 0.0,
+            "fnr": 0.0,
+            "auroc": 0.0,
+            "auprc": 0.0,
+        }
+
+    malware_recall = float(recall_score(labels, pred_labels, pos_label=1, zero_division=0))
+    has_both_classes = np.unique(labels).size == 2
+    auroc_v = float(roc_auc_score(labels, malware_score)) if has_both_classes else 0.0
+    auprc_v = float(average_precision_score(labels, malware_score)) if has_both_classes else 0.0
+    return {
+        "malware_recall": malware_recall,
+        "fnr": 1.0 - malware_recall,
+        "auroc": auroc_v,
+        "auprc": auprc_v,
+    }
+
+
 def _gate_diagnostics(gate_weights, correct=None, risk=None, q_api=None, q_graph=None):
     if not gate_weights:
         return {}
@@ -472,34 +506,47 @@ def _stage_loss_cfg(loss_cfg: dict, stage: str) -> dict:
     return cfg
 
 
-def _balanced_sample_indices(dataset, ratio: float, seed: int, min_per_class: int = 1):
+def _balanced_sample_indices(
+    dataset,
+    ratio: float,
+    seed: int,
+    min_per_group: int = 1,
+    group_by_year: bool = False,
+):
     ratio = float(ratio)
     if ratio >= 1.0:
         return list(range(len(dataset)))
     if ratio <= 0.0:
         return []
-    by_label: dict[int, list[int]] = {}
+    by_group: dict[tuple[int, int] | int, list[int]] = {}
     labels = getattr(dataset, "labels", None)
     sample_sids = getattr(dataset, "sample_sids", None)
     for idx in range(len(dataset)):
         label = None
+        year = None
         if labels is not None and sample_sids is not None and idx < len(sample_sids):
             label = int(labels[sample_sids[idx]])
+            sid_to_year = getattr(dataset, "sid_to_year", None)
+            if sid_to_year is not None:
+                year = int(sid_to_year[sample_sids[idx]])
         else:
             sample = getattr(dataset, "samples", [])[idx]
             if len(sample) >= 2:
                 label = int(sample[1])
+            if len(sample) >= 4:
+                year = int(sample[3])
         if label is None:
             continue
-        by_label.setdefault(label, []).append(idx)
+        group = (int(year), int(label)) if group_by_year and year is not None else int(label)
+        by_group.setdefault(group, []).append(idx)
 
     rng = random.Random(seed)
     selected = []
-    for _, indices in sorted(by_label.items()):
+    for _, indices in sorted(by_group.items()):
         shuffled = list(indices)
         rng.shuffle(shuffled)
         keep = int(round(len(shuffled) * ratio))
-        keep = max(min_per_class, keep) if shuffled else 0
+        keep = max(min_per_group, keep) if shuffled else 0
         selected.extend(shuffled[: min(keep, len(shuffled))])
     selected.sort()
     return selected
@@ -518,7 +565,13 @@ def _build_continual_adaptation_loader(
     seed = int(train_cfg.get("seed", 42))
 
     adapt_indices = _balanced_sample_indices(adapt_dataset, adapt_ratio, seed)
-    replay_indices = _balanced_sample_indices(historical_dataset, replay_ratio, seed + 1009, min_per_class=1)
+    replay_indices = _balanced_sample_indices(
+        historical_dataset,
+        replay_ratio,
+        seed + 1009,
+        min_per_group=1,
+        group_by_year=True,
+    )
     if not adapt_indices:
         raise ValueError("continual adaptation requested, but adaptation_ratio selected no samples")
     datasets = [Subset(adapt_dataset, adapt_indices)]
@@ -1338,6 +1391,27 @@ def main():
     batch_size = int(c_train["batch_size"])
     eval_batch_size = int(c_train["eval_batch_size"])
     epochs = int(c_train["epochs"])
+    configured_historical_epochs = int(c_train.get("historical_epochs", epochs))
+    configured_adaptation_epochs = int(c_train.get("adaptation_epochs", 0))
+    if c_data.get("adapt_csv"):
+        if configured_historical_epochs <= 0 or configured_adaptation_epochs <= 0:
+            raise ValueError(
+                "continual adaptation requires positive train.historical_epochs "
+                "and train.adaptation_epochs when data.adapt_csv is set"
+            )
+        derived_epochs = configured_historical_epochs + configured_adaptation_epochs
+        if epochs != derived_epochs:
+            logger.warning(
+                "Overriding train.epochs to historical_epochs + adaptation_epochs: "
+                f"{epochs} -> {derived_epochs}"
+            )
+            epochs = derived_epochs
+            c_train["epochs"] = derived_epochs
+    else:
+        configured_historical_epochs = epochs
+        configured_adaptation_epochs = 0
+        c_train["historical_epochs"] = epochs
+        c_train["adaptation_epochs"] = 0
     warmup_stage_epochs = (
         int(c_train["warmup_stage_epochs"])
         if _is_multimodal_mode(_fm)
@@ -1489,6 +1563,8 @@ def main():
     last_stage = None
     last_continual_phase = None
     historical_epochs = min(max(int(c_train.get("historical_epochs", epochs)), 0), epochs)
+    historical_best_p = os.path.join(ckpt_dir, f"best_historical_{exp_name}.pt")
+    adapted_best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
     for epoch in range(start_epoch, epochs + 1):
         stage_name = "warmup" if epoch <= warmup_stage_epochs else "main"
         continual_phase = "adaptation" if (dl_adapt is not None and epoch > historical_epochs) else "historical"
@@ -1509,6 +1585,18 @@ def main():
             last_stage = stage_name
         if continual_phase != last_continual_phase:
             if last_continual_phase == "historical" and continual_phase == "adaptation":
+                if os.path.exists(historical_best_p):
+                    state = torch.load(historical_best_p, map_location=device, weights_only=False)
+                    model.load_state_dict(state["state_dict"])
+                    logger.info(
+                        "Loaded historical best checkpoint before adaptation: "
+                        f"{historical_best_p}"
+                    )
+                else:
+                    logger.warning(
+                        "Historical best checkpoint was not found; adaptation continues "
+                        "from the last historical epoch."
+                    )
                 remaining_epochs = epochs - epoch + 1
                 optimizer, scheduler = _build_optimizer_scheduler(remaining_epochs)
                 scaler = build_grad_scaler(device=device, enabled=use_amp)
@@ -1524,6 +1612,7 @@ def main():
 
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss_cfg = _stage_loss_cfg(c_loss, stage_name)
+        epoch_loss_cfg["_continual_phase"] = continual_phase
         epoch_loader = dl_adapt if continual_phase == "adaptation" else dl_tr
 
         (tr_loss, tr_f1, tr_acc, tr_cls, tr_temp, tr_align, tr_branch_aux, tr_risk_calib,
@@ -1566,7 +1655,7 @@ def main():
             no_improve += 0 if stage_name == "warmup" else 1
 
         last_p = os.path.join(ckpt_dir, f"last_{exp_name}.pt")
-        best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
+        best_p = historical_best_p if continual_phase == "historical" and dl_adapt is not None else adapted_best_p
         save_checkpoint(last_p, epoch, model, optimizer, scheduler, scaler,
                         best_score, no_improve, cfg)
         if improved:
@@ -1574,7 +1663,7 @@ def main():
                             best_score, no_improve, cfg)
 
         append_metrics_csv(csv_path, dict(
-            epoch=epoch, stage=stage_name,
+            epoch=epoch, stage=stage_name, continual_phase=continual_phase,
             train_loss=tr_loss, train_f1=tr_f1, train_acc=tr_acc,
             train_cls=tr_cls, train_temporal=tr_temp,
             train_proto_current=tr_proto_current,
@@ -1637,7 +1726,11 @@ def main():
                 f"mean_per_cell={proto_stats['mean_clusters_per_seen_cell']:.2f}"
             )
 
-        if stage_name != "warmup" and no_improve >= patience:
+        early_stop_allowed = (
+            stage_name != "warmup"
+            and (dl_adapt is None or continual_phase == "adaptation")
+        )
+        if early_stop_allowed and no_improve >= patience:
             logger.info(f"Early stop: no_improve={no_improve}")
             break
 
@@ -1702,9 +1795,16 @@ def main():
     # ── Selective classification on calibrated probs ──
     test_probs, test_labels, test_risks = collect_calibrated_outputs(model, calibrator, dl_test, device, use_amp)
     test_preds = test_probs.argmax(axis=1)
+    det_metrics = _binary_detection_metrics(test_labels, test_probs, test_preds)
     test_conf = test_probs.max(axis=1)
     test_correct = (test_preds == test_labels).astype(np.float64)
     test_hybrid_conf = _hybrid_confidence(test_conf, test_risks) if test_risks is not None else test_conf
+    logger.info(
+        "Final detection metrics: "
+        f"F1={test_f1:.4f} MalwareRecall={det_metrics['malware_recall']:.4f} "
+        f"FNR={det_metrics['fnr']:.4f} AUROC={det_metrics['auroc']:.4f} "
+        f"AUPRC={det_metrics['auprc']:.4f}"
+    )
     logger.info(
         f"Selective calibrated summary: softmax_AURC={aurc(test_conf,test_correct):.4f} "
         f"hybrid_AURC={aurc(test_hybrid_conf,test_correct):.4f}"
