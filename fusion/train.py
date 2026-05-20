@@ -16,7 +16,7 @@ import torch.nn as nn
 import yaml
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, f1_score
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
 from fusion.mm_dataset import MultiModalMalwareDataset, hierarchical_collate_fn
@@ -136,6 +136,7 @@ def validate_full_config(cfg):
     allowed_data = {
         "out_dir", "train_pt_dir", "val_pt_dir", "test_pt_dir",
         "train_csv", "val_csv", "test_csv", "extra_tests",
+        "adapt_pt_dir", "adapt_csv",
         "max_api_events_per_sample",
     }
     allowed_extra_test = {"name", "test_pt_dir", "test_csv"}
@@ -155,6 +156,7 @@ def validate_full_config(cfg):
         "persistent_workers", "prefetch_factor", "lr", "weight_decay",
         "warmup_epochs", "eta_min", "label_smoothing", "patience",
         "min_delta", "warmup_stage_epochs",
+        "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
     }
     allowed_loss = {
         "temporal_proto_current_weight", "temporal_proto_future_weight",
@@ -162,6 +164,8 @@ def validate_full_config(cfg):
         "temporal_proto_temperature", "temporal_proto_velocity_scale",
         "temporal_proto_min_history", "semantic_alignment_weight",
         "branch_aux_weight", "stage1_branch_aux_weight",
+        "class_aware_alignment_same_class_weight", "class_aware_alignment_temperature",
+        "gate_oracle_weight", "gate_oracle_temperature",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -194,15 +198,30 @@ def validate_full_config(cfg):
     _reject_unknown("train", cfg["train"], allowed_train)
     _reject_unknown("loss", cfg["loss"], allowed_loss)
 
-    _require_keys("data", cfg["data"], allowed_data, optional={"extra_tests"})
+    _require_keys("data", cfg["data"], allowed_data, optional={"extra_tests", "adapt_pt_dir", "adapt_csv"})
     _require_keys("model", cfg["model"], allowed_model, optional={"in_feat_dim"})
     _require_keys("model.api_encoder", cfg["model"]["api_encoder"], allowed_api)
     _require_keys("model.graph_encoder", cfg["model"]["graph_encoder"], allowed_graph)
     _require_keys("model.temporal", cfg["model"]["temporal"], allowed_temporal)
     _require_keys("model.alignment", cfg["model"]["alignment"], allowed_alignment)
     _require_keys("model.gate", cfg["model"]["gate"], allowed_gate)
-    _require_keys("train", cfg["train"], allowed_train)
-    _require_keys("loss", cfg["loss"], allowed_loss)
+    _require_keys(
+        "train",
+        cfg["train"],
+        allowed_train,
+        optional={"historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio"},
+    )
+    _require_keys(
+        "loss",
+        cfg["loss"],
+        allowed_loss,
+        optional={
+            "class_aware_alignment_same_class_weight",
+            "class_aware_alignment_temperature",
+            "gate_oracle_weight",
+            "gate_oracle_temperature",
+        },
+    )
 
     nc = int(cfg["model"].get("num_classes", 2))
     if nc < 2:
@@ -238,6 +257,7 @@ _CSV_HEADER = [
     "epoch", "stage", "train_loss", "train_f1", "train_acc",
     "train_cls", "train_temporal", "train_proto_current", "train_proto_future",
     "train_alignment", "train_branch_aux", "train_risk_calib", "train_drift",
+    "train_gate_oracle",
     "train_temporal_drift", "train_temporal_risk", "train_alignment_temporal_drift",
     "train_alignment_drift_gate", "train_semantic_drift_gate",
     "train_gate_temporal_drift", "train_gate_disagreement", "train_gate_entropy",
@@ -452,6 +472,67 @@ def _stage_loss_cfg(loss_cfg: dict, stage: str) -> dict:
     return cfg
 
 
+def _balanced_sample_indices(dataset, ratio: float, seed: int, min_per_class: int = 1):
+    ratio = float(ratio)
+    if ratio >= 1.0:
+        return list(range(len(dataset)))
+    if ratio <= 0.0:
+        return []
+    by_label: dict[int, list[int]] = {}
+    labels = getattr(dataset, "labels", None)
+    sample_sids = getattr(dataset, "sample_sids", None)
+    for idx in range(len(dataset)):
+        label = None
+        if labels is not None and sample_sids is not None and idx < len(sample_sids):
+            label = int(labels[sample_sids[idx]])
+        else:
+            sample = getattr(dataset, "samples", [])[idx]
+            if len(sample) >= 2:
+                label = int(sample[1])
+        if label is None:
+            continue
+        by_label.setdefault(label, []).append(idx)
+
+    rng = random.Random(seed)
+    selected = []
+    for _, indices in sorted(by_label.items()):
+        shuffled = list(indices)
+        rng.shuffle(shuffled)
+        keep = int(round(len(shuffled) * ratio))
+        keep = max(min_per_class, keep) if shuffled else 0
+        selected.extend(shuffled[: min(keep, len(shuffled))])
+    selected.sort()
+    return selected
+
+
+def _build_continual_adaptation_loader(
+    historical_dataset,
+    adapt_dataset,
+    cfg,
+    batch_size,
+    loader_kwargs,
+):
+    train_cfg = cfg["train"]
+    adapt_ratio = float(train_cfg.get("adaptation_ratio", 1.0))
+    replay_ratio = float(train_cfg.get("replay_ratio", 0.25))
+    seed = int(train_cfg.get("seed", 42))
+
+    adapt_indices = _balanced_sample_indices(adapt_dataset, adapt_ratio, seed)
+    replay_indices = _balanced_sample_indices(historical_dataset, replay_ratio, seed + 1009, min_per_class=1)
+    if not adapt_indices:
+        raise ValueError("continual adaptation requested, but adaptation_ratio selected no samples")
+    datasets = [Subset(adapt_dataset, adapt_indices)]
+    if replay_indices:
+        datasets.append(Subset(historical_dataset, replay_indices))
+    loader = DataLoader(
+        ConcatDataset(datasets),
+        batch_size=batch_size,
+        shuffle=True,
+        **loader_kwargs,
+    )
+    return loader, len(adapt_indices), len(replay_indices)
+
+
 def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
                     epoch, num_epochs, loss_cfg=None, logger=None, use_amp=False,
                     grad_accum_steps=1):
@@ -462,6 +543,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
     total_loss = total_steps = total_samples = 0
     sum_cls = sum_temp = sum_proto_current = sum_proto_future = sum_align = 0.0
     sum_branch_aux = 0.0
+    sum_gate_oracle = 0.0
     sum_risk_calib = 0.0
     sum_drift = 0.0; num_drift = 0
     sum_gate_temporal_drift = 0.0; num_gate_temporal_drift = 0
@@ -547,6 +629,9 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
             branch_aux, ok_branch_aux = _extract_loss_component(extra, "branch_aux")
             if ok_branch_aux:
                 sum_branch_aux += branch_aux * bs
+            gate_oracle, ok_gate_oracle = _extract_loss_component(extra, "gate_oracle")
+            if ok_gate_oracle:
+                sum_gate_oracle += gate_oracle * bs
             risk_calib, ok_risk_calib = _extract_loss_component(extra, "temporal_risk_calibration")
             if ok_risk_calib:
                 sum_risk_calib += risk_calib * bs
@@ -616,6 +701,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
                 pcur=f"{proto_current:.4f}",
                 pfut=f"{proto_future:.4f}",
                 aux=f"{branch_aux:.4f}",
+                gorl=f"{gate_oracle:.4f}",
                 rcal=f"{risk_calib:.4f}",
                 align=f"{l_align.item():.4f}",
                 accum=f"{accum_steps}/{grad_accum_steps}",
@@ -651,7 +737,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
     if not all_labels:
         if logger:
             logger.warning(f"[train][epoch {epoch}] No valid predictions collected!")
-        return (0.0,) * 22
+        return (0.0,) * 23
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     acc = accuracy_score(all_labels, all_preds)
 
@@ -681,6 +767,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device,
     return (
         avg, f1, acc, sum_cls/n, sum_temp/n,
         sum_align/n, sum_branch_aux/n, sum_risk_calib/n, sum_proto_current/n, sum_proto_future/n,
+        sum_gate_oracle/n,
         sum_drift/max(num_drift, 1),
         sum_temporal_drift/max(num_temporal_drift, 1),
         sum_temporal_risk/max(num_temporal_risk, 1),
@@ -1179,6 +1266,11 @@ def main():
 
     drop_graph_behavior_hints = bool(c_graph["drop_extracted_behavior_hints"])
     train_csv_path = resolve_path(data_root, c_data["train_csv"])
+    adapt_csv_path = (
+        resolve_path(data_root, c_data["adapt_csv"])
+        if c_data.get("adapt_csv")
+        else None
+    )
     val_csv_path = resolve_path(data_root, c_data["val_csv"])
     test_csv_path = resolve_path(data_root, c_data["test_csv"])
     extra_test_specs = c_data.get("extra_tests", []) or []
@@ -1188,6 +1280,7 @@ def main():
     ]
     domain_years = build_global_domain_years(
         train_csv_path,
+        *( [adapt_csv_path] if adapt_csv_path else [] ),
         val_csv_path,
         test_csv_path,
         *extra_test_csv_paths,
@@ -1213,6 +1306,18 @@ def main():
         domain_years=domain_years,
         drop_graph_behavior_hints=drop_graph_behavior_hints)
 
+    ds_adapt = None
+    if adapt_csv_path is not None:
+        ds_adapt = MultiModalMalwareDataset(
+            pt_dir=resolve_path(data_root, c_data.get("adapt_pt_dir") or c_data["train_pt_dir"]),
+            csv_path=adapt_csv_path,
+            is_train=True, robust_aug=False,
+            max_api_events_per_sample=c_data["max_api_events_per_sample"],
+            fusion_mode=_fm,
+            need_alignment_mask=need_alignment_mask,
+            domain_years=domain_years,
+            drop_graph_behavior_hints=drop_graph_behavior_hints)
+
     if getattr(ds_tr, "feature_dim", None) != getattr(ds_val, "feature_dim", None):
         raise ValueError(
             "Train/val graph feature dimensions do not match: "
@@ -1220,6 +1325,12 @@ def main():
             f"val={getattr(ds_val, 'feature_dim', None)}. "
             "This usually means old 515-dim .pt files are mixed with new "
             "519-dim Graph-Lite .pt files. Regenerate all splits into a clean directory."
+        )
+    if ds_adapt is not None and getattr(ds_tr, "feature_dim", None) != getattr(ds_adapt, "feature_dim", None):
+        raise ValueError(
+            "Historical/adaptation graph feature dimensions do not match: "
+            f"historical={getattr(ds_tr, 'feature_dim', None)} "
+            f"adapt={getattr(ds_adapt, 'feature_dim', None)}."
         )
 
     num_classes = int(c_model["num_classes"])
@@ -1250,6 +1361,21 @@ def main():
     val_lk = {**loader_base, "worker_init_fn": _worker_init_fn, "generator": g}
 
     dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, **train_lk)
+    dl_adapt = None
+    if ds_adapt is not None:
+        dl_adapt, n_adapt, n_replay = _build_continual_adaptation_loader(
+            ds_tr,
+            ds_adapt,
+            cfg,
+            batch_size,
+            train_lk,
+        )
+        logger.info(
+            "Continual adaptation loader | "
+            f"adapt_samples={n_adapt} replay_samples={n_replay} "
+            f"adapt_ratio={float(c_train.get('adaptation_ratio', 1.0)):.3f} "
+            f"replay_ratio={float(c_train.get('replay_ratio', 0.25)):.3f}"
+        )
 
     dl_val = DataLoader(ds_val, batch_size=eval_batch_size, shuffle=False, **val_lk)
     val_year_loaders = build_year_subset_loaders(ds_val, eval_batch_size, val_lk)
@@ -1298,7 +1424,7 @@ def main():
         gate_mode=str(c_gate["mode"]),
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,
-        temporal_num_domains=len(getattr(ds_tr, "domain_years", getattr(ds_tr, "unique_years", [0]))),
+        temporal_num_domains=len(domain_years),
         temporal_prototype_momentum=float(c_temporal["prototype_momentum"]),
         temporal_prototype_clusters=int(c_temporal["prototype_clusters"]),
         temporal_drift_velocity_scale=float(c_loss["temporal_proto_velocity_scale"]),
@@ -1350,6 +1476,8 @@ def main():
     )
     logger.info(
         f"Training protocol | warmup_stage_epochs={warmup_stage_epochs} "
+        f"historical_epochs={int(c_train.get('historical_epochs', epochs))} "
+        f"adaptation_epochs={int(c_train.get('adaptation_epochs', 0))} "
         f"stage1_aux={float(c_loss['stage1_branch_aux_weight']):.3f} "
         f"main_aux={float(c_loss['branch_aux_weight']):.3f}"
     )
@@ -1359,8 +1487,11 @@ def main():
     # Training loop
     # ═══════════════════════════════════════════════════════════════════
     last_stage = None
+    last_continual_phase = None
+    historical_epochs = min(max(int(c_train.get("historical_epochs", epochs)), 0), epochs)
     for epoch in range(start_epoch, epochs + 1):
         stage_name = "warmup" if epoch <= warmup_stage_epochs else "main"
+        continual_phase = "adaptation" if (dl_adapt is not None and epoch > historical_epochs) else "historical"
         if stage_name != last_stage:
             if hasattr(model, "set_training_stage"):
                 model.set_training_stage(stage_name)
@@ -1376,17 +1507,32 @@ def main():
                 )
             logger.info(f"Training stage: {stage_name}")
             last_stage = stage_name
+        if continual_phase != last_continual_phase:
+            if last_continual_phase == "historical" and continual_phase == "adaptation":
+                remaining_epochs = epochs - epoch + 1
+                optimizer, scheduler = _build_optimizer_scheduler(remaining_epochs)
+                scaler = build_grad_scaler(device=device, enabled=use_amp)
+                best_score = float("-inf")
+                no_improve = 0
+                logger.info(
+                    "Continual phase transition: historical -> adaptation | "
+                    "training on recent-year samples plus historical replay; "
+                    "optimizer/scheduler and best checkpoint selection reset."
+                )
+            logger.info(f"Continual phase: {continual_phase}")
+            last_continual_phase = continual_phase
 
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss_cfg = _stage_loss_cfg(c_loss, stage_name)
+        epoch_loader = dl_adapt if continual_phase == "adaptation" else dl_tr
 
         (tr_loss, tr_f1, tr_acc, tr_cls, tr_temp, tr_align, tr_branch_aux, tr_risk_calib,
-         tr_proto_current, tr_proto_future, tr_drift,
+         tr_proto_current, tr_proto_future, tr_gate_oracle, tr_drift,
          tr_temporal_drift, tr_temporal_risk, tr_align_temporal_drift,
          tr_align_drift_gate, tr_semantic_drift_gate,
          tr_gate_temporal_drift, tr_gate_disagreement, tr_gate_entropy,
          tr_gate_api, tr_gate_graph, tr_gate_joint) = train_one_epoch(
-            model, dl_tr, optimizer, scaler, criterion, device,
+            model, epoch_loader, optimizer, scaler, criterion, device,
             epoch, epochs, loss_cfg=epoch_loss_cfg, logger=logger, use_amp=use_amp,
             grad_accum_steps=int(c_train["grad_accum_steps"]))
 
@@ -1436,6 +1582,7 @@ def main():
             train_alignment=tr_align,
             train_branch_aux=tr_branch_aux,
             train_risk_calib=tr_risk_calib,
+            train_gate_oracle=tr_gate_oracle,
             train_drift=tr_drift,
             train_temporal_drift=tr_temporal_drift,
             train_temporal_risk=tr_temporal_risk,

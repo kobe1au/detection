@@ -17,6 +17,7 @@ def _semantic_alignment_loss(
     labels: torch.Tensor | None = None,
     time_ids: torch.Tensor | None = None,
     temperature: float = 0.2,
+    same_class_positive_weight: float = 0.0,
 ) -> torch.Tensor:
     """Drift/quality weighted batch contrastive API-Graph alignment."""
     if api_features is None or graph_features is None:
@@ -44,24 +45,40 @@ def _semantic_alignment_loss(
         sim_t = sim.t()
         logits_t = sim_t - sim_t.max(dim=1, keepdim=True).values.detach()
         targets = torch.arange(api_z.size(0), device=api_z.device)
+        same_class_positive_weight = max(float(same_class_positive_weight), 0.0)
 
-        if labels is not None and time_ids is not None:
+        if labels is not None:
             labels = labels.long().view(-1).to(api_z.device)
+        if time_ids is not None:
             time_ids = time_ids.long().view(-1).to(api_z.device)
-            if labels.numel() == api_z.size(0) and time_ids.numel() == api_z.size(0):
-                eye = torch.eye(api_z.size(0), device=api_z.device, dtype=torch.bool)
-                same_context = (
-                    labels[:, None].eq(labels[None, :])
-                    & time_ids[:, None].eq(time_ids[None, :])
-                    & (~eye)
-                )
-                logits = logits.masked_fill(same_context, -1e4)
-                logits_t = logits_t.masked_fill(same_context.t(), -1e4)
 
-        loss = 0.5 * (
-            F.cross_entropy(logits, targets, reduction="none")
-            + F.cross_entropy(logits_t, targets, reduction="none")
-        )
+        if same_class_positive_weight > 0.0 and labels is not None and labels.numel() == api_z.size(0):
+            eye = torch.eye(api_z.size(0), device=api_z.device, dtype=torch.bool)
+            same_class = labels[:, None].eq(labels[None, :])
+            pos = eye.float() + same_class_positive_weight * (same_class & (~eye)).float()
+            pos = pos / pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            pos_t = pos.t()
+            logp = F.log_softmax(logits, dim=1)
+            logp_t = F.log_softmax(logits_t, dim=1)
+            loss = -0.5 * (
+                (pos * logp).sum(dim=1)
+                + (pos_t * logp_t).sum(dim=1)
+            )
+        else:
+            if labels is not None and time_ids is not None:
+                if labels.numel() == api_z.size(0) and time_ids.numel() == api_z.size(0):
+                    eye = torch.eye(api_z.size(0), device=api_z.device, dtype=torch.bool)
+                    same_context = (
+                        labels[:, None].eq(labels[None, :])
+                        & time_ids[:, None].eq(time_ids[None, :])
+                        & (~eye)
+                    )
+                    logits = logits.masked_fill(same_context, -1e4)
+                    logits_t = logits_t.masked_fill(same_context.t(), -1e4)
+            loss = 0.5 * (
+                F.cross_entropy(logits, targets, reduction="none")
+                + F.cross_entropy(logits_t, targets, reduction="none")
+            )
 
     if quality_weights is not None:
         q = quality_weights.float().view(-1).to(loss.device).clamp(0.0, 1.0)
@@ -79,6 +96,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
     temporal_risk_calib_weight = float(loss_cfg["temporal_risk_calibration_weight"])
     semantic_align_weight = float(loss_cfg["semantic_alignment_weight"])
     branch_aux_weight = float(loss_cfg["branch_aux_weight"])
+    gate_oracle_weight = float(loss_cfg.get("gate_oracle_weight", 0.0))
 
     loss_cls = criterion(logits, y)
     if not torch.isfinite(loss_cls).all():
@@ -187,6 +205,8 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             extra.get("semantic_alignment_quality"),
             y,
             time_ids,
+            temperature=float(loss_cfg.get("class_aware_alignment_temperature", 0.2)),
+            same_class_positive_weight=float(loss_cfg.get("class_aware_alignment_same_class_weight", 0.0)),
         ))
 
     loss_branch_aux = zero
@@ -202,6 +222,33 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         if aux_losses:
             loss_branch_aux = torch.stack(aux_losses).mean()
 
+    loss_gate_oracle = zero
+    if gate_oracle_weight != 0.0:
+        gate_weights = extra.get("gate_weights_train", extra.get("gate_weights"))
+        branch_logits = [
+            extra.get("api_logits_aux"),
+            extra.get("graph_logits_aux"),
+            extra.get("joint_logits_aux"),
+        ]
+        if (
+            isinstance(gate_weights, torch.Tensor)
+            and gate_weights.ndim == 2
+            and gate_weights.size(0) == y.numel()
+            and gate_weights.size(1) == 3
+            and all(isinstance(v, torch.Tensor) and v.shape == logits.shape for v in branch_logits)
+        ):
+            branch_losses = torch.stack(
+                [
+                    F.cross_entropy(v.float(), y, reduction="none")
+                    for v in branch_logits
+                ],
+                dim=1,
+            )
+            temp = max(float(loss_cfg.get("gate_oracle_temperature", 0.5)), 1e-4)
+            oracle = torch.softmax(-branch_losses.detach() / temp, dim=1)
+            log_gate = torch.log(gate_weights.float().clamp_min(1e-8))
+            loss_gate_oracle = _safe(F.kl_div(log_gate, oracle, reduction="batchmean"))
+
     total = (
         loss_cls
         + proto_current_weight * loss_proto_current
@@ -209,6 +256,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         + temporal_risk_calib_weight * loss_temporal_risk_calib
         + semantic_align_weight * loss_semantic_align
         + branch_aux_weight * loss_branch_aux
+        + gate_oracle_weight * loss_gate_oracle
     )
 
     if not torch.isfinite(total).all():
@@ -223,6 +271,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         "temporal_risk_pos_rate": temporal_risk_pos_rate.detach(),
         "semantic_align": loss_semantic_align.detach(),
         "branch_aux": loss_branch_aux.detach(),
+        "gate_oracle": loss_gate_oracle.detach(),
         "weighted_proto_current": (proto_current_weight * loss_proto_current).detach(),
         "weighted_proto_future": (proto_future_weight * loss_proto_future).detach(),
         "weighted_temporal_risk_calibration": (
@@ -230,6 +279,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         ).detach(),
         "weighted_semantic_align": (semantic_align_weight * loss_semantic_align).detach(),
         "weighted_branch_aux": (branch_aux_weight * loss_branch_aux).detach(),
+        "weighted_gate_oracle": (gate_oracle_weight * loss_gate_oracle).detach(),
     }
 
     return (

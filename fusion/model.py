@@ -1519,6 +1519,7 @@ class MalwareModelWithXAttn(nn.Module):
 
         logits = w_api * api_logits + w_graph * graph_logits + w_joint * joint_logits
 
+        extra["gate_weights_train"] = gate_weights
         extra["gate_weights"] = gate_weights.detach()
         extra["drift_score"] = drift_score.detach()
         extra["gate_temporal_drift"] = gate_temporal_drift.detach()

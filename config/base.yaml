@@ -13,6 +13,8 @@ data:
   # DATA_ROOT 下的时间划分 CSV。主实验：2018-2021 train / 2022 val / 2023 test。
   # 2024 不参与调参，作为更长时间跨度的漂移压力测试。
   train_csv: "resource/dataset_split_2018_2024/train.csv"
+  adapt_pt_dir: null
+  adapt_csv: null
   val_csv: "resource/dataset_split_2018_2024/val.csv"
   test_csv: "resource/dataset_split_2018_2024/test_2023.csv"
 
@@ -105,6 +107,10 @@ train:
   # API-only/Graph-only 自动跳过。Stage 1 固定 gate、关闭 future/alignment，只保留判别学习、
   # 单模态辅助监督和 current prototype。
   warmup_stage_epochs: 8
+  historical_epochs: 60
+  adaptation_epochs: 0
+  adaptation_ratio: 1.0
+  replay_ratio: 0.25
   eta_min: 0.000001
   label_smoothing: 0.05
 
@@ -125,9 +131,13 @@ loss:
 
   # 创新点2：API-Graph 语义对齐辅助损失。
   semantic_alignment_weight: 0.0
+  class_aware_alignment_same_class_weight: 0.0
+  class_aware_alignment_temperature: 0.2
 
   # 多模态公平训练：API / Graph / Joint 分支辅助分类损失。
   # stage1_branch_aux_weight 用于 Stage 1，防止融合层过早偏向单模态；
   # branch_aux_weight 用于 Stage 2，保留弱监督以避免 gate 把某个分支压死。
   stage1_branch_aux_weight: 0.30
   branch_aux_weight: 0.10
+  gate_oracle_weight: 0.0
+  gate_oracle_temperature: 0.5
