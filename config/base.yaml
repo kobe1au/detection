@@ -40,11 +40,6 @@ model:
     use_behavior_hint: false
     drop_extracted_behavior_hints: true
 
-  temporal:
-    prototype_momentum: 0.95
-    prototype_clusters: 4
-    use_future_drift: true
-
   alignment:
     enabled: false
     adaptive_bias: false
@@ -89,12 +84,6 @@ train:
   min_delta: 0.0001
 
 loss:
-  temporal_proto_current_weight: 0.0
-  temporal_proto_future_weight: 0.0
-  temporal_risk_calibration_weight: 0.0
-  temporal_proto_temperature: 0.2
-  temporal_proto_velocity_scale: 0.5
-  temporal_proto_min_history: 2
 
   semantic_alignment_weight: 0.0
   class_aware_alignment_same_class_weight: 0.0

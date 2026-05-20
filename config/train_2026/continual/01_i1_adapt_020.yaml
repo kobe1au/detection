@@ -17,9 +17,7 @@ model:
   fusion_mode: concat
 
 loss:
-  temporal_proto_current_weight: 0.0
-  temporal_proto_future_weight: 0.0
-  temporal_risk_calibration_weight: 0.0
+ 
   semantic_alignment_weight: 0.0
   class_aware_alignment_same_class_weight: 0.0
   gate_oracle_weight: 0.0

@@ -7,9 +7,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from fusion.constants import ArchitectureConstants
-
-
 def _semantic_alignment_loss(
     api_features: torch.Tensor | None,
     graph_features: torch.Tensor | None,
@@ -19,7 +16,7 @@ def _semantic_alignment_loss(
     temperature: float = 0.2,
     same_class_positive_weight: float = 0.0,
 ) -> torch.Tensor:
-    """Drift/quality weighted batch contrastive API-Graph alignment."""
+    """Quality-weighted class-aware batch contrastive API-Graph alignment."""
     if api_features is None or graph_features is None:
         device = (
             api_features.device
@@ -90,10 +87,7 @@ def _semantic_alignment_loss(
 
 
 def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epochs=1):
-    """Aggregate the main classification, temporal, alignment, and branch losses."""
-    proto_current_weight = float(loss_cfg["temporal_proto_current_weight"])
-    proto_future_weight = float(loss_cfg["temporal_proto_future_weight"])
-    temporal_risk_calib_weight = float(loss_cfg["temporal_risk_calibration_weight"])
+    """Aggregate classification, alignment, branch auxiliary, and gate oracle losses."""
     semantic_align_weight = float(loss_cfg["semantic_alignment_weight"])
     branch_aux_weight = float(loss_cfg["branch_aux_weight"])
     gate_oracle_weight = float(loss_cfg.get("gate_oracle_weight", 0.0))
@@ -105,7 +99,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         if str(loss_cfg.get("_continual_phase", "historical")).lower() != gate_oracle_start_phase:
             gate_oracle_weight = 0.0
     if bool(loss_cfg.get("gate_oracle_adaptation_only", False)):
-        if str(loss_cfg.get("_continual_phase", "historical")) != "adaptation":
+        if str(loss_cfg.get("_continual_phase", "historical")).lower() != "adaptation":
             gate_oracle_weight = 0.0
 
     loss_cls = criterion(logits, y)
@@ -119,89 +113,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             return zero
         return t
 
-    features = extra.get("temporal_features", None)
     time_ids = extra.get("time_ids")
-    temporal_quality = extra.get("temporal_quality")
-
-    temporal_memory = extra.get("temporal_prototype_memory")
-    loss_proto_current = zero
-    loss_proto_future = zero
-    if temporal_memory is not None and features is not None and time_ids is not None:
-        if proto_current_weight != 0.0:
-            loss_proto_current = _safe(temporal_memory.get_loss_quality_gated(
-                features,
-                y,
-                time_ids,
-                temporal_quality,
-            ))
-        if proto_future_weight != 0.0:
-            loss_proto_future = _safe(temporal_memory.get_future_forecast_loss(
-                features,
-                y,
-                time_ids,
-                temporal_quality,
-                temperature=float(loss_cfg["temporal_proto_temperature"]),
-                velocity_scale=float(loss_cfg["temporal_proto_velocity_scale"]),
-                min_history=int(loss_cfg["temporal_proto_min_history"]),
-            ))
-
-    loss_temporal_risk_calib = zero
-    loss_temporal_risk_bce = zero
-    loss_temporal_risk_rank = zero
-    temporal_risk_pos_rate = zero
-    risk_logit = extra.get("temporal_risk_logit")
-    if temporal_risk_calib_weight != 0.0 and risk_logit is not None:
-        risk_logit = risk_logit.float().view(-1)
-        if risk_logit.numel() == y.numel():
-            with torch.no_grad():
-                probs = torch.softmax(logits.detach().float(), dim=-1)
-                row = torch.arange(y.numel(), device=y.device)
-                safe_y = y.long().clamp(0, probs.size(-1) - 1)
-                pred = probs.argmax(dim=-1)
-                wrong = pred.ne(safe_y).float()
-                soft_error = (1.0 - probs[row, safe_y]).clamp(0.0, 1.0)
-                # Wrong predictions should score higher than merely uncertain ones.
-                risk_target = (0.7 * wrong + 0.3 * soft_error).clamp(0.0, 1.0)
-                wrong_mask = wrong > 0.5
-                correct_mask = ~wrong_mask
-                pos = wrong_mask.float().sum()
-                neg = correct_mask.float().sum()
-                temporal_risk_pos_rate = wrong.mean()
-
-            bce = F.binary_cross_entropy_with_logits(
-                risk_logit,
-                risk_target,
-                reduction="none",
-            )
-            if float(pos.item()) > 0.0 and float(neg.item()) > 0.0:
-                max_pos_weight = float(ArchitectureConstants.TEMPORAL_RISK_POS_WEIGHT_MAX)
-                pos_weight = (neg / pos).clamp(1.0, max_pos_weight)
-                sample_weight = torch.where(
-                    wrong_mask,
-                    torch.ones_like(risk_logit) * pos_weight,
-                    torch.ones_like(risk_logit),
-                )
-                loss_temporal_risk_bce = (bce * sample_weight).sum() / sample_weight.sum().clamp_min(1e-8)
-            else:
-                loss_temporal_risk_bce = bce.mean()
-
-            if bool(wrong_mask.any().item()) and bool(correct_mask.any().item()):
-                wrong_logits = risk_logit[wrong_mask]
-                correct_logits = risk_logit[correct_mask]
-                margin = float(ArchitectureConstants.TEMPORAL_RISK_RANK_MARGIN)
-                diff = wrong_logits.view(-1, 1) - correct_logits.view(1, -1)
-                loss_temporal_risk_rank = F.softplus(margin - diff).mean()
-
-            rank_weight = float(ArchitectureConstants.TEMPORAL_RISK_RANK_WEIGHT)
-            loss_temporal_risk_calib = _safe(
-                loss_temporal_risk_bce + rank_weight * loss_temporal_risk_rank
-            )
-
-    loss_temporal = (
-        loss_proto_current
-        + loss_proto_future
-        + loss_temporal_risk_calib
-    )
 
     loss_semantic_align = zero
     if (
@@ -265,9 +177,6 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
 
     total = (
         loss_cls
-        + proto_current_weight * loss_proto_current
-        + proto_future_weight * loss_proto_future
-        + temporal_risk_calib_weight * loss_temporal_risk_calib
         + semantic_align_weight * loss_semantic_align
         + branch_aux_weight * loss_branch_aux
         + gate_oracle_weight * loss_gate_oracle
@@ -277,20 +186,9 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         total = loss_cls if torch.isfinite(loss_cls).all() else logits.new_tensor(0.0, requires_grad=True)
 
     extra["loss_components"] = {
-        "proto_current": loss_proto_current.detach(),
-        "proto_future": loss_proto_future.detach(),
-        "temporal_risk_calibration": loss_temporal_risk_calib.detach(),
-        "temporal_risk_bce": loss_temporal_risk_bce.detach(),
-        "temporal_risk_rank": loss_temporal_risk_rank.detach(),
-        "temporal_risk_pos_rate": temporal_risk_pos_rate.detach(),
         "semantic_align": loss_semantic_align.detach(),
         "branch_aux": loss_branch_aux.detach(),
         "gate_oracle": loss_gate_oracle.detach(),
-        "weighted_proto_current": (proto_current_weight * loss_proto_current).detach(),
-        "weighted_proto_future": (proto_future_weight * loss_proto_future).detach(),
-        "weighted_temporal_risk_calibration": (
-            temporal_risk_calib_weight * loss_temporal_risk_calib
-        ).detach(),
         "weighted_semantic_align": (semantic_align_weight * loss_semantic_align).detach(),
         "weighted_branch_aux": (branch_aux_weight * loss_branch_aux).detach(),
         "weighted_gate_oracle": (gate_oracle_weight * loss_gate_oracle).detach(),
@@ -299,6 +197,5 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
     return (
         total,
         loss_cls.detach(),
-        loss_temporal.detach(),
         loss_semantic_align.detach(),
     )

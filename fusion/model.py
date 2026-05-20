@@ -15,7 +15,6 @@ from fusion.modules import (
     build_main_head,
 )
 from fusion.graph_encoders import GraphEncoderGAT, GraphEncoderGCN, GraphEncoderGPS
-from fusion.prototypes import TemporalPrototypeMemory
 
 
 class ApiSequenceEncoder(nn.Module):
@@ -320,7 +319,6 @@ class MalwareModelWithXAttn(nn.Module):
         max_nodes_gnn: int = 2048,
         max_xattn_nodes: int = 512,
         in_feat_dim: int = 515,
-        use_temporal_regularization: bool = True,
         gate_detach: bool = True,
         xattn_heads: int = 4,
         fusion_mode: str = "ours",
@@ -342,18 +340,10 @@ class MalwareModelWithXAttn(nn.Module):
         alignment_context_scale: float = 0.35,
         use_alignment_bias: bool = True,
         use_adaptive_alignment_bias: bool = False,
-        use_alignment_drift_guidance: bool = True,
-        use_drift_gate: bool = True,
+        use_uncertainty_gate: bool = True,
         use_quality_gate_inputs: bool = True,
         gate_mode: str = "learned",
         late_fusion_api_weight: float = 0.5,
-        temporal_num_domains: int = 1,
-        temporal_prototype_momentum: float = 0.95,
-        temporal_prototype_clusters: int = 4,
-        temporal_drift_velocity_scale: float = 0.5,
-        temporal_drift_min_history: int = 2,
-        use_future_temporal_drift: bool = True,
-        use_temporal_risk_calibration: bool = True,
     ):
         super().__init__()
 
@@ -378,16 +368,9 @@ class MalwareModelWithXAttn(nn.Module):
         self.graph_emb_dim = int(graph_emb_dim)
         self.align_dim = int(align_dim)
         self.fusion_mode = str(fusion_mode)
-        self.use_temporal_regularization = bool(use_temporal_regularization)
         self.gate_detach = bool(gate_detach)
         self.graph_use_behavior_hint = bool(graph_use_behavior_hint)
-        self.temporal_num_domains = max(int(temporal_num_domains), 1)
-        self.temporal_prototype_momentum = float(temporal_prototype_momentum)
-        self.temporal_prototype_clusters = max(int(temporal_prototype_clusters), 1)
-        self.temporal_drift_velocity_scale = float(temporal_drift_velocity_scale)
-        self.temporal_drift_min_history = max(int(temporal_drift_min_history), 1)
-        self.use_future_temporal_drift = bool(use_future_temporal_drift)
-        self.use_temporal_risk_calibration = bool(use_temporal_risk_calibration)
+
 
         self.api_encoder_type = str(api_encoder_type).lower()
         self.api_max_seq_len = int(api_max_seq_len)
@@ -416,13 +399,11 @@ class MalwareModelWithXAttn(nn.Module):
 
         self.use_alignment_bias = bool(use_alignment_bias)
         self.use_adaptive_alignment_bias = bool(use_adaptive_alignment_bias)
-        self.use_alignment_drift_guidance = bool(use_alignment_drift_guidance)
-        self.use_drift_gate = bool(use_drift_gate)
+        self.use_uncertainty_gate = bool(use_uncertainty_gate)
         self.use_quality_gate_inputs = bool(use_quality_gate_inputs)
         self.training_stage = "main"
         self.force_fixed_gate = False
         self.force_disable_alignment = False
-        self.force_disable_future_temporal = False
         self.gate_mode = str(gate_mode or "learned").lower()
         if self.gate_mode not in {"learned", "fixed"}:
             raise ValueError("gate_mode must be one of: learned, fixed")
@@ -496,41 +477,9 @@ class MalwareModelWithXAttn(nn.Module):
             self.cross_attn = None
 
         if self._need_gates:
-            self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=10)
+            self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=9)
         else:
             self.gate_net = None
-
-        if fusion_mode == "api":
-            temporal_in_dim = api_emb_dim
-        elif fusion_mode == "graph":
-            temporal_in_dim = graph_emb_dim
-        elif fusion_mode == "cross_attention":
-            temporal_in_dim = api_emb_dim + graph_emb_dim + api_emb_dim
-        else:
-            temporal_in_dim = api_emb_dim + graph_emb_dim
-
-        if temporal_in_dim == api_emb_dim:
-            self.temporal_feature_proj = nn.Identity()
-        else:
-            self.temporal_feature_proj = nn.Sequential(
-                nn.Linear(temporal_in_dim, api_emb_dim),
-                nn.LayerNorm(api_emb_dim),
-            )
-
-        self.temporal_pair_proj = nn.Sequential(
-            nn.Linear(api_emb_dim + graph_emb_dim, api_emb_dim),
-            nn.LayerNorm(api_emb_dim),
-        )
-        # Keep downstream classifier initialization seed-compatible with the
-        # previous 3-input risk head. The actual 6-input head is created after
-        # the main heads below.
-        _risk_head_rng_compat = nn.Sequential(
-            nn.Linear(3, ArchitectureConstants.GATE_HIDDEN_DIM // 2),
-            nn.GELU(),
-            nn.Linear(ArchitectureConstants.GATE_HIDDEN_DIM // 2, 1),
-        )
-        del _risk_head_rng_compat
-        self.temporal_risk_head = None
 
         if self._need_alignment:
             self.api_align_proj = nn.Sequential(
@@ -571,19 +520,6 @@ class MalwareModelWithXAttn(nn.Module):
                 joint_in_dim = api_emb_dim + graph_emb_dim
             self.joint_head = build_main_head(joint_in_dim, num_classes)
 
-        self.temporal_prototype_memory = TemporalPrototypeMemory(
-            num_domains=self.temporal_num_domains,
-            num_classes=num_classes,
-            feature_dim=api_emb_dim,
-            momentum=self.temporal_prototype_momentum,
-            num_clusters=self.temporal_prototype_clusters,
-        )
-        self.temporal_risk_head = nn.Sequential(
-            nn.Linear(7, ArchitectureConstants.GATE_HIDDEN_DIM // 2),
-            nn.GELU(),
-            nn.Linear(ArchitectureConstants.GATE_HIDDEN_DIM // 2, 1),
-        )
-
     def set_training_stage(self, stage: str):
         """Switch lightweight stage-specific behavior without rebuilding modules."""
         stage = str(stage or "main").lower()
@@ -592,7 +528,6 @@ class MalwareModelWithXAttn(nn.Module):
         self.training_stage = stage
         self.force_fixed_gate = stage == "warmup"
         self.force_disable_alignment = stage == "warmup"
-        self.force_disable_future_temporal = stage == "warmup"
 
     def _encode_api(self, graph_data, batch_size: int, device, dtype, return_token_seqs: bool = True):
         if self.api_encoder is None:
@@ -631,123 +566,6 @@ class MalwareModelWithXAttn(nn.Module):
 
         return api_z, graph_z
 
-    def _project_temporal_feature(self, feature: torch.Tensor) -> torch.Tensor:
-        projected = self.temporal_feature_proj(feature)
-        return F.normalize(projected, dim=-1)
-
-    def _project_temporal_pair(self, api_emb: torch.Tensor, graph_emb: torch.Tensor) -> torch.Tensor:
-        pair = torch.cat([api_emb, graph_emb], dim=-1)
-        return F.normalize(self.temporal_pair_proj(pair), dim=-1)
-
-    def _estimate_temporal_drift(
-        self,
-        feature: torch.Tensor | None,
-        time_ids: torch.Tensor | None,
-        logits: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        if (
-            feature is None
-            or time_ids is None
-            or not self.use_temporal_regularization
-            or self.temporal_prototype_memory is None
-        ):
-            return None
-
-        class_probs = None
-        if logits is not None:
-            class_probs = torch.softmax(logits.detach().float(), dim=-1)
-
-        drift = self.temporal_prototype_memory.estimate_drift(
-            feature.detach(),
-            time_ids.detach(),
-            class_probs=class_probs,
-            include_future=(
-                self.use_future_temporal_drift
-                and not self.force_disable_future_temporal
-            ),
-            velocity_scale=self.temporal_drift_velocity_scale,
-            min_history=self.temporal_drift_min_history,
-        )
-        return drift.to(device=feature.device, dtype=feature.dtype)
-
-    def _estimate_temporal_risk_components(
-        self,
-        feature: torch.Tensor | None,
-        time_ids: torch.Tensor | None,
-        logits: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor] | None:
-        if (
-            feature is None
-            or time_ids is None
-            or not self.use_temporal_regularization
-            or self.temporal_prototype_memory is None
-        ):
-            return None
-
-        class_probs = None
-        if logits is not None:
-            class_probs = torch.softmax(logits.detach().float(), dim=-1)
-
-        components = self.temporal_prototype_memory.estimate_risk_components(
-            feature.detach(),
-            time_ids.detach(),
-            class_probs=class_probs,
-            include_future=(
-                self.use_future_temporal_drift
-                and not self.force_disable_future_temporal
-            ),
-            velocity_scale=self.temporal_drift_velocity_scale,
-            min_history=self.temporal_drift_min_history,
-        )
-        return {
-            k: v.to(device=feature.device, dtype=feature.dtype)
-            for k, v in components.items()
-        }
-
-    def _calibrate_temporal_risk(
-        self,
-        temporal_drift: torch.Tensor | None,
-        prototype_pred_distance: torch.Tensor | None,
-        prototype_margin_risk: torch.Tensor | None,
-        prototype_label_mismatch: torch.Tensor | None,
-        prototype_reliability_risk: torch.Tensor | None,
-        disagreement: torch.Tensor,
-        entropy: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Map raw prototype drift to a calibrated temporal error-risk score."""
-        if temporal_drift is None:
-            temporal_drift = torch.zeros_like(entropy)
-        temporal_drift = temporal_drift.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
-        if prototype_pred_distance is None:
-            prototype_pred_distance = temporal_drift
-        prototype_pred_distance = prototype_pred_distance.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
-        if prototype_margin_risk is None:
-            prototype_margin_risk = torch.zeros_like(entropy)
-        prototype_margin_risk = prototype_margin_risk.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
-        if prototype_label_mismatch is None:
-            prototype_label_mismatch = torch.zeros_like(entropy)
-        prototype_label_mismatch = prototype_label_mismatch.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
-        if prototype_reliability_risk is None:
-            prototype_reliability_risk = torch.zeros_like(entropy)
-        prototype_reliability_risk = prototype_reliability_risk.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
-        risk_inputs = torch.cat(
-            [
-                temporal_drift.clamp(0.0, 1.0),
-                prototype_pred_distance.clamp(0.0, 1.0),
-                prototype_margin_risk.clamp(0.0, 1.0),
-                prototype_label_mismatch.clamp(0.0, 1.0),
-                prototype_reliability_risk.clamp(0.0, 1.0),
-                disagreement.detach().clamp(0.0, 1.0),
-                entropy.detach().clamp(0.0, 1.0),
-            ],
-            dim=-1,
-        )
-        if not self.use_temporal_risk_calibration:
-            raw_logit = torch.logit(temporal_drift.clamp(1e-4, 1.0 - 1e-4))
-            return raw_logit, temporal_drift.clamp(0.0, 1.0)
-        risk_logit = self.temporal_risk_head(risk_inputs.detach())
-        return risk_logit, torch.sigmoid(risk_logit).clamp(0.0, 1.0)
-
     def _explicit_qs_to_tensor(self, explicit_qs, b, device, dtype):
         if explicit_qs is None:
             return torch.ones((b, 5), device=device, dtype=dtype)
@@ -761,7 +579,7 @@ class MalwareModelWithXAttn(nn.Module):
 
         return torch.cat(vals, dim=-1).clamp(0.0, 1.0)
 
-    def _compute_drift_components(self, api_logits, graph_logits, joint_logits, temporal_drift=None):
+    def _compute_branch_uncertainty(self, api_logits, graph_logits, joint_logits):
         p_api = torch.softmax(api_logits.detach(), dim=-1)
         p_graph = torch.softmax(graph_logits.detach(), dim=-1)
         p_joint = torch.softmax(joint_logits.detach(), dim=-1)
@@ -779,116 +597,17 @@ class MalwareModelWithXAttn(nn.Module):
             * p_joint.clamp_min(1e-8).log()
         ).sum(dim=-1, keepdim=True) / math.log(max(p_joint.size(-1), 2))
 
-        W = ArchitectureConstants
-        if temporal_drift is None:
-            temporal_drift = torch.zeros_like(entropy)
-        else:
-            temporal_drift = temporal_drift.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
+        # No temporal prototype drift here. This is branch-level uncertainty only.
+        denom = max(
+            float(ArchitectureConstants.UNCERTAINTY_W_DISAGREE + ArchitectureConstants.UNCERTAINTY_W_ENTROPY),
+            1e-8,
+        )
+        uncertainty_score = (
+            ArchitectureConstants.UNCERTAINTY_W_DISAGREE * disagreement
+            + ArchitectureConstants.UNCERTAINTY_W_ENTROPY * entropy
+        ) / denom
 
-        drift_score = (
-            W.DRIFT_W_TEMPORAL * temporal_drift
-            + W.DRIFT_W_DISAGREE * disagreement
-            + W.DRIFT_W_ENTROPY * entropy
-        ).clamp(0.0, 1.0)
-        return drift_score, temporal_drift.clamp(0.0, 1.0), disagreement, entropy
-
-    def _attach_temporal_risk(
-        self,
-        extra: dict,
-        temporal_feature: torch.Tensor | None,
-        time_ids: torch.Tensor | None,
-        logits: torch.Tensor | None,
-        api_logits: torch.Tensor | None = None,
-        graph_logits: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if (
-            temporal_feature is None
-            or time_ids is None
-            or logits is None
-            or not self.use_temporal_regularization
-        ):
-            return None, None
-
-        risk_components = self._estimate_temporal_risk_components(
-            temporal_feature,
-            time_ids,
-            logits,
-        )
-        raw_temporal_drift = (
-            None
-            if risk_components is None
-            else risk_components.get("temporal_drift")
-        )
-        proto_pred_dist = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_pred_distance")
-        )
-        proto_margin_risk = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_margin_risk")
-        )
-        proto_label_mismatch = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_label_mismatch")
-        )
-        proto_reliability_risk = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_reliability_risk")
-        )
-
-        if (
-            api_logits is not None
-            and graph_logits is not None
-            and api_logits.shape == logits.shape
-            and graph_logits.shape == logits.shape
-        ):
-            _, raw_gate_temporal_drift, disagreement, entropy = self._compute_drift_components(
-                api_logits,
-                graph_logits,
-                logits,
-                temporal_drift=raw_temporal_drift,
-            )
-        else:
-            p = torch.softmax(logits.detach(), dim=-1)
-            entropy = -(
-                p.clamp_min(1e-8) * p.clamp_min(1e-8).log()
-            ).sum(dim=-1, keepdim=True) / math.log(max(p.size(-1), 2))
-            disagreement = torch.zeros_like(entropy)
-            raw_gate_temporal_drift = (
-                torch.zeros_like(entropy)
-                if raw_temporal_drift is None
-                else raw_temporal_drift.to(device=entropy.device, dtype=entropy.dtype).view_as(entropy)
-            )
-
-        risk_logit, risk_score = self._calibrate_temporal_risk(
-            raw_gate_temporal_drift,
-            proto_pred_dist,
-            proto_margin_risk,
-            proto_label_mismatch,
-            proto_reliability_risk,
-            disagreement,
-            entropy,
-        )
-
-        B = logits.size(0)
-        if raw_temporal_drift is not None:
-            extra["temporal_drift_score"] = raw_temporal_drift.detach().view(B)
-            extra["temporal_drift_raw_for_gate"] = raw_gate_temporal_drift.detach().view(B)
-        if proto_pred_dist is not None:
-            extra["temporal_proto_pred_dist"] = proto_pred_dist.detach().view(B)
-        if proto_margin_risk is not None:
-            extra["temporal_proto_margin_risk"] = proto_margin_risk.detach().view(B)
-        if proto_label_mismatch is not None:
-            extra["temporal_proto_label_mismatch"] = proto_label_mismatch.detach().view(B)
-        if proto_reliability_risk is not None:
-            extra["temporal_proto_reliability_risk"] = proto_reliability_risk.detach().view(B)
-        extra["temporal_risk_logit"] = risk_logit.view(B)
-        extra["temporal_risk_score"] = risk_score.detach().view(B)
-        return raw_temporal_drift, risk_score
+        return uncertainty_score.clamp(0.0, 1.0), disagreement, entropy
 
     @staticmethod
     def _modality_alive(emb: torch.Tensor) -> torch.Tensor:
@@ -1120,28 +839,6 @@ class MalwareModelWithXAttn(nn.Module):
 
         extra = {}
 
-        temporal_api_feature = F.normalize(api_emb, dim=-1)
-        temporal_graph_feature = F.normalize(graph_emb, dim=-1)
-
-        def _set_temporal_features(fusion_feature, projected_feature=None):
-            if not (self.training and y is not None and self.use_temporal_regularization and time_ids is not None):
-                return (
-                    projected_feature
-                    if projected_feature is not None
-                    else self._project_temporal_feature(fusion_feature)
-                )
-            fusion_feature = (
-                projected_feature
-                if projected_feature is not None
-                else self._project_temporal_feature(fusion_feature)
-            )
-            extra["temporal_features_api"] = temporal_api_feature
-            extra["temporal_features_graph"] = temporal_graph_feature
-            extra["temporal_features_fusion"] = fusion_feature
-            extra["temporal_features"] = fusion_feature
-            extra["temporal_prototype_memory"] = self.temporal_prototype_memory
-            return fusion_feature
-
         if time_ids is not None:
             extra["time_ids"] = time_ids
 
@@ -1158,21 +855,13 @@ class MalwareModelWithXAttn(nn.Module):
             extra["alignment_density_prior"] = alignment_density_prior.detach()
 
         if self.fusion_mode == "api":
-            risk_feature = _set_temporal_features(api_emb, projected_feature=temporal_api_feature)
-            if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
-                extra["temporal_quality"] = raw_qs[:, 0].detach().clamp(0.0, 1.0)
             logits = self.api_head(api_emb)
-            self._attach_temporal_risk(extra, risk_feature, time_ids, logits)
             if return_features:
                 extra["api_emb"] = api_emb
             return logits, extra
 
         if self.fusion_mode == "graph":
-            risk_feature = _set_temporal_features(graph_emb, projected_feature=temporal_graph_feature)
-            if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
-                extra["temporal_quality"] = raw_qs[:, 1].detach().clamp(0.0, 1.0)
             logits = self.graph_head(graph_emb)
-            self._attach_temporal_risk(extra, risk_feature, time_ids, logits)
             if return_features:
                 extra["graph_emb"] = graph_emb
             return logits, extra
@@ -1187,34 +876,12 @@ class MalwareModelWithXAttn(nn.Module):
                 extra["graph_logits_aux"] = graph_logits
 
         if self.fusion_mode == "late_fusion":
-            late_joint = torch.cat([api_emb, graph_emb], dim=-1)
-            risk_feature = _set_temporal_features(late_joint)
-            if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
-                extra["temporal_quality"] = (
-                    raw_qs[:, 0] * raw_qs[:, 1]
-                ).detach().clamp(0.0, 1.0)
             wa = self.late_fusion_api_weight
             logits = wa * api_logits + (1.0 - wa) * graph_logits
-            self._attach_temporal_risk(extra, risk_feature, time_ids, logits, api_logits, graph_logits)
             if return_features:
                 extra["api_emb"] = api_emb
                 extra["graph_emb"] = graph_emb
             return logits, extra
-
-        temporal_pair_feature = None
-        alignment_temporal_drift = None
-        if self.fusion_mode == "ours" and time_ids is not None:
-            temporal_pair_feature = self._project_temporal_pair(api_emb, graph_emb)
-            pre_logits = None
-            if api_logits is not None and graph_logits is not None:
-                pre_logits = 0.5 * (api_logits + graph_logits)
-            alignment_temporal_drift = self._estimate_temporal_drift(
-                temporal_pair_feature,
-                time_ids,
-                pre_logits,
-            )
-            if alignment_temporal_drift is not None:
-                extra["alignment_temporal_drift"] = alignment_temporal_drift.detach().view(B)
 
         if (
             self.training
@@ -1231,13 +898,6 @@ class MalwareModelWithXAttn(nn.Module):
                     semantic_quality = semantic_quality * coverage_gate * density_gate
                     extra["semantic_alignment_coverage_gate"] = coverage_gate.detach()
                     extra["semantic_alignment_density_gate"] = density_gate.detach()
-                if self.use_alignment_drift_guidance and alignment_temporal_drift is not None:
-                    drift_gate = (
-                        0.25
-                        + 0.75 * (1.0 - alignment_temporal_drift.detach().view(-1))
-                    ).clamp(0.25, 1.0)
-                    semantic_quality = semantic_quality * drift_gate
-                    extra["semantic_alignment_drift_gate"] = drift_gate.detach()
                 extra["semantic_alignment_api"] = api_align
                 extra["semantic_alignment_graph"] = graph_align
                 extra["semantic_alignment_quality"] = semantic_quality
@@ -1287,13 +947,6 @@ class MalwareModelWithXAttn(nn.Module):
                         align_scale = torch.ones((B, 1, 1, 1), device=device, dtype=dtype)
 
                     align_scale = align_scale.to(device=device, dtype=dtype)
-                    if self.use_alignment_drift_guidance and alignment_temporal_drift is not None:
-                        drift_gate = (
-                            0.25
-                            + 0.75 * (1.0 - alignment_temporal_drift.view(B, 1, 1, 1))
-                        ).clamp(0.25, 1.0)
-                        align_scale = align_scale * drift_gate.to(device=device, dtype=dtype)
-                        extra["alignment_drift_gate"] = drift_gate.view(B).detach()
                     align_scale_for_context = align_scale
 
                     penalty_scale = align_scale * self.alignment_penalty_scale
@@ -1371,13 +1024,7 @@ class MalwareModelWithXAttn(nn.Module):
 
         if self.fusion_mode == "cross_attention":
             joint = torch.cat([api_emb, graph_emb, xattn_pooled], dim=-1)
-            risk_feature = _set_temporal_features(joint)
-            if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
-                extra["temporal_quality"] = (
-                    raw_qs[:, 0] * raw_qs[:, 1]
-                ).detach().clamp(0.0, 1.0)
             logits = self.joint_head(joint)
-            self._attach_temporal_risk(extra, risk_feature, time_ids, logits, api_logits, graph_logits)
             if return_features:
                 extra["api_emb"] = api_emb
                 extra["graph_emb"] = graph_emb
@@ -1386,13 +1033,7 @@ class MalwareModelWithXAttn(nn.Module):
 
         if self.fusion_mode == "concat":
             joint = torch.cat([api_emb, graph_emb], dim=-1)
-            risk_feature = _set_temporal_features(joint)
-            if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
-                extra["temporal_quality"] = (
-                    raw_qs[:, 0] * raw_qs[:, 1]
-                ).detach().clamp(0.0, 1.0)
             logits = self.joint_head(joint)
-            self._attach_temporal_risk(extra, risk_feature, time_ids, logits, api_logits, graph_logits)
             if return_features:
                 extra["api_emb"] = api_emb
                 extra["graph_emb"] = graph_emb
@@ -1410,92 +1051,24 @@ class MalwareModelWithXAttn(nn.Module):
         joint = torch.cat([fused_api, graph_emb], dim=-1)
         joint_logits = self.joint_head(joint)
         extra["joint_logits_aux"] = joint_logits
-        joint_temporal_feature = (
-            temporal_pair_feature
-            if temporal_pair_feature is not None
-            else self._project_temporal_feature(joint)
-        )
-        risk_components = self._estimate_temporal_risk_components(
-            joint_temporal_feature,
-            time_ids,
+
+        uncertainty_score, gate_disagreement, gate_entropy = self._compute_branch_uncertainty(
+            api_logits,
+            graph_logits,
             joint_logits,
-        )
-        temporal_drift_score = (
-            None
-            if risk_components is None
-            else risk_components.get("temporal_drift")
-        )
-        proto_pred_dist = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_pred_distance")
-        )
-        proto_margin_risk = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_margin_risk")
-        )
-        proto_label_mismatch = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_label_mismatch")
-        )
-        proto_reliability_risk = (
-            None
-            if risk_components is None
-            else risk_components.get("prototype_reliability_risk")
         )
 
-        _, raw_gate_temporal_drift, gate_disagreement, gate_entropy = self._compute_drift_components(
-            api_logits,
-            graph_logits,
-            joint_logits,
-            temporal_drift=temporal_drift_score,
-        )
-        temporal_risk_logit, temporal_risk_score = self._calibrate_temporal_risk(
-            raw_gate_temporal_drift,
-            proto_pred_dist,
-            proto_margin_risk,
-            proto_label_mismatch,
-            proto_reliability_risk,
-            gate_disagreement,
-            gate_entropy,
-        )
-        # The gate should consume the calibrated risk estimate as a signal, but
-        # not reshape the calibrator through the classification objective.
-        gate_temporal_risk = temporal_risk_score.detach()
-        drift_score, gate_temporal_drift, gate_disagreement, gate_entropy = self._compute_drift_components(
-            api_logits,
-            graph_logits,
-            joint_logits,
-            temporal_drift=gate_temporal_risk,
-        )
-        drift_score = drift_score.to(device=device, dtype=dtype)
-        gate_temporal_drift = gate_temporal_drift.to(device=device, dtype=dtype)
+        uncertainty_score = uncertainty_score.to(device=device, dtype=dtype)
         gate_disagreement = gate_disagreement.to(device=device, dtype=dtype)
         gate_entropy = gate_entropy.to(device=device, dtype=dtype)
-        if temporal_drift_score is not None:
-            extra["temporal_drift_score"] = temporal_drift_score.detach().view(B)
-            extra["temporal_drift_raw_for_gate"] = raw_gate_temporal_drift.detach().view(B)
-        if proto_pred_dist is not None:
-            extra["temporal_proto_pred_dist"] = proto_pred_dist.detach().view(B)
-        if proto_margin_risk is not None:
-            extra["temporal_proto_margin_risk"] = proto_margin_risk.detach().view(B)
-        if proto_label_mismatch is not None:
-            extra["temporal_proto_label_mismatch"] = proto_label_mismatch.detach().view(B)
-        if proto_reliability_risk is not None:
-            extra["temporal_proto_reliability_risk"] = proto_reliability_risk.detach().view(B)
-        extra["temporal_risk_logit"] = temporal_risk_logit.view(B)
-        extra["temporal_risk_score"] = temporal_risk_score.detach().view(B)
 
-        if not self.use_drift_gate:
-            drift_score = torch.zeros_like(drift_score)
-            gate_temporal_drift = torch.zeros_like(gate_temporal_drift)
+        if not self.use_uncertainty_gate:
+            uncertainty_score = torch.zeros_like(uncertainty_score)
             gate_disagreement = torch.zeros_like(gate_disagreement)
             gate_entropy = torch.zeros_like(gate_entropy)
 
         gate_inputs = torch.cat(
-            [gate_qs, gate_temporal_drift, gate_disagreement, gate_entropy, api_alive, graph_alive],
+            [gate_qs, gate_disagreement, gate_entropy, api_alive, graph_alive],
             dim=-1,
         )
 
@@ -1521,16 +1094,9 @@ class MalwareModelWithXAttn(nn.Module):
 
         extra["gate_weights_train"] = gate_weights
         extra["gate_weights"] = gate_weights.detach()
-        extra["drift_score"] = drift_score.detach()
-        extra["gate_temporal_drift"] = gate_temporal_drift.detach()
         extra["gate_disagreement"] = gate_disagreement.detach()
         extra["gate_entropy"] = gate_entropy.detach()
-
-        if self.training and y is not None and self.use_temporal_regularization and time_ids is not None:
-            _set_temporal_features(joint, projected_feature=joint_temporal_feature)
-            extra["temporal_quality"] = (
-                raw_qs[:, 0:1] * raw_qs[:, 1:2]
-            ).detach().view(-1).clamp(0.0, 1.0)
+        extra["uncertainty_score"] = uncertainty_score.detach()
 
         if return_features:
             extra["api_emb"] = api_emb
