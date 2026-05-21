@@ -1808,14 +1808,19 @@ class WarmupCosineScheduler:
         return [pg["lr"] for pg in self.optimizer.param_groups]
 
 @torch.no_grad()
-def collect_calibrated_outputs(model, calibrator, loader, device, use_amp=False):
+def collect_calibrated_outputs(model, calibrator, loader, device, use_amp=False, strict=True, phase="calibrated_eval"):
     model.eval()
     calibrator.eval()
     all_p, all_y = [], []
 
     for batch in loader:
         if batch is None:
+            if strict:
+                raise RuntimeError(f"[{phase}] got None batch")
             continue
+
+        if strict:
+            _assert_no_failed_eval_batch(batch, phase)
 
         r = prepare_batch(
             batch,
@@ -1827,6 +1832,11 @@ def collect_calibrated_outputs(model, calibrator, loader, device, use_amp=False)
             ),
         )
         if r[2] is None:
+            if strict:
+                raise RuntimeError(
+                    f"[{phase}] prepare_batch produced invalid batch. "
+                    f"Examples: {_format_failed_items(batch)}"
+                )
             continue
 
         graph, masks, y, _, ex, _ = r
@@ -2408,7 +2418,7 @@ def main():
 
     # ── Selective classification on calibrated probs ──
     test_probs, test_labels = collect_calibrated_outputs(
-        model, calibrator, dl_test, device, use_amp
+        model, calibrator, dl_test, device, use_amp, strict=True,phase="test_calibrated",
     )
     test_preds = test_probs.argmax(axis=1)
     det_metrics = _binary_detection_metrics(test_labels, test_probs, test_preds)
@@ -2563,7 +2573,7 @@ def main():
         )
 
         extra_probs, extra_labels = collect_calibrated_outputs(
-            model, calibrator, dl_extra, device, use_amp
+            model, calibrator, dl_extra, device, use_amp, strict=True,phase="extra_calibrated",
         )
         extra_preds = extra_probs.argmax(axis=1)
         extra_conf = extra_probs.max(axis=1)

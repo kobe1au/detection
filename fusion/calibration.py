@@ -54,6 +54,9 @@ class TemperatureScaling(nn.Module):
                                         skip_graph=False,
                                         skip_masks=(model.fusion_mode != "ours" or not getattr(model, "use_alignment_bias", False)))
                     if result[2] is None:
+                        msg = "[calibration] prepare_batch produced invalid batch"
+                        if strict:
+                            raise RuntimeError(msg)
                         failed_batches += 1
                         continue
                     graph, masks, y, _, explicit_info, _ = result
@@ -66,12 +69,17 @@ class TemperatureScaling(nn.Module):
                             masks=masks,
                         )
                     if logits.shape[0] != y.shape[0]:
-                        logger.warning(f"Batch size mismatch: {logits.shape[0]} vs {y.shape[0]}")
+                        msg = f"[calibration] batch size mismatch: logits={logits.shape[0]} labels={y.shape[0]}"
+                        if strict:
+                            raise RuntimeError(msg)
+                        logger.warning(msg)
                         failed_batches += 1
                         continue
                     all_logits.append(logits.detach().cpu())
                     all_labels.append(y.detach().cpu()) 
                 except Exception as e:
+                    if strict:
+                        raise RuntimeError(f"[calibration] batch failed under strict mode: {e}") from e
                     logger.warning(f"Calibration batch failed: {e}")
                     failed_batches += 1
                     continue
