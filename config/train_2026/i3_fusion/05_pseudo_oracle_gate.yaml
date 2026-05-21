@@ -27,7 +27,7 @@ train:
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
-  gate_oracle_weight: 0.0
+  gate_oracle_weight: 0.05
   gate_oracle_temperature: 0.5
   gate_oracle_smoothing: 0.10
   gate_oracle_start_phase: adaptation
