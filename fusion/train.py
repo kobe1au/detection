@@ -15,6 +15,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 import torch.nn as nn
+from torch_geometric.graphgym import cfg
 import yaml
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, recall_score, roc_auc_score
@@ -130,22 +131,40 @@ def preflight_validate_protocol(
         years = read_split_years(extra_csv)
         extra_test_years.append((extra_csv, years))
 
+    train_end = max(train_years)
+
+    if min(val_years) <= train_end:
+        raise ValueError(
+            f"val years should be newer than historical train years: "
+            f"train={train_years}, val={val_years}"
+        )
+
     if adapt_csv:
         adapt_years = read_split_years(adapt_csv)
-        if min(adapt_years) <= max(train_years):
+
+        if min(adapt_years) <= train_end:
             raise ValueError(
                 f"adapt_csv should be strictly newer than train_csv: "
                 f"train={train_years}, adapt={adapt_years}"
             )
 
-        he = int(cfg["train"].get("historical_epochs", 0))
-        ae = int(cfg["train"].get("adaptation_epochs", 0))
-        if he <= 0 or ae <= 0:
+        if max(val_years) >= min(adapt_years):
             raise ValueError(
-                "continual adaptation requires historical_epochs > 0 "
-                "and adaptation_epochs > 0"
+                f"validation years should be before adaptation years: "
+                f"val={val_years}, adapt={adapt_years}"
             )
 
+        if min(test_years) <= max(adapt_years):
+            raise ValueError(
+                f"test years should be newer than adaptation years: "
+                f"adapt={adapt_years}, test={test_years}"
+            )
+    else:
+        if min(test_years) <= train_end:
+            raise ValueError(
+                f"test years should be newer than train years: "
+                f"train={train_years}, test={test_years}"
+            )
     phase = str(cfg["loss"].get("gate_oracle_start_phase", "") or "").lower()
     if phase and phase not in {"historical", "adaptation"}:
         raise ValueError(
@@ -1359,7 +1378,10 @@ def eval_one_epoch(
         all_confs.extend(conf.detach().cpu().tolist())
 
         # Per-sample diagnostics for I2 alignment bucket analysis.
-        all_qalign.extend(qa.detach().float().view(-1).cpu().tolist())
+        if isinstance(qa, torch.Tensor) and qa.numel() == bs:
+            all_qalign.extend(qa.detach().float().view(-1).cpu().tolist())
+        else:
+            all_qalign.extend([float("nan")] * bs)
 
         def _append_extra_vector(key, target_list):
             value = extra.get(key) if isinstance(extra, dict) else None
@@ -1997,6 +2019,8 @@ def main():
         )
     graph_in_feat_dim = inferred_graph_dim
     c_model["in_feat_dim"] = graph_in_feat_dim
+    effective_snap_path = os.path.join(ckpt_dir, "config_effective.yaml")
+    save_config_snapshot(cfg, effective_snap_path)
     model = MalwareModelWithXAttn(
         num_classes=num_classes,
         api_emb_dim=TrainingConstants.API_EMB_DIM,
