@@ -17,13 +17,13 @@ model:
     detach: true
 
 train:
-  exp_name: final_continual_ours_2026_adapt_010
+  exp_name: replay_ablation_static_replay_adapt_020
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 0.10
+  adaptation_ratio: 0.20
   replay_ratio: 0.25
-  replay_strategy: dynamic_year_class
+  replay_strategy: static
 
 loss:
   semantic_alignment_weight: 0.03

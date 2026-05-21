@@ -6,10 +6,11 @@ model:
   fusion_mode: concat
 
 train:
-  exp_name: continual_b1_i1_adapt_010
+  exp_name: i1_ratio_005_dynamic_replay
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 0.10
+  adaptation_ratio: 0.05
   replay_ratio: 0.25
   replay_strategy: dynamic_year_class
+

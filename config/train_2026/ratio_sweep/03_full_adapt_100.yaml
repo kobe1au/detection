@@ -10,16 +10,26 @@ model:
     penalty_scale: 0.5
     bonus_scale: 1.0
     context_scale: 0.35
+  gate:
+    mode: learned
+    quality_inputs: true
+    uncertainty_inputs: true
+    detach: true
 
 train:
-  exp_name: continual_b2_i1_i2_adapt_005
+  exp_name: ratio_full_i1_i2_i3_adapt_100
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 0.05
+  adaptation_ratio: 1.00
   replay_ratio: 0.25
   replay_strategy: dynamic_year_class
 
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
+  gate_oracle_weight: 0.05
+  gate_oracle_temperature: 0.5
+  gate_oracle_smoothing: 0.10
+  gate_oracle_start_phase: adaptation
+  gate_oracle_adaptation_only: true

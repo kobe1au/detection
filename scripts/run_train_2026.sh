@@ -19,27 +19,35 @@ BASELINES=(
   "config/train_2026/baselines/03_cross_attention.yaml"
 )
 
-CONTINUAL=(
-  "config/train_2026/continual/00_zero_adapt_concat.yaml"
-  "config/train_2026/continual/01_i1_adapt_010.yaml"
-  "config/train_2026/continual/02_i1_i2_adapt_010.yaml"
-  "config/train_2026/continual/03_i1_i2_i3_adapt_010.yaml"
-  "config/train_2026/continual/04_i1_i2_i3_static_replay_adapt_010.yaml"
+MAIN_CHAIN=(
+  "config/train_2026/main_chain/00_zero_adapt_concat.yaml"
+  "config/train_2026/main_chain/01_i1_adapt_020.yaml"
+  "config/train_2026/main_chain/02_i1_i2_adapt_020.yaml"
+  "config/train_2026/main_chain/03_i1_i2_i3_adapt_020.yaml"
+)
+
+I1_ADAPTATION=(
+  "config/train_2026/i1_adaptation/00_zero_adapt_concat.yaml"
+  "config/train_2026/i1_adaptation/01_adapt_020_no_replay.yaml"
+  "config/train_2026/i1_adaptation/02_adapt_020_static_replay.yaml"
+  "config/train_2026/i1_adaptation/03_adapt_020_dynamic_replay.yaml"
+  "config/train_2026/i1_adaptation/10_ratio_005_dynamic_replay.yaml"
+  "config/train_2026/i1_adaptation/11_ratio_010_dynamic_replay.yaml"
+  "config/train_2026/i1_adaptation/12_ratio_020_dynamic_replay.yaml"
+  "config/train_2026/i1_adaptation/13_ratio_100_dynamic_replay.yaml"
 )
 
 RATIO_SWEEP=(
-  "config/train_2026/continual/01_i1_adapt_005.yaml"
-  "config/train_2026/continual/01_i1_adapt_010.yaml"
-  "config/train_2026/continual/01_i1_adapt_020.yaml"
-  "config/train_2026/continual/01_i1_adapt_100.yaml"
-  "config/train_2026/continual/02_i1_i2_adapt_005.yaml"
-  "config/train_2026/continual/02_i1_i2_adapt_010.yaml"
-  "config/train_2026/continual/02_i1_i2_adapt_020.yaml"
-  "config/train_2026/continual/02_i1_i2_adapt_100.yaml"
-  "config/train_2026/continual/03_i1_i2_i3_adapt_005.yaml"
-  "config/train_2026/continual/03_i1_i2_i3_adapt_010.yaml"
-  "config/train_2026/continual/03_i1_i2_i3_adapt_020.yaml"
-  "config/train_2026/continual/03_i1_i2_i3_adapt_100.yaml"
+  "config/train_2026/ratio_sweep/00_full_adapt_005.yaml"
+  "config/train_2026/ratio_sweep/01_full_adapt_010.yaml"
+  "config/train_2026/ratio_sweep/02_full_adapt_020.yaml"
+  "config/train_2026/ratio_sweep/03_full_adapt_100.yaml"
+)
+
+REPLAY_ABLATION=(
+  "config/train_2026/replay_ablation/00_no_replay_adapt_020.yaml"
+  "config/train_2026/replay_ablation/01_static_replay_adapt_020.yaml"
+  "config/train_2026/replay_ablation/02_dynamic_year_class_replay_adapt_020.yaml"
 )
 
 I2_ALIGNMENT=(
@@ -57,13 +65,6 @@ I3_FUSION=(
   "config/train_2026/i3_fusion/03_uncertainty_gate.yaml"
   "config/train_2026/i3_fusion/04_quality_uncertainty_gate.yaml"
   "config/train_2026/i3_fusion/05_pseudo_oracle_gate.yaml"
-)
-
-FINAL=(
-  "config/train_2026/final/continual_ours_2026_adapt_005.yaml"
-  "config/train_2026/final/continual_ours_2026_adapt_010.yaml"
-  "config/train_2026/final/continual_ours_2026_adapt_020.yaml"
-  "config/train_2026/final/continual_ours_2026_adapt_100.yaml"
 )
 
 run_group() {
@@ -87,11 +88,17 @@ case "${STAGE}" in
   baseline|base|baselines|cmp)
     run_group "baselines" "${BASELINES[@]}"
     ;;
-  continual|i1|main)
-    run_group "continual-main-chain" "${CONTINUAL[@]}"
+  main|chain|continual)
+    run_group "main-chain-20pct" "${MAIN_CHAIN[@]}"
+    ;;
+  i1|adaptation)
+    run_group "i1-adaptation-ablation" "${I1_ADAPTATION[@]}"
     ;;
   sweep|ratio|ratios)
-    run_group "continual-ratio-sweep" "${RATIO_SWEEP[@]}"
+    run_group "full-model-ratio-sweep" "${RATIO_SWEEP[@]}"
+    ;;
+  replay|memory)
+    run_group "replay-ablation-20pct" "${REPLAY_ABLATION[@]}"
     ;;
   i2|alignment|align)
     run_group "class-aware-alignment-ablation" "${I2_ALIGNMENT[@]}"
@@ -100,17 +107,19 @@ case "${STAGE}" in
     run_group "quality-aware-fusion-ablation" "${I3_FUSION[@]}"
     ;;
   final)
-    run_group "final-ratio-sweep" "${FINAL[@]}"
+    run_group "full-model-ratio-sweep" "${RATIO_SWEEP[@]}"
     ;;
   all)
     run_group "baselines" "${BASELINES[@]}"
-    run_group "continual-main-chain" "${CONTINUAL[@]}"
+    run_group "main-chain-20pct" "${MAIN_CHAIN[@]}"
+    run_group "i1-adaptation-ablation" "${I1_ADAPTATION[@]}"
+    run_group "replay-ablation-20pct" "${REPLAY_ABLATION[@]}"
     run_group "class-aware-alignment-ablation" "${I2_ALIGNMENT[@]}"
     run_group "quality-aware-fusion-ablation" "${I3_FUSION[@]}"
-    run_group "final-ratio-sweep" "${FINAL[@]}"
+    run_group "full-model-ratio-sweep" "${RATIO_SWEEP[@]}"
     ;;
   *)
-    echo "Usage: $0 [all|baselines|continual|sweep|i2|i3|final]"
+    echo "Usage: $0 [all|baselines|main|i1|replay|sweep|i2|i3|final]"
     exit 1
     ;;
 esac

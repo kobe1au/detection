@@ -1,0 +1,16 @@
+data:
+  adapt_pt_dir: "pts/adapt"
+  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
+
+model:
+  fusion_mode: concat
+
+train:
+  exp_name: i1_ratio_100_dynamic_replay
+  epochs: 70
+  historical_epochs: 60
+  adaptation_epochs: 10
+  adaptation_ratio: 1.00
+  replay_ratio: 0.25
+  replay_strategy: dynamic_year_class
+

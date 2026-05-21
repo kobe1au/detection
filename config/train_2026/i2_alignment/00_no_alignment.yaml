@@ -12,11 +12,11 @@ model:
     context_scale: 0.0
 
 train:
-  exp_name: i2_no_alignment_adapt_010
+  exp_name: i2_no_alignment_adapt_020
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 0.10
+  adaptation_ratio: 0.20
   replay_ratio: 0.25
   replay_strategy: dynamic_year_class
 loss:
