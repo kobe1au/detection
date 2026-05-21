@@ -7,13 +7,13 @@ data:
 
   train_pt_dir: "pts/train"
   val_pt_dir: "pts/val"
-  test_pt_dir: "pts/test"
+  test_pt_dir: "/pts/test"
 
-  train_csv: "resource/dataset_split_2018_2024/train.csv"
+  train_csv: "results/labels/train.csv"
   adapt_pt_dir: null
   adapt_csv: null
-  val_csv: "resource/dataset_split_2018_2024/val.csv"
-  test_csv: "resource/dataset_split_2018_2024/test_2024.csv"
+  val_csv: "results/labels/val.csv"
+  test_csv: "results/labels/test_2024.csv"
   extra_tests: []
 
   max_api_events_per_sample: 1024

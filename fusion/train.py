@@ -1970,7 +1970,7 @@ def main():
     ds_adapt = None
     if adapt_csv_path is not None:
         ds_adapt = MultiModalMalwareDataset(
-            pt_dir=resolve_path(data_root, c_data.get("adapt_pt_dir") or c_data["train_pt_dir"]),
+            pt_dir=resolve_path("", c_data.get("adapt_pt_dir") or c_data["train_pt_dir"]),
             csv_path=adapt_csv_path,
             is_train=True, robust_aug=False,
             max_api_events_per_sample=c_data["max_api_events_per_sample"],
@@ -2364,7 +2364,7 @@ def main():
     torch.save(calibrator.state_dict(), os.path.join(ckpt_dir, f"calibrator_{exp_name}.pt"))
 
     # ── Test ──
-    test_pt = resolve_path(data_root, c_data["test_pt_dir"])
+    test_pt = resolve_path("", c_data["test_pt_dir"])
     test_csv = resolve_path(data_root, c_data["test_csv"])
     if not (os.path.exists(test_pt) and os.path.exists(test_csv)):
         raise FileNotFoundError(f"Test set not found: pt_dir={test_pt}, csv={test_csv}")
@@ -2519,7 +2519,7 @@ def main():
 
     for spec in extra_test_specs:
         extra_name = str(spec["name"])
-        extra_pt = resolve_path(data_root, spec["test_pt_dir"])
+        extra_pt = resolve_path("", spec["test_pt_dir"])
         extra_csv = resolve_path(data_root, spec["test_csv"])
         if not (os.path.exists(extra_pt) and os.path.exists(extra_csv)):
             raise FileNotFoundError(

@@ -1,7 +1,3 @@
-data:
-  adapt_pt_dir: "pts/adapt"
-  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
-
 model:
   fusion_mode: ours
   alignment:
@@ -18,13 +14,14 @@ model:
 
 train:
   exp_name: ratio_full_i1_i2_i3_adapt_000
-  epochs: 70
+  epochs: 60
   historical_epochs: 60
-  adaptation_epochs: 10
+  adaptation_epochs: 0
   adaptation_ratio: 0.0
-  replay_ratio: 0.25
-  replay_strategy: dynamic_year_class
+  replay_ratio: 0.0
+  replay_strategy: static
 
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
+  gate_oracle_weight: 0.0

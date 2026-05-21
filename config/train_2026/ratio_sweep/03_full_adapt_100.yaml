@@ -1,6 +1,6 @@
 data:
-  adapt_pt_dir: "pts/adapt"
-  adapt_csv: "resource/dataset_split_2018_2024/adapt_2023.csv"
+  adapt_pt_dir: "/pts/test"
+  adapt_csv: "results/labels/test_2023.csv"
 
 model:
   fusion_mode: ours
