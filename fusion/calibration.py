@@ -25,7 +25,7 @@ class TemperatureScaling(nn.Module):
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
         return torch.softmax(logits / self.temperature, dim=-1)
 
-    def fit(self, model, val_loader, device, max_iter=50, lr=0.01, use_amp=False):
+    def fit(self, model, val_loader, device, max_iter=50, lr=0.01, use_amp=False, strict=True):
         model.eval()
         self.to(device)
         self.train()
@@ -36,8 +36,19 @@ class TemperatureScaling(nn.Module):
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Calibration data collection"):
                 if batch is None:
+                    if strict:
+                        raise RuntimeError("[calibration] got None batch")
                     failed_batches += 1
                     continue
+
+                if strict and int(batch.get("num_failed", 0) or 0) > 0:
+                    raise RuntimeError(
+                        "[calibration] failed samples found: "
+                        + "; ".join(
+                            f"sid={x.get('sid')} path={x.get('path')} reason={x.get('reason')}"
+                            for x in (batch.get("failed_items", []) or [])[:5]
+                        )
+                    )
                 try:
                     result = prepare_batch(batch, device,
                                         skip_graph=False,

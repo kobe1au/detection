@@ -333,6 +333,31 @@ def setup_logger(log_path):
         h.setFormatter(fmt); lg.addHandler(h)
     return lg
 
+def _format_failed_items(batch, max_items=5):
+    items = batch.get("failed_items", []) or []
+    preview = items[:max_items]
+    if not preview:
+        return ""
+
+    return "; ".join(
+        f"sid={x.get('sid')} path={x.get('path')} reason={x.get('reason')}"
+        for x in preview
+    )
+
+
+def _assert_no_failed_eval_batch(batch, phase: str):
+    num_failed = int(batch.get("num_failed", 0) or 0)
+    if num_failed > 0:
+        raise RuntimeError(
+            f"[{phase}] found {num_failed} failed sample(s) in evaluation batch. "
+            f"Examples: {_format_failed_items(batch)}"
+        )
+
+    if batch.get("labels") is None:
+        raise RuntimeError(
+            f"[{phase}] evaluation batch has no valid labels. "
+            f"Examples: {_format_failed_items(batch)}"
+        )
 
 def save_config_snapshot(cfg, path):
     with open(path, "w", encoding="utf-8") as f:
@@ -1219,7 +1244,9 @@ def eval_one_epoch(
     num_epochs=1,
     use_amp=False,
     logger=None,
-    dump_path: str | None = None
+    dump_path: str | None = None,
+    strict: bool = False,
+    phase: str = "eval",
 ):
     model.eval()
 
@@ -1277,8 +1304,13 @@ def eval_one_epoch(
 
     for batch in tqdm(loader, desc=f"Eval Epoch {epoch}", dynamic_ncols=True):
         if batch is None:
+            if strict:
+                raise RuntimeError(f"[{phase}] got None batch")
             skipped += 1
             continue
+
+        if strict:
+            _assert_no_failed_eval_batch(batch, phase)
 
         r = prepare_batch(
             batch,
@@ -1291,6 +1323,11 @@ def eval_one_epoch(
         )
 
         if r[2] is None:
+            if strict:
+                raise RuntimeError(
+                    f"[{phase}] prepare_batch produced invalid batch. "
+                    f"Examples: {_format_failed_items(batch)}"
+                )
             skipped += 1
             failed += r[-1]
             continue
@@ -2205,8 +2242,13 @@ def main():
             val_gate_disagreement,
             val_gate_entropy,
         ) = eval_one_epoch(
-            model, dl_val, criterion, device, epoch, num_epochs=epochs,
-            use_amp=use_amp, logger=logger)
+            model, dl_val, criterion, device, epoch,
+            num_epochs=epochs,
+            use_amp=use_amp,
+            logger=logger,
+            strict=True,
+            phase="val",
+        )
 
         # Temporal selection
         selection_score, latest_f1, worst_f1, aut_f1 = val_f1, val_f1, val_f1, val_f1
@@ -2300,7 +2342,7 @@ def main():
         cal_loader = val_year_loaders[ly]
         logger.info(f"Calibrating on latest year: {ly}")
     # train.py 中 calibrator.fit 调用，增加 use_amp 参数
-    calibrator.fit(model, cal_loader, device, max_iter=50, lr=0.01, use_amp=use_amp)
+    calibrator.fit(model, cal_loader, device, max_iter=50, lr=0.01, use_amp=use_amp,strict=True)
     torch.save(calibrator.state_dict(), os.path.join(ckpt_dir, f"calibrator_{exp_name}.pt"))
 
     # ── Test ──
@@ -2348,9 +2390,14 @@ def main():
         test_gate_disagreement,
         test_gate_entropy,
     ) = eval_one_epoch(
-        model, dl_test, criterion, device, epoch=0, num_epochs=1,
-        use_amp=use_amp, logger=logger,
+        model, dl_test, criterion, device,
+        epoch=0,
+        num_epochs=1,
+        use_amp=use_amp,
+        logger=logger,
         dump_path=test_dump_path,
+        strict=True,
+        phase="test",
     )
 
     logger.info(
