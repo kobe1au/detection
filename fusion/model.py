@@ -689,12 +689,12 @@ class MalwareModelWithXAttn(nn.Module):
 
         context = torch.cat([xattn_pooled, aligned_nodes, aligned_apis], dim=-1)
         delta = self.alignment_context_delta(context)
-        xattn_pooled = self.alignment_context_norm(
+        updated = xattn_pooled + self.alignment_context_scale * coverage * scale.clamp(0.0, 1.0) * delta
+        has_ctx = coverage > 0
+        xattn_pooled = torch.where(
+            has_ctx,
+            self.alignment_context_norm(updated),
             xattn_pooled
-            + self.alignment_context_scale
-            * coverage
-            * scale.clamp(0.0, 1.0)
-            * delta
         )
 
         return xattn_pooled, coverage.detach(), density.detach()
