@@ -21,16 +21,16 @@ BASELINES=(
 
 MAIN_CHAIN=(
   # = i1_adaptation/00_zero_adapt_concat.yaml
-  #"config/train_2026/main_chain/00_zero_adapt_concat.yaml"
+  "config/train_2026/main_chain/00_zero_adapt_concat.yaml"
 
   # = i1_adaptation/03_adapt_020_dynamic_replay.yaml
-  # "config/train_2026/main_chain/01_i1_adapt_020.yaml"
+  "config/train_2026/main_chain/01_i1_adapt_020.yaml"
 
   # = i2_alignment/04_full_class_aware_alignment.yaml
-  # "config/train_2026/main_chain/02_i1_i2_adapt_020.yaml"
+  "config/train_2026/main_chain/02_i1_i2_adapt_020.yaml"
 
   # = i3_fusion/04_quality_uncertainty_gate.yaml
-  # "config/train_2026/main_chain/03_i1_i2_i3_adapt_020.yaml"
+  "config/train_2026/main_chain/03_i1_i2_i3_adapt_020.yaml"
 )
 
 I1_ADAPTATION=(
@@ -45,6 +45,7 @@ I1_ADAPTATION=(
 )
 
 RATIO_SWEEP=(
+  "config/train_2026/ratio_sweep/00_full_adapt_000.yaml"
   "config/train_2026/ratio_sweep/00_full_adapt_005.yaml"
   "config/train_2026/ratio_sweep/01_full_adapt_010.yaml"
   "config/train_2026/ratio_sweep/02_full_adapt_020.yaml"
