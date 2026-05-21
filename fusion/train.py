@@ -1704,7 +1704,7 @@ def build_year_subset_loaders(dataset, batch_size, loader_kwargs):
 
 
 def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
-                              num_epochs, use_amp=False, logger=None, tag="val"):
+                              num_epochs, use_amp=False, logger=None, tag="val",strict=False):
     metrics = {}
     for y, dl in sorted(year_loaders.items()):
         (
@@ -1722,7 +1722,7 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
             gate_entropy,
         ) = eval_one_epoch(
             model, dl, criterion, device, epoch, num_epochs=num_epochs,
-            use_amp=use_amp, logger=None
+            use_amp=use_amp, logger=None, strict=strict,phase=f"{tag}:{y}"
         )
 
         metrics[int(y)] = {
@@ -2265,7 +2265,7 @@ def main():
         if val_year_loaders:
             ym = evaluate_temporal_windows(
                 model, val_year_loaders, criterion, device, epoch, epochs,
-                use_amp=use_amp, logger=logger, tag="val")
+                use_amp=use_amp, logger=logger, tag="val",strict=True)
             selection_score, latest_f1, worst_f1, aut_f1 = compute_temporal_selection_score(ym)
             logger.info(f"[Epoch {epoch:03d}] sel={selection_score:.4f} "
                         f"(AUT={aut_f1:.4f} latest={latest_f1:.4f} worst={worst_f1:.4f})")
@@ -2493,7 +2493,7 @@ def main():
     if test_year_loaders:
         yearly = evaluate_temporal_windows(
             model, test_year_loaders, criterion, device, epoch=0, num_epochs=1,
-            use_amp=use_amp, logger=logger, tag="test")
+            use_amp=use_amp, logger=logger, tag="test",strict=True)
         aut_suite = compute_aut_suite(yearly)
         logger.info("🕐 Temporal AUT: " + " | ".join(
             f"{k}={v:.4f}" for k, v in aut_suite.items()))
@@ -2596,7 +2596,7 @@ def main():
         if extra_year_loaders:
             extra_yearly = evaluate_temporal_windows(
                 model, extra_year_loaders, criterion, device, epoch=0, num_epochs=1,
-                use_amp=use_amp, logger=logger, tag=f"extra_{_safe_eval_name(extra_name)}")
+                use_amp=use_amp, logger=logger, tag=f"extra_{_safe_eval_name(extra_name)}",strict=True)
             extra_aut_suite = compute_aut_suite(extra_yearly)
             logger.info(f"Extra Temporal AUT[{extra_name}]: " + " | ".join(
                 f"{k}={v:.4f}" for k, v in extra_aut_suite.items()))
