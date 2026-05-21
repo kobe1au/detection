@@ -209,6 +209,14 @@ def validate_full_config(cfg):
         if k not in cfg:
             raise ValueError(f"missing config key: {k}")
     
+    if cfg["data"].get("adapt_csv"):
+        expected = int(cfg["train"].get("historical_epochs")) + int(cfg["train"].get("adaptation_epochs"))
+        if int(cfg["train"].get("epochs")) != expected:
+            raise ValueError(
+                f"epochs should equal historical_epochs + adaptation_epochs: "
+                f"{cfg['train']['epochs']} != {cfg['train']['historical_epochs']} + {cfg['train']['adaptation_epochs']}"
+            )
+
     replay_strategy = str(cfg["train"].get("replay_strategy", "static")).lower()
     if replay_strategy not in {"static", "dynamic_year_class"}:
         raise ValueError(
