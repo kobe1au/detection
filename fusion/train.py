@@ -2563,6 +2563,7 @@ def main():
             model, dl_extra, criterion, device, epoch=0, num_epochs=1,
             use_amp=use_amp, logger=logger,
             dump_path=extra_dump_path,
+            strict=True,phase=f"extra_test:{extra_name}",
         )
 
         logger.info(
@@ -2573,7 +2574,7 @@ def main():
         )
 
         extra_probs, extra_labels = collect_calibrated_outputs(
-            model, calibrator, dl_extra, device, use_amp, strict=True,phase="extra_calibrated",
+            model, calibrator, dl_extra, device, use_amp, strict=True,phase=f"extra_calibrated:{extra_name}",
         )
         extra_preds = extra_probs.argmax(axis=1)
         extra_conf = extra_probs.max(axis=1)
