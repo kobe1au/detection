@@ -104,7 +104,7 @@ model:
 | M0 | zero-adapt concat baseline | 只用 2018-2021 训练，2024 测试 |
 | M1 | I1 DBTA 20% + drift-matched replay | 验证漂移感知预算适应 |
 | M2 | M1 + hierarchical alignment, fixed gate | 验证类别感知跨模态判别对齐 |
-| M3 | M2 + quality/uncertainty/time gate | 验证质量感知和漂移感知融合 |
+| M3 | M2 + quality/q_time-q_drift/time-feature/uncertainty gate | 验证质量感知和漂移感知融合 |
 | M4 | full + random 100% + static replay | 压力测试 DBTA 20% 的效率叙事 |
 
 ratio sweep：

@@ -253,7 +253,15 @@ def validate_full_config(cfg):
     allowed_api = {"type", "num_hash_buckets", "type_vocab_size", "max_seq_len", "layers", "heads"}
     allowed_graph = {"type", "hidden", "heads", "layers", "use_behavior_hint", "drop_extracted_behavior_hints"}
     allowed_alignment = {"enabled", "adaptive_bias", "penalty_scale", "bonus_scale", "context_scale"}
-    allowed_gate = {"mode", "quality_inputs", "uncertainty_inputs", "detach", "time_inputs", "time_feature_set"}
+    allowed_gate = {
+        "mode",
+        "quality_inputs",
+        "temporal_reliability_inputs",
+        "uncertainty_inputs",
+        "detach",
+        "time_inputs",
+        "time_feature_set",
+    }
     allowed_train = {
         "exp_name", "seed", "device", "use_amp", "epochs", "batch_size",
         "eval_batch_size", "grad_accum_steps", "num_workers", "pin_memory",
@@ -2734,6 +2742,12 @@ def main():
         use_alignment_bias=bool(c_alignment["enabled"]),
         use_adaptive_alignment_bias=bool(c_alignment["adaptive_bias"]),
         use_quality_gate_inputs=bool(c_gate["quality_inputs"]),
+        use_gate_temporal_reliability_inputs=bool(
+            c_gate.get(
+                "temporal_reliability_inputs",
+                use_temporal_reliability or use_drift_reliability,
+            )
+        ),
         use_uncertainty_gate=bool(c_gate["uncertainty_inputs"]),
         use_time_gate_inputs=bool(c_gate.get("time_inputs", False)),
         time_feature_set=str(c_gate.get("time_feature_set", "basic")),

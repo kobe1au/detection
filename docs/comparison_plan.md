@@ -12,7 +12,7 @@
 | `i1` | 8 | 在 concat 上隔离 DBTA selection、replay、adaptation budget |
 | `replay` | 4 | 固定 full model + DBTA 20%，比较 no/static/dynamic/drift-matched replay |
 | `i2` | 5 | 固定 I1，固定 gate，拆解 semantic、class-aware、method-bias、local alignment |
-| `i3` | 6 | 固定 I1+I2，拆解 fixed/learned gate、quality、uncertainty、time-drift 输入 |
+| `i3` | 7 | 固定 I1+I2，拆解 fixed/learned gate、quality、q_time/q_drift、time features、uncertainty 输入 |
 | `ratio` / `full` | 5 | full model 的 0%、5%、10%、20%、100% recent adaptation budget |
 | `main` | 5 | 最短论文主线：concat ERM -> I1 -> I1+I2 -> full -> random100 static stress test |
 
@@ -23,7 +23,7 @@
 | M0 | `config/experiments/main_chain/M0_concat_erm.yaml` | historical concat ERM |
 | M1 | `config/experiments/main_chain/M1_i1_dbta_concat020.yaml` | concat + DBTA 20% + drift-matched replay |
 | M2 | `config/experiments/main_chain/M2_i1_i2_alignment_fixed_gate020.yaml` | M1 + hierarchical alignment，gate 固定 |
-| M3 | `config/experiments/main_chain/M3_full_dbta020.yaml` | M2 + learned quality/uncertainty/time gate |
+| M3 | `config/experiments/main_chain/M3_full_dbta020.yaml` | M2 + learned quality/q_time-q_drift/time-feature/uncertainty gate |
 | M4 | `config/experiments/main_chain/M4_full_random100_static.yaml` | full model + random 100% + static replay，用来压力测试 DBTA 20% 的效率叙事 |
 
 ## 运行

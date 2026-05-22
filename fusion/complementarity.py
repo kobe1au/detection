@@ -171,6 +171,12 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device, data_root: s
         use_alignment_bias=bool(c_alignment["enabled"]),
         use_adaptive_alignment_bias=bool(c_alignment["adaptive_bias"]),
         use_quality_gate_inputs=bool(c_gate["quality_inputs"]),
+        use_gate_temporal_reliability_inputs=bool(
+            c_gate.get(
+                "temporal_reliability_inputs",
+                use_temporal_reliability or use_drift_reliability,
+            )
+        ),
         use_uncertainty_gate=bool(c_gate["uncertainty_inputs"]),
         use_time_gate_inputs=bool(c_gate.get("time_inputs", False)),
         time_feature_set=str(c_gate.get("time_feature_set", "basic")),

@@ -343,6 +343,7 @@ class MalwareModelWithXAttn(nn.Module):
         use_uncertainty_gate: bool = True,
         use_quality_gate_inputs: bool = True,
         use_time_gate_inputs: bool = False,
+        use_gate_temporal_reliability_inputs: bool | None = None,
         time_feature_set: str = "basic",
         use_temporal_reliability: bool = False,
         use_drift_reliability: bool = False,
@@ -408,6 +409,11 @@ class MalwareModelWithXAttn(nn.Module):
         self.use_uncertainty_gate = bool(use_uncertainty_gate)
         self.use_quality_gate_inputs = bool(use_quality_gate_inputs)
         self.use_time_gate_inputs = bool(use_time_gate_inputs)
+        self.use_gate_temporal_reliability_inputs = (
+            bool(use_temporal_reliability or use_drift_reliability)
+            if use_gate_temporal_reliability_inputs is None
+            else bool(use_gate_temporal_reliability_inputs)
+        )
         self.time_feature_set = str(time_feature_set or "basic").lower()
         self.use_temporal_reliability = bool(use_temporal_reliability)
         self.use_drift_reliability = bool(use_drift_reliability)
@@ -500,12 +506,11 @@ class MalwareModelWithXAttn(nn.Module):
 
         if self._need_gates:
             # Gate input dimensions must exactly match forward() concatenation.
-            # Composition: 5 (explicit_qs) + [temporal] + [drift] + [time_features] + 4 (uncertainty/alive)
+            # Composition: 5 explicit quality features + optional
+            # q_time/q_drift + optional time features + 4 uncertainty/alive.
             gate_q_dim = 5
-            if self.use_temporal_reliability:
-                gate_q_dim += 1
-            if self.use_drift_reliability:
-                gate_q_dim += 1
+            if self.use_gate_temporal_reliability_inputs:
+                gate_q_dim += 2
             if self.use_time_gate_inputs:
                 gate_q_dim += 4
             gate_q_dim += 4  # disagreement, entropy, api_alive, graph_alive
@@ -953,21 +958,21 @@ class MalwareModelWithXAttn(nn.Module):
             masks = truncated_masks
 
         raw_qs = self._explicit_qs_to_tensor(explicit_qs, B, device, dtype)
-        gate_qs = raw_qs.clone()
 
         q_time, q_drift = self._build_temporal_reliability(time_ids, B, device, dtype)
         time_gate_features = self._build_time_gate_features(time_ids, B, device, dtype)
 
-        if self.use_temporal_reliability:
-            gate_qs = torch.cat([gate_qs, q_time], dim=-1)
-        if self.use_drift_reliability:
-            gate_qs = torch.cat([gate_qs, q_drift], dim=-1)
-
+        gate_quality_qs = raw_qs.clone()
         if not self.use_quality_gate_inputs:
-            neutral_qs = torch.ones_like(gate_qs)
+            neutral_qs = torch.ones_like(gate_quality_qs)
             if neutral_qs.size(1) > 3:
                 neutral_qs[:, 3:] = 0.0
-            gate_qs = neutral_qs
+            gate_quality_qs = neutral_qs
+
+        gate_q_parts = [gate_quality_qs]
+        if self.use_gate_temporal_reliability_inputs:
+            gate_q_parts.extend([q_time, q_drift])
+        gate_qs = torch.cat(gate_q_parts, dim=-1)
 
         feat_drop = ArchitectureConstants.FEATURE_DROPOUT
         if self.training and feat_drop > 0.0:

@@ -43,7 +43,11 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertEqual(tuple(extra["gate_weights"].shape), (2, 3))
 
     def test_ours_forward_with_temporal_reliability(self):
-        model = make_model("ours", use_temporal_reliability=True)
+        model = make_model(
+            "ours",
+            use_temporal_reliability=True,
+            use_gate_temporal_reliability_inputs=True,
+        )
         model.eval()
         logits, extra = model(
             graph_data=make_graph_batch(),
@@ -61,6 +65,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
         model = make_model(
             "ours",
             use_time_gate_inputs=True,
+            use_gate_temporal_reliability_inputs=True,
             use_temporal_reliability=True,
             use_drift_reliability=True,
             num_time_domains=4,
@@ -82,6 +87,56 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertEqual(tuple(extra["q_drift"].shape), (2,))
         self.assertEqual(tuple(extra["time_gate_features"].shape), (2, 4))
         self.assertEqual(tuple(extra["gate_weights"].shape), (2, 3))
+
+    def test_gate_temporal_reliability_inputs_are_independent_of_quality_inputs(self):
+        model = make_model(
+            "ours",
+            use_quality_gate_inputs=False,
+            use_uncertainty_gate=False,
+            use_time_gate_inputs=False,
+            use_gate_temporal_reliability_inputs=True,
+            use_temporal_reliability=True,
+            use_drift_reliability=True,
+            num_time_domains=4,
+            historical_time_id_max=1,
+        )
+        model.eval()
+        self.assertEqual(model.gate_net.q_dim, 11)
+        logits, extra = model(
+            graph_data=make_graph_batch(),
+            explicit_qs=make_explicit_qs(),
+            time_ids=torch.tensor([0, 2], dtype=torch.long),
+            masks=make_masks(),
+        )
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertIn("q_time", extra)
+        self.assertIn("q_drift", extra)
+
+    def test_quality_only_gate_excludes_temporal_reliability_inputs(self):
+        model = make_model(
+            "ours",
+            use_quality_gate_inputs=True,
+            use_uncertainty_gate=False,
+            use_time_gate_inputs=False,
+            use_gate_temporal_reliability_inputs=False,
+            use_temporal_reliability=True,
+            use_drift_reliability=True,
+            num_time_domains=4,
+            historical_time_id_max=1,
+        )
+        model.eval()
+        self.assertEqual(model.gate_net.q_dim, 9)
+        logits, extra = model(
+            graph_data=make_graph_batch(),
+            explicit_qs=make_explicit_qs(),
+            time_ids=torch.tensor([0, 2], dtype=torch.long),
+            masks=make_masks(),
+        )
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertIn("q_time", extra)
+        self.assertIn("q_drift", extra)
 
     def test_temporal_features_are_batch_invariant(self):
         model = make_model(

@@ -2,9 +2,9 @@
 data:
   out_dir: "experiments/i3_gate"
 train:
-  exp_name: "I3_02_quality_only"
+  exp_name: "I3_03_temporal_reliability_only"
 model:
   gate:
-    temporal_reliability_inputs: false
+    quality_inputs: false
     uncertainty_inputs: false
     time_inputs: false

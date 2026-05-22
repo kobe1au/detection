@@ -51,6 +51,7 @@ model:
   gate:
     mode: learned
     quality_inputs: true
+    temporal_reliability_inputs: true
     uncertainty_inputs: true
     time_inputs: true
     time_feature_set: basic
