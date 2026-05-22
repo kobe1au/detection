@@ -15,7 +15,6 @@ from typing import Any, Dict
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.graphgym import cfg
 import yaml
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, recall_score, roc_auc_score
@@ -165,11 +164,6 @@ def preflight_validate_protocol(
                 f"test years should be newer than train years: "
                 f"train={train_years}, test={test_years}"
             )
-    phase = str(cfg["loss"].get("gate_oracle_start_phase", "") or "").lower()
-    if phase and phase not in {"historical", "adaptation"}:
-        raise ValueError(
-            f"gate_oracle_start_phase must be historical/adaptation/empty, got {phase}"
-        )
 
     if min(val_years) < min(train_years):
         raise ValueError(
@@ -198,13 +192,6 @@ def build_global_domain_years(*csv_paths: str) -> list[int]:
 
 
 def validate_full_config(cfg):
-    """Validate the cleaned 2026 config schema.
-
-    This project now assumes fresh training from the new chronological split.
-    Legacy knobs such as resume, warm-start checkpoints, graph pretraining,
-    TTA/conformal switches, and robustness-suite switches are intentionally
-    rejected so old YAMLs fail loudly instead of silently changing behavior.
-    """
     for k in ("data", "model", "train", "loss"):
         if k not in cfg:
             raise ValueError(f"missing config key: {k}")
@@ -227,6 +214,11 @@ def validate_full_config(cfg):
     if adaptation_selection not in {"random", "drift_aware", "dbta"}:
         raise ValueError(
             "train.adaptation_selection must be one of: random, drift_aware, dbta"
+        )
+    if replay_strategy == "drift_matched" and adaptation_selection == "random":
+        raise ValueError(
+            "train.replay_strategy=drift_matched requires "
+            "train.adaptation_selection=drift_aware or dbta"
         )
     dbta_balance = str(cfg["train"].get("dbta_balance", "predicted_label")).lower()
     if dbta_balance not in {"predicted_label", "none"}:
@@ -254,7 +246,7 @@ def validate_full_config(cfg):
         "eval_batch_size", "grad_accum_steps", "num_workers", "pin_memory",
         "persistent_workers", "prefetch_factor", "lr", "weight_decay",
         "warmup_epochs", "eta_min", "label_smoothing", "patience",
-        "min_delta", "warmup_stage_epochs",
+        "min_delta", "warmup_stage_epochs","warm_start_historical_ckpt",
         "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
         "replay_strategy", "adaptation_selection", "dbta_balance",
         "dbta_uncertainty_weight", "dbta_disagreement_weight",
@@ -266,12 +258,6 @@ def validate_full_config(cfg):
         "stage1_branch_aux_weight",
         "class_aware_alignment_same_class_weight",
         "class_aware_alignment_temperature",
-        "gate_oracle_weight",
-        "gate_oracle_temperature",
-        "gate_oracle_smoothing",
-        "gate_oracle_start_epoch",
-        "gate_oracle_start_phase",
-        "gate_oracle_adaptation_only",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -314,7 +300,7 @@ def validate_full_config(cfg):
         cfg["train"],
         allowed_train,
         optional={
-            "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
+            "historical_epochs", "adaptation_epochs","warm_start_historical_ckpt", "adaptation_ratio", "replay_ratio",
             "replay_strategy", "adaptation_selection", "dbta_balance",
             "dbta_uncertainty_weight", "dbta_disagreement_weight",
             "dbta_prototype_weight", "dbta_drift_replay_fraction",
@@ -327,12 +313,6 @@ def validate_full_config(cfg):
         optional={
             "class_aware_alignment_same_class_weight",
             "class_aware_alignment_temperature",
-            "gate_oracle_weight",
-            "gate_oracle_temperature",
-            "gate_oracle_smoothing",
-            "gate_oracle_start_epoch",
-            "gate_oracle_start_phase",
-            "gate_oracle_adaptation_only",
         },
     )
 
@@ -427,7 +407,7 @@ def save_run_metadata(path, cfg, model):
 _CSV_HEADER = [
     "epoch", "stage", "continual_phase",
     "train_loss", "train_f1", "train_acc",
-    "train_cls", "train_alignment", "train_branch_aux", "train_gate_oracle",
+    "train_cls", "train_alignment", "train_branch_aux", 
     "train_uncertainty", "train_gate_disagreement", "train_gate_entropy",
     "train_gate_api", "train_gate_graph", "train_gate_joint",
     "val_loss", "val_cls_loss", "val_f1", "val_acc",
@@ -1462,14 +1442,6 @@ def train_one_epoch(
     sum_cls = 0.0
     sum_align = 0.0
     sum_branch_aux = 0.0
-    sum_gate_oracle = 0.0
-
-    sum_oracle_api = 0.0
-    sum_oracle_graph = 0.0
-    sum_oracle_joint = 0.0
-    num_oracle = 0
-    sum_oracle_entropy = 0.0
-    num_oracle_entropy = 0
 
     sum_uncertainty = 0.0
     num_uncertainty = 0
@@ -1598,27 +1570,10 @@ def train_one_epoch(
             if ok_branch_aux:
                 sum_branch_aux += branch_aux * bs
 
-            gate_oracle, ok_gate_oracle = _extract_loss_component(extra, "gate_oracle")
-            if ok_gate_oracle:
-                sum_gate_oracle += gate_oracle * bs
-
             uncertainty, ok_uncertainty = _extract_extra_mean(extra, "uncertainty_score")
             if ok_uncertainty:
                 sum_uncertainty += uncertainty * bs
                 num_uncertainty += bs
-            
-            oracle_mean = extra.get("gate_oracle_target_mean")
-            if isinstance(oracle_mean, torch.Tensor) and oracle_mean.numel() == 3:
-                om = oracle_mean.detach().float().cpu()
-                sum_oracle_api += float(om[0])
-                sum_oracle_graph += float(om[1])
-                sum_oracle_joint += float(om[2])
-                num_oracle += 1
-
-            oracle_entropy = extra.get("gate_oracle_entropy")
-            if isinstance(oracle_entropy, torch.Tensor) and oracle_entropy.numel() > 0:
-                sum_oracle_entropy += float(oracle_entropy.detach().float().mean()) * bs
-                num_oracle_entropy += bs
 
             gate_disagreement, ok_gate_disagreement = _extract_extra_mean(extra, "gate_disagreement")
             if ok_gate_disagreement:
@@ -1663,7 +1618,6 @@ def train_one_epoch(
                 cls=f"{float(l_cls.item()):.4f}",
                 align=f"{float(l_align.item()):.4f}",
                 aux=f"{branch_aux:.4f}",
-                gorl=f"{gate_oracle:.4f}",
                 unc=f"{uncertainty:.4f}",
                 accum=f"{accum_steps}/{grad_accum_steps}",
             )
@@ -1708,7 +1662,6 @@ def train_one_epoch(
             0.0,  # cls
             0.0,  # align
             0.0,  # branch aux
-            0.0,  # gate oracle
             0.0,  # uncertainty
             0.0,  # gate disagreement
             0.0,  # gate entropy
@@ -1736,10 +1689,6 @@ def train_one_epoch(
             f"valid={total_valid} failed={failed} skipped={skipped} "
             f"optim_steps={optimizer_steps} grad_accum={grad_accum_steps} "
             f"avg_w=({avg_gate_api:.3f},{avg_gate_graph:.3f},{avg_gate_joint:.3f}) "
-            f"oracle=({sum_oracle_api / max(num_oracle, 1):.3f},"
-            f"{sum_oracle_graph / max(num_oracle, 1):.3f},"
-            f"{sum_oracle_joint / max(num_oracle, 1):.3f}) "
-            f"oracle_ent={sum_oracle_entropy / max(num_oracle_entropy, 1):.3f} "
             f"std_w=({sum_wi_std / max(num_w_std, 1):.3f},"
             f"{sum_wg_std / max(num_w_std, 1):.3f},"
             f"{sum_wj_std / max(num_w_std, 1):.3f}) "
@@ -1757,7 +1706,6 @@ def train_one_epoch(
         sum_cls / n,
         sum_align / n,
         sum_branch_aux / n,
-        sum_gate_oracle / n,
         avg_uncertainty,
         avg_gate_disagreement,
         avg_gate_entropy,
@@ -2643,7 +2591,7 @@ def main():
         f"path={metadata_path}"
     )
 
-    start_epoch, best_score, no_improve = 1, float("-inf"), 0
+    # start_epoch, best_score, no_improve = 1, float("-inf"), 0
 
     # ── Optimizer / Scheduler ──
     base_lr = float(c_train["lr"])
@@ -2690,13 +2638,58 @@ def main():
     # ═══════════════════════════════════════════════════════════════════
     # Training loop
     # ═══════════════════════════════════════════════════════════════════
+    # last_stage = None
+    # last_continual_phase = None
+    # historical_epochs = min(max(int(c_train.get("historical_epochs", epochs)), 0), epochs)
+    # historical_best_p = os.path.join(ckpt_dir, f"best_historical_{exp_name}.pt")
+    # adapted_best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
+
     last_stage = None
-    last_continual_phase = None
     historical_epochs = min(max(int(c_train.get("historical_epochs", epochs)), 0), epochs)
+
     historical_best_p = os.path.join(ckpt_dir, f"best_historical_{exp_name}.pt")
     adapted_best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
+
+    warm_start_raw = str(c_train.get("warm_start_historical_ckpt", "") or "").strip()
+    warm_start_path = resolve_path(data_root, warm_start_raw) if warm_start_raw else ""
+
+    use_warm_start = (
+        bool(warm_start_path)
+        and os.path.exists(warm_start_path)
+        and ds_adapt is not None
+        and historical_epochs < epochs
+    )
+
+    if warm_start_raw and not os.path.exists(warm_start_path):
+        logger.warning(
+            "warm_start_historical_ckpt is set but not found; "
+            f"falling back to normal historical training: {warm_start_path}"
+        )
+
+    if warm_start_raw and os.path.exists(warm_start_path) and ds_adapt is None:
+        logger.warning(
+            "warm_start_historical_ckpt exists but no adapt_csv is configured; "
+            "falling back to normal training."
+        )
+
+    if use_warm_start:
+        start_epoch = historical_epochs + 1
+        last_continual_phase = "historical"
+        adaptation_source_ckpt = warm_start_path
+        logger.info(
+            "Warm-start checkpoint found; skipping historical training and "
+            f"starting adaptation from epoch {start_epoch}: {warm_start_path}"
+        )
+    else:
+        start_epoch = 1
+        last_continual_phase = None
+        adaptation_source_ckpt = historical_best_p
+
+    best_score = float("-inf")
+    no_improve = 0
+
     for epoch in range(start_epoch, epochs + 1):
-        stage_name = "warmup" if epoch <= warmup_stage_epochs else "main"
+        stage_name = "main" if use_warm_start else ("warmup" if epoch <= warmup_stage_epochs else "main")
         continual_phase = "adaptation" if (ds_adapt is not None and epoch > historical_epochs) else "historical"
         if stage_name != last_stage:
             if hasattr(model, "set_training_stage"):
@@ -2715,16 +2708,21 @@ def main():
             last_stage = stage_name
         if continual_phase != last_continual_phase:
             if last_continual_phase == "historical" and continual_phase == "adaptation":
-                if os.path.exists(historical_best_p):
-                    state = torch.load(historical_best_p, map_location=device, weights_only=False)
-                    model.load_state_dict(state["state_dict"])
+                if os.path.exists(adaptation_source_ckpt):
+                    state = torch.load(adaptation_source_ckpt, map_location=device, weights_only=False)
+                    state_dict = state.get("state_dict", state)
+                    model.load_state_dict(state_dict)
+
                     logger.info(
-                        "Loaded historical best checkpoint before adaptation: "
-                        f"{historical_best_p}"
+                        "Loaded historical checkpoint before adaptation: "
+                        f"{adaptation_source_ckpt} "
+                        f"epoch={state.get('epoch', 'unknown') if isinstance(state, dict) else 'unknown'} "
+                        f"exp_name={state.get('exp_name', 'unknown') if isinstance(state, dict) else 'unknown'} "
+                        f"best_score={state.get('best_score', 'unknown') if isinstance(state, dict) else 'unknown'}"
                     )
                 else:
                     logger.warning(
-                        "Historical best checkpoint was not found; adaptation continues "
+                        "Historical checkpoint was not found; adaptation continues "
                         "from the last historical epoch."
                     )
                 remaining_epochs = epochs - epoch + 1
@@ -2777,7 +2775,6 @@ def main():
             tr_cls,
             tr_align,
             tr_branch_aux,
-            tr_gate_oracle,
             tr_uncertainty,
             tr_gate_disagreement,
             tr_gate_entropy,
@@ -2845,7 +2842,6 @@ def main():
             train_cls=tr_cls,
             train_alignment=tr_align,
             train_branch_aux=tr_branch_aux,
-            train_gate_oracle=tr_gate_oracle,
             train_uncertainty=tr_uncertainty,
             train_gate_disagreement=tr_gate_disagreement,
             train_gate_entropy=tr_gate_entropy,
