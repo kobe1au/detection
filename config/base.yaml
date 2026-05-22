@@ -78,8 +78,6 @@ train:
   adaptation_ratio: 1.0
   replay_ratio: 0.25
   replay_strategy: static
-  warm_start_historical_ckpt: null
-  start_phase: historical
   eta_min: 0.000001
   label_smoothing: 0.05
   patience: 10
