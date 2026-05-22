@@ -48,7 +48,14 @@ def make_explicit_qs(batch_size: int = 2):
     return tuple(values)
 
 
-def make_model(fusion_mode: str):
+def make_model(
+    fusion_mode: str,
+    *,
+    gate_mode: str = "learned",
+    use_time_gate_inputs: bool = False,
+    use_temporal_reliability: bool = False,
+    use_drift_reliability: bool = False,
+):
     return MalwareModelWithXAttn(
         num_classes=2,
         api_emb_dim=16,
@@ -67,7 +74,10 @@ def make_model(fusion_mode: str):
         api_heads=2,
         api_layers=1,
         xattn_heads=2,
-        gate_mode="learned",
+        gate_mode=gate_mode,
+        use_time_gate_inputs=use_time_gate_inputs,
+        use_temporal_reliability=use_temporal_reliability,
+        use_drift_reliability=use_drift_reliability,
     )
 
 

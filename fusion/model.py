@@ -487,7 +487,16 @@ class MalwareModelWithXAttn(nn.Module):
             self.cross_attn = None
 
         if self._need_gates:
-            gate_q_dim = 9 + (4 if self.use_time_gate_inputs else 0)
+            # Gate input dimensions must exactly match forward() concatenation.
+            # Composition: 5 (explicit_qs) + [temporal] + [drift] + [time_features] + 4 (uncertainty/alive)
+            gate_q_dim = 5
+            if self.use_temporal_reliability:
+                gate_q_dim += 1
+            if self.use_drift_reliability:
+                gate_q_dim += 1
+            if self.use_time_gate_inputs:
+                gate_q_dim += 4
+            gate_q_dim += 4  # disagreement, entropy, api_alive, graph_alive
             self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=gate_q_dim)
         else:
             self.gate_net = None

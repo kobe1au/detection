@@ -119,6 +119,9 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
     c_alignment = c_model["alignment"]
     c_gate = c_model["gate"]
     fusion_mode = str(c_model["fusion_mode"])
+    legacy_temporal = bool(cfg["loss"].get("alignment_use_temporal_soft_weight", False))
+    use_temporal_reliability = bool(cfg["loss"].get("alignment_use_temporal_reliability", legacy_temporal))
+    use_drift_reliability = bool(cfg["loss"].get("alignment_use_drift_reliability", legacy_temporal))
     model = MalwareModelWithXAttn(
         num_classes=int(c_model["num_classes"]),
         api_emb_dim=TrainingConstants.API_EMB_DIM,
@@ -149,8 +152,8 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
         use_uncertainty_gate=bool(c_gate["uncertainty_inputs"]),
         use_time_gate_inputs=bool(c_gate.get("time_inputs", False)),
         time_feature_set=str(c_gate.get("time_feature_set", "basic")),
-        use_temporal_reliability=bool(cfg["loss"].get("alignment_use_temporal_soft_weight", False)),
-        use_drift_reliability=bool(cfg["loss"].get("alignment_use_temporal_soft_weight", False)),
+        use_temporal_reliability=use_temporal_reliability,
+        use_drift_reliability=use_drift_reliability,
         gate_mode=str(c_gate.get("mode", "learned")),
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,

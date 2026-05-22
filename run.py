@@ -11,20 +11,14 @@ PYTHON_BIN = os.getenv("PYTHON_BIN", "python")
 BASE_CONFIG = os.getenv("BASE_CONFIG", "./config/base.yaml")
 
 
-# Main 2026 experiment chain at the paper default 20% adaptation setting.
+# Main 2026 experiment chain mapped to actual config/exp_*.yaml files.
 EXPERIMENTS = [
-    "./config/train_2026/baselines/00_api_only.yaml",
-    "./config/train_2026/baselines/01_graph_only.yaml",
-    "./config/train_2026/baselines/02_concat_erm.yaml",
-    "./config/train_2026/baselines/03_cross_attention.yaml",
-    "./config/train_2026/main_chain/00_zero_adapt_concat.yaml",
-    "./config/train_2026/main_chain/01_i1_adapt_020.yaml",
-    "./config/train_2026/main_chain/02_i1_i2_adapt_020.yaml",
-    "./config/train_2026/main_chain/03_i1_i2_i3_adapt_020.yaml",
-    "./config/train_2026/replay_ablation/00_no_replay_adapt_020.yaml",
-    "./config/train_2026/replay_ablation/01_static_replay_adapt_020.yaml",
-    "./config/train_2026/replay_ablation/02_dynamic_year_class_replay_adapt_020.yaml",
-    "./config/train_2026/replay_ablation/03_drift_matched_replay_adapt_020.yaml",
+    "./config/exp_erm_concat_baseline.yaml",
+    "./config/exp_ours_align_gate.yaml",
+    "./config/exp_ours_time_gate.yaml",
+    "./config/exp_ours_time_reliability.yaml",
+    "./config/exp_ours_hierarchical_alignment.yaml",
+    "./config/exp_ours_continual_2023adapt.yaml",
 ]
 
 

@@ -93,7 +93,8 @@ loss:
   class_aware_alignment_same_class_weight: 0.20
   class_aware_alignment_temperature: 0.2
   local_alignment_weight: 0.0
-  alignment_use_temporal_soft_weight: true
+  alignment_use_temporal_reliability: true
+  alignment_use_drift_reliability: true
 
   stage1_branch_aux_weight: 0.05
   branch_aux_weight: 0.10

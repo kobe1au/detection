@@ -262,6 +262,8 @@ def validate_full_config(cfg):
         "class_aware_alignment_temperature",
         "local_alignment_weight",
         "alignment_use_temporal_soft_weight",
+        "alignment_use_temporal_reliability",
+        "alignment_use_drift_reliability",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -1785,6 +1787,8 @@ def eval_one_epoch(
     all_gate_qalign = []
     all_gate_qtime = []
     all_gate_qdrift = []
+    all_gate_qapi = []
+    all_gate_qgraph = []
 
     all_qalign = []
     all_qtime = []
@@ -2522,6 +2526,9 @@ def main():
     c_graph = c_model["graph_encoder"]
     c_alignment = c_model["alignment"]
     c_gate = c_model["gate"]
+    legacy_temporal = bool(c_loss.get("alignment_use_temporal_soft_weight", False))
+    use_temporal_reliability = bool(c_loss.get("alignment_use_temporal_reliability", legacy_temporal))
+    use_drift_reliability = bool(c_loss.get("alignment_use_drift_reliability", legacy_temporal))
 
     need_alignment_mask = _fm == "ours" and bool(c_alignment["enabled"])
 
@@ -2711,8 +2718,8 @@ def main():
         use_uncertainty_gate=bool(c_gate["uncertainty_inputs"]),
         use_time_gate_inputs=bool(c_gate.get("time_inputs", False)),
         time_feature_set=str(c_gate.get("time_feature_set", "basic")),
-        use_temporal_reliability=bool(c_loss.get("alignment_use_temporal_soft_weight", False)),
-        use_drift_reliability=bool(c_loss.get("alignment_use_temporal_soft_weight", False)),
+        use_temporal_reliability=use_temporal_reliability,
+        use_drift_reliability=use_drift_reliability,
         gate_mode=str(c_gate["mode"]),
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,
