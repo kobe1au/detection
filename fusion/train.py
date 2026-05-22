@@ -210,14 +210,14 @@ def validate_full_config(cfg):
             "static, dynamic_year_class, drift_matched"
         )
     adaptation_selection = str(cfg["train"].get("adaptation_selection", "random")).lower()
-    if adaptation_selection not in {"random", "drift_aware", "dbta"}:
+    if adaptation_selection not in {"random", "dbta"}:
         raise ValueError(
-            "train.adaptation_selection must be one of: random, drift_aware, dbta"
+            "train.adaptation_selection must be one of: random, dbta"
         )
     if replay_strategy == "drift_matched" and adaptation_selection == "random":
         raise ValueError(
             "train.replay_strategy=drift_matched requires "
-            "train.adaptation_selection=drift_aware or dbta"
+            "train.adaptation_selection= dbta"
         )
     dbta_balance = str(cfg["train"].get("dbta_balance", "predicted_label")).lower()
     if dbta_balance not in {"predicted_label", "none"}:
@@ -1303,9 +1303,9 @@ def build_adaptation_loader(
     selection_dump_path: str | None = None,
 ):
     selection_strategy = str(cfg["train"].get("adaptation_selection", "random")).lower()
-    if selection_strategy not in {"random", "drift_aware", "dbta"}:
+    if selection_strategy not in {"random", "dbta"}:
         raise ValueError(
-            "train.adaptation_selection must be one of: random, drift_aware, dbta"
+            "train.adaptation_selection must be one of: random, dbta"
         )
 
     if selection_strategy == "random":
@@ -1538,12 +1538,7 @@ def train_one_epoch(
                     total_epochs=num_epochs,
                 )
 
-                # Compatible with both:
-                #   old: return total, cls, temporal_zero, align
-                #   new: return total, cls, align
-                if len(loss_out) == 4:
-                    loss, l_cls, _, l_align = loss_out
-                elif len(loss_out) == 3:
+                if len(loss_out) == 3:
                     loss, l_cls, l_align = loss_out
                 else:
                     raise RuntimeError(
