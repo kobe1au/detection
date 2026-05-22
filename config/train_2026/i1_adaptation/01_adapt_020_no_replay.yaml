@@ -13,4 +13,4 @@ train:
   adaptation_ratio: 0.20
   replay_ratio: 0.0
   replay_strategy: static
-
+  adaptation_selection: dbta

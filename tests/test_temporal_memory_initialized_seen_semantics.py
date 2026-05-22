@@ -2,10 +2,14 @@ import unittest
 
 import torch
 
-from fusion.prototypes import TemporalPrototypeMemory
+try:
+    from fusion.prototypes import TemporalPrototypeMemory
+except ModuleNotFoundError:
+    TemporalPrototypeMemory = None
 
 
 class TemporalMemoryInitializedSeenTest(unittest.TestCase):
+    @unittest.skipIf(TemporalPrototypeMemory is None, "legacy temporal prototype module is not in the current DBTA mainline")
     def test_inherited_prototype_is_initialized_but_not_seen_until_observed(self):
         memory = TemporalPrototypeMemory(
             num_domains=3,
@@ -41,6 +45,7 @@ class TemporalMemoryInitializedSeenTest(unittest.TestCase):
         self.assertTrue(bool(inherited_only.any().item()))
         self.assertTrue(bool(memory.initialized[1, 0][inherited_only].all().item()))
 
+    @unittest.skipIf(TemporalPrototypeMemory is None, "legacy temporal prototype module is not in the current DBTA mainline")
     def test_first_observation_overwrites_inherited_prior_before_ema(self):
         memory = TemporalPrototypeMemory(
             num_domains=2,

@@ -218,11 +218,19 @@ def validate_full_config(cfg):
             )
 
     replay_strategy = str(cfg["train"].get("replay_strategy", "static")).lower()
-    if replay_strategy not in {"static", "dynamic_year_class"}:
+    if replay_strategy not in {"static", "dynamic_year_class", "drift_matched"}:
         raise ValueError(
             "train.replay_strategy must be one of: "
-            "static, dynamic_year_class"
+            "static, dynamic_year_class, drift_matched"
         )
+    adaptation_selection = str(cfg["train"].get("adaptation_selection", "random")).lower()
+    if adaptation_selection not in {"random", "drift_aware", "dbta"}:
+        raise ValueError(
+            "train.adaptation_selection must be one of: random, drift_aware, dbta"
+        )
+    dbta_balance = str(cfg["train"].get("dbta_balance", "predicted_label")).lower()
+    if dbta_balance not in {"predicted_label", "none"}:
+        raise ValueError("train.dbta_balance must be predicted_label or none")
 
     allowed_top = {"data", "model", "train", "loss"}
     allowed_data = {
@@ -248,7 +256,9 @@ def validate_full_config(cfg):
         "warmup_epochs", "eta_min", "label_smoothing", "patience",
         "min_delta", "warmup_stage_epochs",
         "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
-        "replay_strategy",
+        "replay_strategy", "adaptation_selection", "dbta_balance",
+        "dbta_uncertainty_weight", "dbta_disagreement_weight",
+        "dbta_prototype_weight", "dbta_drift_replay_fraction",
     }
     allowed_loss = {
         "semantic_alignment_weight",
@@ -303,7 +313,12 @@ def validate_full_config(cfg):
         "train",
         cfg["train"],
         allowed_train,
-        optional={"historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio","replay_strategy"},
+        optional={
+            "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
+            "replay_strategy", "adaptation_selection", "dbta_balance",
+            "dbta_uncertainty_weight", "dbta_disagreement_weight",
+            "dbta_prototype_weight", "dbta_drift_replay_fraction",
+        },
     )
     _require_keys(
         "loss",
@@ -630,6 +645,46 @@ def _stage_loss_cfg(loss_cfg: dict, stage: str) -> dict:
     return cfg
 
 
+def _resolve_base_sample(dataset, idx: int):
+    """Return the underlying dataset and raw index for possibly nested Subset objects."""
+    base = dataset
+    raw_idx = int(idx)
+    while isinstance(base, Subset):
+        raw_idx = int(base.indices[raw_idx])
+        base = base.dataset
+    return base, raw_idx
+
+
+def _sample_label_year(dataset, idx: int):
+    base, raw_idx = _resolve_base_sample(dataset, idx)
+    labels = getattr(base, "labels", None)
+    sample_sids = getattr(base, "sample_sids", None)
+    sid_to_year = getattr(base, "sid_to_year", None)
+    samples = getattr(base, "samples", None)
+
+    sid = None
+    label = None
+    year = None
+
+    if sample_sids is not None and raw_idx < len(sample_sids):
+        sid = sample_sids[raw_idx]
+        if labels is not None and sid in labels:
+            label = int(labels[sid])
+        if sid_to_year is not None and sid in sid_to_year:
+            year = int(sid_to_year[sid])
+
+    if samples is not None and raw_idx < len(samples):
+        sample = samples[raw_idx]
+        if sid is None and len(sample) >= 3:
+            sid = sample[2]
+        if label is None and len(sample) >= 2:
+            label = int(sample[1])
+        if year is None and len(sample) >= 4:
+            year = int(sample[3])
+
+    return label, year, sid
+
+
 def _balanced_sample_indices(
     dataset,
     ratio: float,
@@ -643,22 +698,8 @@ def _balanced_sample_indices(
     if ratio <= 0.0:
         return []
     by_group: dict[tuple[int, int] | int, list[int]] = {}
-    labels = getattr(dataset, "labels", None)
-    sample_sids = getattr(dataset, "sample_sids", None)
     for idx in range(len(dataset)):
-        label = None
-        year = None
-        if labels is not None and sample_sids is not None and idx < len(sample_sids):
-            label = int(labels[sample_sids[idx]])
-            sid_to_year = getattr(dataset, "sid_to_year", None)
-            if sid_to_year is not None:
-                year = int(sid_to_year[sample_sids[idx]])
-        else:
-            sample = getattr(dataset, "samples", [])[idx]
-            if len(sample) >= 2:
-                label = int(sample[1])
-            if len(sample) >= 4:
-                year = int(sample[3])
+        label, year, _ = _sample_label_year(dataset, idx)
         if label is None:
             continue
         group = (int(year), int(label)) if group_by_year and year is not None else int(label)
@@ -679,29 +720,8 @@ def _dataset_label_year_groups(dataset, group_by_year: bool = False):
     """Build label or year-label groups over raw dataset indices."""
     groups: dict[tuple[int, int] | int, list[int]] = {}
 
-    labels = getattr(dataset, "labels", None)
-    sample_sids = getattr(dataset, "sample_sids", None)
-    sid_to_year = getattr(dataset, "sid_to_year", None)
-    samples = getattr(dataset, "samples", None)
-
     for idx in range(len(dataset)):
-        label = None
-        year = None
-
-        if labels is not None and sample_sids is not None and idx < len(sample_sids):
-            sid = sample_sids[idx]
-            if sid in labels:
-                label = int(labels[sid])
-            if sid_to_year is not None and sid in sid_to_year:
-                year = int(sid_to_year[sid])
-
-        if label is None and samples is not None and idx < len(samples):
-            sample = samples[idx]
-            if len(sample) >= 2:
-                label = int(sample[1])
-            if len(sample) >= 4:
-                year = int(sample[3])
-
+        label, year, _ = _sample_label_year(dataset, idx)
         if label is None:
             continue
 
@@ -903,6 +923,514 @@ def _build_continual_adaptation_loader(
         **loader_kwargs,
     )
     return loader, len(adapt_indices), len(replay_indices)
+
+
+def _loader_for_scoring(dataset, batch_size, loader_kwargs):
+    kwargs = dict(loader_kwargs)
+    kwargs.pop("generator", None)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, **kwargs)
+
+
+def _drift_embedding(extra: dict, logits: torch.Tensor) -> torch.Tensor:
+    joint = extra.get("joint_emb")
+    if isinstance(joint, torch.Tensor) and joint.ndim == 2 and joint.size(0) == logits.size(0):
+        return joint.float()
+
+    parts = []
+    for key in ("api_emb", "graph_emb", "cross_emb"):
+        value = extra.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim == 2 and value.size(0) == logits.size(0):
+            parts.append(value.float())
+    if parts:
+        return torch.cat(parts, dim=-1)
+
+    return logits.float()
+
+
+def _branch_disagreement_from_logits(logits: torch.Tensor, extra: dict) -> torch.Tensor:
+    gate_disagreement = extra.get("gate_disagreement")
+    if (
+        isinstance(gate_disagreement, torch.Tensor)
+        and gate_disagreement.numel() == logits.size(0)
+    ):
+        return gate_disagreement.detach().float().view(-1)
+
+    branch_probs = []
+    for key in ("api_logits_aux", "graph_logits_aux", "joint_logits_aux"):
+        branch_logits = extra.get(key)
+        if isinstance(branch_logits, torch.Tensor) and branch_logits.shape == logits.shape:
+            branch_probs.append(torch.softmax(branch_logits.detach().float(), dim=-1))
+
+    branch_probs.append(torch.softmax(logits.detach().float(), dim=-1))
+    if len(branch_probs) < 2:
+        return logits.new_zeros((logits.size(0),), dtype=torch.float32)
+
+    stacked = torch.stack(branch_probs, dim=0)
+    mean_prob = stacked.mean(dim=0)
+    return (stacked - mean_prob).abs().mean(dim=(0, 2)).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def _collect_dbta_records(
+    model,
+    dataset,
+    loader,
+    device,
+    use_amp: bool,
+    logger=None,
+    phase: str = "dbta_score",
+):
+    was_training = model.training
+    model.eval()
+    sid_to_index = {
+        str(sid): idx
+        for idx, sid in enumerate(getattr(dataset, "sample_sids", []) or [])
+    }
+    records = []
+
+    try:
+        for batch in tqdm(loader, desc=phase, dynamic_ncols=True):
+            if batch is None:
+                continue
+            try:
+                _assert_no_failed_eval_batch(batch, phase)
+            except RuntimeError as exc:
+                if logger:
+                    logger.warning(str(exc))
+
+            r = prepare_batch(
+                batch,
+                device,
+                skip_graph=False,
+                skip_masks=(
+                    model.fusion_mode != "ours"
+                    or not getattr(model, "use_alignment_bias", False)
+                ),
+            )
+            if r[2] is None:
+                continue
+
+            graph, masks, y, sids, ex, _ = r
+            qapi, qg, qa, papi, pg, tids = ex
+            with get_amp_context(device, enabled=use_amp):
+                logits, extra = model(
+                    graph_data=graph,
+                    explicit_qs=(qapi, qg, qa, papi, pg),
+                    time_ids=tids,
+                    masks=masks,
+                    return_features=True,
+                )
+
+            probs = torch.softmax(logits.float(), dim=-1)
+            entropy = -(
+                probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()
+            ).sum(dim=-1)
+            entropy = entropy / np.log(max(probs.size(-1), 2))
+            pred_labels = probs.argmax(dim=-1)
+            disagreement = _branch_disagreement_from_logits(logits, extra)
+            embedding = _drift_embedding(extra, logits)
+
+            emb_cpu = embedding.detach().float().cpu()
+            entropy_cpu = entropy.detach().float().cpu()
+            pred_cpu = pred_labels.detach().long().cpu()
+            dis_cpu = disagreement.detach().float().cpu()
+            label_cpu = y.detach().long().cpu() if isinstance(y, torch.Tensor) else None
+            sid_values = list(sids) if sids is not None else [None] * logits.size(0)
+
+            for i, sid in enumerate(sid_values):
+                sid_key = str(sid) if sid is not None else ""
+                dataset_index = sid_to_index.get(sid_key)
+                if dataset_index is None:
+                    continue
+                label = int(label_cpu[i].item()) if label_cpu is not None else None
+                records.append({
+                    "dataset_index": int(dataset_index),
+                    "sid": sid_key,
+                    "label": label,
+                    "pred_label": int(pred_cpu[i].item()),
+                    "uncertainty": float(entropy_cpu[i].item()),
+                    "branch_disagreement": float(dis_cpu[i].item()),
+                    "embedding": emb_cpu[i].numpy().astype(np.float32, copy=True),
+                })
+    finally:
+        if was_training:
+            model.train()
+
+    return records
+
+
+def _build_class_prototypes(records, num_classes: int):
+    prototypes = {}
+    for cls in range(int(num_classes)):
+        vectors = [
+            r["embedding"]
+            for r in records
+            if r.get("label") is not None and int(r["label"]) == cls
+        ]
+        if vectors:
+            prototypes[cls] = np.stack(vectors, axis=0).mean(axis=0).astype(np.float32)
+    return prototypes
+
+
+def _cosine_distance(vec: np.ndarray, proto: np.ndarray) -> float:
+    v = vec.astype(np.float32, copy=False)
+    p = proto.astype(np.float32, copy=False)
+    denom = float(np.linalg.norm(v) * np.linalg.norm(p))
+    if denom <= 1e-8:
+        return 0.0
+    return float(1.0 - np.dot(v, p) / denom)
+
+
+def _attach_prototype_distance(records, prototypes):
+    if not prototypes:
+        for record in records:
+            record["prototype_distance"] = 0.0
+        return
+
+    for record in records:
+        pred = int(record.get("pred_label", 0))
+        emb = record["embedding"]
+        if pred in prototypes:
+            dist = _cosine_distance(emb, prototypes[pred])
+        else:
+            dist = min(_cosine_distance(emb, proto) for proto in prototypes.values())
+        record["prototype_distance"] = max(0.0, dist)
+
+
+def _normalize_component(records, key: str):
+    values = np.asarray([float(r.get(key, 0.0)) for r in records], dtype=np.float64)
+    if values.size == 0:
+        return np.asarray([], dtype=np.float64)
+    lo = float(np.nanmin(values))
+    hi = float(np.nanmax(values))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-12:
+        return np.zeros_like(values, dtype=np.float64)
+    return (values - lo) / (hi - lo)
+
+
+def _budget_count(n: int, ratio: float) -> int:
+    n = int(n)
+    ratio = float(ratio)
+    if n <= 0 or ratio <= 0.0:
+        return 0
+    if ratio >= 1.0:
+        return n
+    return min(n, max(1, int(round(n * ratio))))
+
+
+def _select_predicted_label_balanced(records, target: int):
+    if target <= 0 or not records:
+        return []
+    if target >= len(records):
+        return list(records)
+
+    groups: dict[int, list[dict]] = {}
+    for record in records:
+        groups.setdefault(int(record.get("pred_label", 0)), []).append(record)
+    for group_records in groups.values():
+        group_records.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
+
+    n = len(records)
+    quotas = {}
+    remainders = []
+    for group, group_records in groups.items():
+        raw = target * (len(group_records) / max(n, 1))
+        quota = min(len(group_records), int(np.floor(raw)))
+        quotas[group] = quota
+        remainders.append((raw - quota, group))
+
+    remaining = target - sum(quotas.values())
+    for _, group in sorted(remainders, reverse=True):
+        if remaining <= 0:
+            break
+        if quotas[group] < len(groups[group]):
+            quotas[group] += 1
+            remaining -= 1
+
+    selected = []
+    for group, quota in quotas.items():
+        selected.extend(groups[group][:quota])
+
+    if len(selected) < target:
+        selected_ids = {id(r) for r in selected}
+        leftovers = [r for r in records if id(r) not in selected_ids]
+        leftovers.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
+        selected.extend(leftovers[: target - len(selected)])
+
+    selected.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
+    return selected[:target]
+
+
+def _score_and_select_dbta_records(records, cfg):
+    train_cfg = cfg["train"]
+    target = _budget_count(len(records), float(train_cfg.get("adaptation_ratio", 1.0)))
+    if target <= 0:
+        return []
+
+    weights = {
+        "uncertainty": float(train_cfg.get("dbta_uncertainty_weight", 1.0)),
+        "branch_disagreement": float(train_cfg.get("dbta_disagreement_weight", 1.0)),
+        "prototype_distance": float(train_cfg.get("dbta_prototype_weight", 1.0)),
+    }
+
+    normalized = {
+        key: _normalize_component(records, key)
+        for key in weights
+    }
+    weight_sum = max(sum(max(w, 0.0) for w in weights.values()), 1e-8)
+
+    for i, record in enumerate(records):
+        score = 0.0
+        for key, weight in weights.items():
+            score += max(weight, 0.0) * float(normalized[key][i])
+        record["drift_score"] = score / weight_sum
+
+    balance = str(train_cfg.get("dbta_balance", "predicted_label")).lower()
+    if balance == "predicted_label":
+        return _select_predicted_label_balanced(records, target)
+    if balance == "none":
+        return sorted(records, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:target]
+    raise ValueError(f"Unsupported train.dbta_balance={balance}; expected predicted_label or none")
+
+
+def _nearest_historical_indices(hist_records, adapt_records, count: int, exclude=None):
+    count = int(count)
+    exclude = set(exclude or [])
+    if count <= 0 or not hist_records or not adapt_records:
+        return []
+
+    hist_vectors = np.stack([r["embedding"] for r in hist_records], axis=0).astype(np.float32)
+    adapt_vectors = np.stack([r["embedding"] for r in adapt_records], axis=0).astype(np.float32)
+    hist_norm = hist_vectors / np.clip(np.linalg.norm(hist_vectors, axis=1, keepdims=True), 1e-8, None)
+    adapt_norm = adapt_vectors / np.clip(np.linalg.norm(adapt_vectors, axis=1, keepdims=True), 1e-8, None)
+
+    best_sim = np.full((hist_norm.shape[0],), -np.inf, dtype=np.float32)
+    adapt_chunk = 512
+    hist_chunk = 512
+    for h0 in range(0, hist_norm.shape[0], hist_chunk):
+        h1 = min(h0 + hist_chunk, hist_norm.shape[0])
+        local_best = np.full((h1 - h0,), -np.inf, dtype=np.float32)
+        h = hist_norm[h0:h1]
+        for a0 in range(0, adapt_norm.shape[0], adapt_chunk):
+            a1 = min(a0 + adapt_chunk, adapt_norm.shape[0])
+            sim = h @ adapt_norm[a0:a1].T
+            local_best = np.maximum(local_best, sim.max(axis=1))
+        best_sim[h0:h1] = local_best
+
+    order = np.argsort(-best_sim)
+    selected = []
+    for pos in order:
+        dataset_index = int(hist_records[int(pos)]["dataset_index"])
+        if dataset_index in exclude:
+            continue
+        selected.append(dataset_index)
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def _build_drift_matched_replay_indices(
+    historical_dataset,
+    historical_records,
+    selected_adapt_records,
+    cfg,
+):
+    train_cfg = cfg["train"]
+    replay_ratio = float(train_cfg.get("replay_ratio", 0.25))
+    target = _count_group_samples(
+        _dataset_label_year_groups(historical_dataset, group_by_year=True),
+        replay_ratio,
+        min_per_group=1,
+    )
+    if target <= 0:
+        return []
+
+    drift_fraction = float(train_cfg.get("dbta_drift_replay_fraction", 0.5))
+    drift_fraction = min(max(drift_fraction, 0.0), 1.0)
+    anchor_ratio = replay_ratio * (1.0 - drift_fraction)
+    anchor_indices = _balanced_sample_indices(
+        historical_dataset,
+        anchor_ratio,
+        int(train_cfg.get("seed", 42)) + 1009,
+        min_per_group=1,
+        group_by_year=True,
+    )
+    anchor_indices = anchor_indices[:target]
+
+    drift_count = max(0, target - len(anchor_indices))
+    drift_indices = _nearest_historical_indices(
+        historical_records,
+        selected_adapt_records,
+        drift_count,
+        exclude=set(anchor_indices),
+    )
+    replay_indices = anchor_indices + drift_indices
+    if len(replay_indices) < target:
+        filler = _balanced_sample_indices(
+            historical_dataset,
+            replay_ratio,
+            int(train_cfg.get("seed", 42)) + 2003,
+            min_per_group=1,
+            group_by_year=True,
+        )
+        seen = set(replay_indices)
+        for idx in filler:
+            if idx not in seen:
+                replay_indices.append(idx)
+                seen.add(idx)
+            if len(replay_indices) >= target:
+                break
+    return replay_indices[:target]
+
+
+def _write_dbta_selection_dump(path, selected_records):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fields = [
+        "dataset_index",
+        "sid",
+        "pred_label",
+        "drift_score",
+        "uncertainty",
+        "branch_disagreement",
+        "prototype_distance",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for record in selected_records:
+            writer.writerow({
+                "dataset_index": int(record["dataset_index"]),
+                "sid": record.get("sid", ""),
+                "pred_label": int(record.get("pred_label", 0)),
+                "drift_score": f"{float(record.get('drift_score', 0.0)):.8f}",
+                "uncertainty": f"{float(record.get('uncertainty', 0.0)):.8f}",
+                "branch_disagreement": f"{float(record.get('branch_disagreement', 0.0)):.8f}",
+                "prototype_distance": f"{float(record.get('prototype_distance', 0.0)):.8f}",
+            })
+
+
+def build_adaptation_loader(
+    historical_dataset,
+    adapt_dataset,
+    cfg,
+    batch_size,
+    loader_kwargs,
+    model=None,
+    device=None,
+    use_amp: bool = False,
+    logger=None,
+    selection_dump_path: str | None = None,
+):
+    selection_strategy = str(cfg["train"].get("adaptation_selection", "random")).lower()
+    if selection_strategy not in {"random", "drift_aware", "dbta"}:
+        raise ValueError(
+            "train.adaptation_selection must be one of: random, drift_aware, dbta"
+        )
+
+    if selection_strategy == "random":
+        return _build_continual_adaptation_loader(
+            historical_dataset,
+            adapt_dataset,
+            cfg,
+            batch_size,
+            loader_kwargs,
+        )
+
+    if model is None or device is None:
+        raise ValueError("DBTA selection requires a historical model and device")
+
+    score_lk = dict(loader_kwargs)
+    score_lk.pop("generator", None)
+    historical_loader = _loader_for_scoring(historical_dataset, batch_size, score_lk)
+    adapt_loader = _loader_for_scoring(adapt_dataset, batch_size, score_lk)
+
+    historical_records = _collect_dbta_records(
+        model,
+        historical_dataset,
+        historical_loader,
+        device,
+        use_amp,
+        logger=logger,
+        phase="dbta_historical",
+    )
+    adapt_records = _collect_dbta_records(
+        model,
+        adapt_dataset,
+        adapt_loader,
+        device,
+        use_amp,
+        logger=logger,
+        phase="dbta_recent",
+    )
+
+    prototypes = _build_class_prototypes(
+        historical_records,
+        int(cfg["model"].get("num_classes", 2)),
+    )
+    _attach_prototype_distance(adapt_records, prototypes)
+    selected_records = _score_and_select_dbta_records(adapt_records, cfg)
+    selected_indices = [int(r["dataset_index"]) for r in selected_records]
+    if not selected_indices:
+        raise ValueError("DBTA selected no adaptation samples; check adaptation_ratio and recent pool")
+
+    _write_dbta_selection_dump(selection_dump_path, selected_records)
+
+    pred_counts = {}
+    for record in selected_records:
+        pred = int(record.get("pred_label", 0))
+        pred_counts[pred] = pred_counts.get(pred, 0) + 1
+
+    if logger:
+        scores = [float(r.get("drift_score", 0.0)) for r in selected_records]
+        logger.info(
+            "DBTA selection | "
+            f"selected={len(selected_records)}/{len(adapt_records)} "
+            f"ratio={float(cfg['train'].get('adaptation_ratio', 1.0)):.3f} "
+            f"pred_label_counts={pred_counts} "
+            f"mean_drift={float(np.mean(scores)) if scores else 0.0:.4f} "
+            f"dump={selection_dump_path or ''}"
+        )
+
+    selected_adapt_dataset = Subset(adapt_dataset, selected_indices)
+    loader_cfg = copy.deepcopy(cfg)
+    loader_cfg["train"]["adaptation_ratio"] = 1.0
+
+    replay_strategy = str(loader_cfg["train"].get("replay_strategy", "static")).lower()
+    if replay_strategy == "drift_matched":
+        replay_indices = _build_drift_matched_replay_indices(
+            historical_dataset,
+            historical_records,
+            selected_records,
+            loader_cfg,
+        )
+        replay_dataset = Subset(historical_dataset, replay_indices) if replay_indices else None
+        datasets = [selected_adapt_dataset]
+        if replay_dataset is not None:
+            datasets.append(replay_dataset)
+        loader = DataLoader(
+            ConcatDataset(datasets),
+            batch_size=batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        )
+        if logger:
+            logger.info(
+                "DBTA drift-matched replay | "
+                f"adapt_samples={len(selected_indices)} replay_samples={len(replay_indices)} "
+                f"drift_replay_fraction={float(loader_cfg['train'].get('dbta_drift_replay_fraction', 0.5)):.3f}"
+            )
+        return loader, len(selected_indices), len(replay_indices)
+
+    loader, _, n_replay = _build_continual_adaptation_loader(
+        historical_dataset,
+        selected_adapt_dataset,
+        loader_cfg,
+        batch_size,
+        loader_kwargs,
+    )
+    return loader, len(selected_indices), n_replay
 
 
 def train_one_epoch(
@@ -2044,18 +2572,13 @@ def main():
 
     dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, **train_lk)
     dl_adapt = None
+    n_adapt = 0
+    n_replay = 0
     if ds_adapt is not None:
-        dl_adapt, n_adapt, n_replay = _build_continual_adaptation_loader(
-            ds_tr,
-            ds_adapt,
-            cfg,
-            batch_size,
-            train_lk,
-        )
         logger.info(
-            "Continual adaptation loader | "
+            "Continual adaptation loader will be built after historical checkpoint selection | "
+            f"selection={str(c_train.get('adaptation_selection', 'random'))} "
             f"strategy={str(c_train.get('replay_strategy', 'static'))} "
-            f"adapt_samples_per_epoch={n_adapt} replay_samples_per_epoch={n_replay} "
             f"adapt_ratio={float(c_train.get('adaptation_ratio', 1.0)):.3f} "
             f"replay_ratio={float(c_train.get('replay_ratio', 0.25)):.3f}"
         )
@@ -2174,7 +2697,7 @@ def main():
     adapted_best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
     for epoch in range(start_epoch, epochs + 1):
         stage_name = "warmup" if epoch <= warmup_stage_epochs else "main"
-        continual_phase = "adaptation" if (dl_adapt is not None and epoch > historical_epochs) else "historical"
+        continual_phase = "adaptation" if (ds_adapt is not None and epoch > historical_epochs) else "historical"
         if stage_name != last_stage:
             if hasattr(model, "set_training_stage"):
                 model.set_training_stage(stage_name)
@@ -2216,6 +2739,26 @@ def main():
                 )
             logger.info(f"Continual phase: {continual_phase}")
             last_continual_phase = continual_phase
+
+        if continual_phase == "adaptation" and dl_adapt is None:
+            dl_adapt, n_adapt, n_replay = build_adaptation_loader(
+                ds_tr,
+                ds_adapt,
+                cfg,
+                batch_size,
+                train_lk,
+                model=model,
+                device=device,
+                use_amp=use_amp,
+                logger=logger,
+                selection_dump_path=os.path.join(ckpt_dir, "dbta_selection.csv"),
+            )
+            logger.info(
+                "Continual adaptation loader | "
+                f"selection={str(c_train.get('adaptation_selection', 'random'))} "
+                f"strategy={str(c_train.get('replay_strategy', 'static'))} "
+                f"adapt_samples_per_epoch={n_adapt} replay_samples_per_epoch={n_replay}"
+            )
 
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_loss_cfg = _stage_loss_cfg(c_loss, stage_name)
@@ -2289,7 +2832,7 @@ def main():
             no_improve += 0 if stage_name == "warmup" else 1
 
         last_p = os.path.join(ckpt_dir, f"last_{exp_name}.pt")
-        best_p = historical_best_p if continual_phase == "historical" and dl_adapt is not None else adapted_best_p
+        best_p = historical_best_p if continual_phase == "historical" and ds_adapt is not None else adapted_best_p
         save_checkpoint(last_p, epoch, model, optimizer, scheduler, scaler,
                         best_score, no_improve, cfg)
         if improved:
@@ -2334,7 +2877,7 @@ def main():
             f"sel={selection_score:.4f}")
         early_stop_allowed = (
             stage_name != "warmup"
-            and (dl_adapt is None or continual_phase == "adaptation")
+            and (ds_adapt is None or continual_phase == "adaptation")
         )
         if early_stop_allowed and no_improve >= patience:
             logger.info(f"Early stop: no_improve={no_improve}")

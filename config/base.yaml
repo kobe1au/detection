@@ -78,6 +78,12 @@ train:
   adaptation_ratio: 1.0
   replay_ratio: 0.25
   replay_strategy: static
+  adaptation_selection: random
+  dbta_balance: predicted_label
+  dbta_uncertainty_weight: 1.0
+  dbta_disagreement_weight: 1.0
+  dbta_prototype_weight: 1.0
+  dbta_drift_replay_fraction: 0.5
   eta_min: 0.000001
   label_smoothing: 0.05
   patience: 10

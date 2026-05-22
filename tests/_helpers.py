@@ -67,21 +67,15 @@ def make_model(fusion_mode: str):
         api_heads=2,
         api_layers=1,
         xattn_heads=2,
-        temporal_num_domains=3,
-        temporal_prototype_clusters=2,
-        use_temporal_regularization=True,
         gate_mode="learned",
     )
 
 
 def make_loss_cfg():
     return {
-        "temporal_proto_current_weight": 0.01,
-        "temporal_proto_future_weight": 0.01,
-        "temporal_risk_calibration_weight": 0.10,
         "semantic_alignment_weight": 0.03,
+        "class_aware_alignment_same_class_weight": 0.25,
+        "class_aware_alignment_temperature": 0.2,
+        "stage1_branch_aux_weight": 0.0,
         "branch_aux_weight": 0.10,
-        "temporal_proto_temperature": 0.2,
-        "temporal_proto_velocity_scale": 0.5,
-        "temporal_proto_min_history": 2,
     }

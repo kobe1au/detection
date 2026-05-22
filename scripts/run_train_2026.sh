@@ -38,6 +38,7 @@ I1_ADAPTATION=(
   "config/train_2026/i1_adaptation/01_adapt_020_no_replay.yaml"
   "config/train_2026/i1_adaptation/02_adapt_020_static_replay.yaml"
   "config/train_2026/i1_adaptation/03_adapt_020_dynamic_replay.yaml"
+  "config/train_2026/i1_adaptation/04_adapt_020_drift_matched_replay.yaml"
   "config/train_2026/i1_adaptation/10_ratio_005_dynamic_replay.yaml"
   "config/train_2026/i1_adaptation/11_ratio_010_dynamic_replay.yaml"
   "config/train_2026/i1_adaptation/12_ratio_020_dynamic_replay.yaml"
@@ -56,6 +57,7 @@ REPLAY_ABLATION=(
   "config/train_2026/replay_ablation/00_no_replay_adapt_020.yaml"
   "config/train_2026/replay_ablation/01_static_replay_adapt_020.yaml"
   "config/train_2026/replay_ablation/02_dynamic_year_class_replay_adapt_020.yaml"
+  "config/train_2026/replay_ablation/03_drift_matched_replay_adapt_020.yaml"
 )
 
 I2_ALIGNMENT=(
@@ -72,7 +74,6 @@ I3_FUSION=(
   "config/train_2026/i3_fusion/02_quality_gate.yaml"
   "config/train_2026/i3_fusion/03_uncertainty_gate.yaml"
   "config/train_2026/i3_fusion/04_quality_uncertainty_gate.yaml"
-  "config/train_2026/i3_fusion/05_pseudo_oracle_gate.yaml"
 )
 
 run_group() {

@@ -23,7 +23,8 @@ train:
   adaptation_epochs: 10
   adaptation_ratio: 0.20
   replay_ratio: 0.25
-  replay_strategy: dynamic_year_class
+  replay_strategy: drift_matched
+  adaptation_selection: dbta
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25

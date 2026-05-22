@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+
 def _semantic_alignment_loss(
     api_features: torch.Tensor | None,
     graph_features: torch.Tensor | None,
@@ -87,20 +88,9 @@ def _semantic_alignment_loss(
 
 
 def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epochs=1):
-    """Aggregate classification, alignment, branch auxiliary, and gate oracle losses."""
+    """Aggregate classification, semantic alignment, and branch auxiliary losses."""
     semantic_align_weight = float(loss_cfg["semantic_alignment_weight"])
     branch_aux_weight = float(loss_cfg["branch_aux_weight"])
-    gate_oracle_weight = float(loss_cfg.get("gate_oracle_weight", 0.0))
-    gate_oracle_start_epoch = int(loss_cfg.get("gate_oracle_start_epoch", 0))
-    if epoch < gate_oracle_start_epoch:
-        gate_oracle_weight = 0.0
-    gate_oracle_start_phase = str(loss_cfg.get("gate_oracle_start_phase", "") or "").lower()
-    if gate_oracle_start_phase:
-        if str(loss_cfg.get("_continual_phase", "historical")).lower() != gate_oracle_start_phase:
-            gate_oracle_weight = 0.0
-    if bool(loss_cfg.get("gate_oracle_adaptation_only", False)):
-        if str(loss_cfg.get("_continual_phase", "historical")).lower() != "adaptation":
-            gate_oracle_weight = 0.0
 
     loss_cls = criterion(logits, y)
     if not torch.isfinite(loss_cls).all():
@@ -144,50 +134,10 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
         if aux_losses:
             loss_branch_aux = torch.stack(aux_losses).mean()
 
-    loss_gate_oracle = zero
-    if gate_oracle_weight != 0.0:
-        gate_weights = extra.get("gate_weights_train", extra.get("gate_weights"))
-        branch_logits = [
-            extra.get("api_logits_aux"),
-            extra.get("graph_logits_aux"),
-            extra.get("joint_logits_aux"),
-        ]
-        if (
-            isinstance(gate_weights, torch.Tensor)
-            and gate_weights.ndim == 2
-            and gate_weights.size(0) == y.numel()
-            and gate_weights.size(1) == 3
-            and all(isinstance(v, torch.Tensor) and v.shape == logits.shape for v in branch_logits)
-        ):
-            branch_losses = torch.stack(
-                [
-                    F.cross_entropy(v.float(), y, reduction="none")
-                    for v in branch_logits
-                ],
-                dim=1,
-            )
-            temp = max(float(loss_cfg.get("gate_oracle_temperature", 0.5)), 1e-4)
-            oracle = torch.softmax(-branch_losses.detach() / temp, dim=1)
-            smoothing = float(loss_cfg.get("gate_oracle_smoothing", 0.0))
-            if smoothing > 0.0:
-                smoothing = min(max(smoothing, 0.0), 1.0)
-                oracle = (1.0 - smoothing) * oracle + smoothing / oracle.size(1)
-
-            oracle_detached = oracle.detach()
-            extra["gate_oracle_target_mean"] = oracle_detached.mean(dim=0)
-            extra["gate_oracle_entropy"] = -(
-                oracle_detached.clamp_min(1e-8)
-                * oracle_detached.clamp_min(1e-8).log()
-            ).sum(dim=1)
-
-            log_gate = torch.log(gate_weights.float().clamp_min(1e-8))
-            loss_gate_oracle = _safe(F.kl_div(log_gate, oracle, reduction="batchmean"))
-
     total = (
         loss_cls
         + semantic_align_weight * loss_semantic_align
         + branch_aux_weight * loss_branch_aux
-        + gate_oracle_weight * loss_gate_oracle
     )
 
     if not torch.isfinite(total).all():
@@ -196,10 +146,8 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
     extra["loss_components"] = {
         "semantic_align": loss_semantic_align.detach(),
         "branch_aux": loss_branch_aux.detach(),
-        "gate_oracle": loss_gate_oracle.detach(),
         "weighted_semantic_align": (semantic_align_weight * loss_semantic_align).detach(),
         "weighted_branch_aux": (branch_aux_weight * loss_branch_aux).detach(),
-        "weighted_gate_oracle": (gate_oracle_weight * loss_gate_oracle).detach(),
     }
 
     return (

@@ -24,6 +24,7 @@ EXPERIMENTS = [
     "./config/train_2026/replay_ablation/00_no_replay_adapt_020.yaml",
     "./config/train_2026/replay_ablation/01_static_replay_adapt_020.yaml",
     "./config/train_2026/replay_ablation/02_dynamic_year_class_replay_adapt_020.yaml",
+    "./config/train_2026/replay_ablation/03_drift_matched_replay_adapt_020.yaml",
 ]
 
 

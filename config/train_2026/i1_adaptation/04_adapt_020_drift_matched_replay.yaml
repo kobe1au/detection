@@ -6,11 +6,11 @@ model:
   fusion_mode: concat
 
 train:
-  exp_name: i1_ratio_005_dynamic_replay
+  exp_name: i1_adapt_020_drift_matched_replay
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
-  adaptation_ratio: 0.05
+  adaptation_ratio: 0.20
   replay_ratio: 0.25
-  replay_strategy: dynamic_year_class
+  replay_strategy: drift_matched
   adaptation_selection: dbta

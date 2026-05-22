@@ -21,7 +21,7 @@ class LossComponentsFiniteTest(unittest.TestCase):
             time_ids=torch.tensor([0, 1], dtype=torch.long),
             masks=make_masks(),
         )
-        loss, loss_cls, loss_temporal, loss_alignment = compute_total_loss(
+        loss, loss_cls, loss_alignment = compute_total_loss(
             logits,
             extra,
             y,
@@ -30,7 +30,7 @@ class LossComponentsFiniteTest(unittest.TestCase):
         )
 
         self.assertTrue(torch.isfinite(loss).all())
-        for value in (loss_cls, loss_temporal, loss_alignment):
+        for value in (loss_cls, loss_alignment):
             self.assertTrue(torch.isfinite(value).all())
         for value in extra.get("loss_components", {}).values():
             if isinstance(value, torch.Tensor):

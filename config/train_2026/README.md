@@ -10,7 +10,8 @@ Protocol:
 - Recent-year adaptation pool: 2023
 - Final test: 2024
 - Paper default adaptation ratio: 20%
-- Default replay strategy for continual experiments: `dynamic_year_class`
+- Default recent-year sample selection for continual experiments: `dbta`
+- Default replay strategy for main/full continual experiments: `drift_matched`
 
 Run order:
 
@@ -19,9 +20,9 @@ Run order:
 2. `scripts/run_train_2026.sh main`
    - B0 zero-adapt, B1 I1, B2 I1+I2, B3 I1+I2+I3 at 20% adaptation.
 3. `scripts/run_train_2026.sh i1`
-   - I1-only adaptation ablations: no replay, static replay, dynamic replay, and I1-only ratio sweep.
+   - I1-only adaptation ablations: no replay, static replay, dynamic replay, drift-matched replay, and I1-only ratio sweep.
 4. `scripts/run_train_2026.sh replay`
-   - No replay, static replay, dynamic year-class replay at 20% adaptation.
+   - No replay, static replay, dynamic year-class replay, and drift-matched replay at 20% adaptation.
 5. `scripts/run_train_2026.sh i2`
    - Class-aware API-Graph alignment ablations at 20% adaptation.
 6. `scripts/run_train_2026.sh i3`

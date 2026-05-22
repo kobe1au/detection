@@ -17,17 +17,19 @@ model:
     detach: true
 
 train:
-  exp_name: i3_pseudo_oracle_gate_adapt_020
+  exp_name: replay_ablation_drift_matched_replay_adapt_020
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10
   adaptation_ratio: 0.20
   replay_ratio: 0.25
-  replay_strategy: dynamic_year_class
+  replay_strategy: drift_matched
+  adaptation_selection: dbta
+
 loss:
   semantic_alignment_weight: 0.03
   class_aware_alignment_same_class_weight: 0.25
-  gate_oracle_weight: 0.05
+  gate_oracle_weight: 0.0
   gate_oracle_temperature: 0.5
   gate_oracle_smoothing: 0.10
   gate_oracle_start_phase: adaptation

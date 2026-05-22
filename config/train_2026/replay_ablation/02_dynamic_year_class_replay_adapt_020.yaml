@@ -24,6 +24,7 @@ train:
   adaptation_ratio: 0.20
   replay_ratio: 0.25
   replay_strategy: dynamic_year_class
+  adaptation_selection: dbta
 
 loss:
   semantic_alignment_weight: 0.03
