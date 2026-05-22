@@ -1,5 +1,0 @@
-model:
-  fusion_mode: graph
-
-train:
-  exp_name: baseline_graph_only_2024

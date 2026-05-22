@@ -1,5 +1,0 @@
-model:
-  fusion_mode: cross_attention
-
-train:
-  exp_name: baseline_cross_attention_2024

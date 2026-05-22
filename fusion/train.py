@@ -24,7 +24,10 @@ from fusion.mm_dataset import MultiModalMalwareDataset, hierarchical_collate_fn
 from fusion.model import MalwareModelWithXAttn
 from fusion.losses import compute_total_loss
 from fusion.constants import TrainingConstants
-from fusion.calibration import TemperatureScaling
+from fusion.calibration import (
+    TemperatureScaling,
+    compute_calibration_metrics_from_logits,
+)
 from fusion.utils import get_amp_context, build_grad_scaler, prepare_batch
 from fusion.selective_metrics import aurc, eaurc, risk_at_coverage, coverage_at_risk
 from fusion.temporal_metrics import compute_aut, compute_aut_suite
@@ -239,7 +242,7 @@ def validate_full_config(cfg):
     allowed_api = {"type", "num_hash_buckets", "type_vocab_size", "max_seq_len", "layers", "heads"}
     allowed_graph = {"type", "hidden", "heads", "layers", "use_behavior_hint", "drop_extracted_behavior_hints"}
     allowed_alignment = {"enabled", "adaptive_bias", "penalty_scale", "bonus_scale", "context_scale"}
-    allowed_gate = {"mode", "quality_inputs", "uncertainty_inputs", "detach"}
+    allowed_gate = {"mode", "quality_inputs", "uncertainty_inputs", "detach", "time_inputs", "time_feature_set"}
     allowed_train = {
         "exp_name", "seed", "device", "use_amp", "epochs", "batch_size",
         "eval_batch_size", "grad_accum_steps", "num_workers", "pin_memory",
@@ -257,6 +260,8 @@ def validate_full_config(cfg):
         "stage1_branch_aux_weight",
         "class_aware_alignment_same_class_weight",
         "class_aware_alignment_temperature",
+        "local_alignment_weight",
+        "alignment_use_temporal_soft_weight",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -507,7 +512,7 @@ def _binary_detection_metrics(labels, probs, preds=None):
     }
 
 
-def _gate_diagnostics(gate_weights, correct=None, q_api=None, q_graph=None):
+def _gate_diagnostics(gate_weights, correct=None, q_api=None, q_graph=None, q_align=None, q_time=None, q_drift=None):
     if not gate_weights:
         return {}
     gw = np.asarray(gate_weights, dtype=np.float64)
@@ -541,6 +546,12 @@ def _gate_diagnostics(gate_weights, correct=None, q_api=None, q_graph=None):
         _mean_by_mask("qapi", q_api, high_name="qapi")
     if q_graph is not None:
         _mean_by_mask("qgraph", q_graph, high_name="qgraph")
+    if q_align is not None:
+        _mean_by_mask("qalign", q_align, high_name="qalign")
+    if q_time is not None:
+        _mean_by_mask("qtime", q_time, high_name="qtime")
+    if q_drift is not None:
+        _mean_by_mask("qdrift", q_drift, high_name="qdrift")
     return out
 
 def _compute_bucket_metrics(values, labels, preds, prefix: str):
@@ -1764,13 +1775,20 @@ def eval_one_epoch(
     all_preds = []
     all_labels = []
     all_confs = []
+    all_fused_probs = []
+    all_api_probs = []
+    all_graph_probs = []
+    all_joint_probs = []
 
     all_gate_weights = []
     all_gate_correct = []
-    all_gate_qapi = []
-    all_gate_qgraph = []
+    all_gate_qalign = []
+    all_gate_qtime = []
+    all_gate_qdrift = []
 
     all_qalign = []
+    all_qtime = []
+    all_qdrift = []
     all_align_coverage = []
     all_align_density = []
 
@@ -1842,6 +1860,12 @@ def eval_one_epoch(
         total_loss += float(loss_cls.item()) * bs
         total_samples += bs
 
+        all_fused_probs.append(probs.detach().float().cpu())
+        for key, target in (("api_logits_aux", all_api_probs), ("graph_logits_aux", all_graph_probs), ("joint_logits_aux", all_joint_probs)):
+            aux_logits = extra.get(key) if isinstance(extra, dict) else None
+            if isinstance(aux_logits, torch.Tensor) and aux_logits.ndim == 2 and aux_logits.size(0) == bs:
+                target.append(torch.softmax(aux_logits.detach().float(), dim=-1).cpu())
+
         uncertainty, ok_uncertainty = _extract_extra_mean(extra, "uncertainty_score")
         if ok_uncertainty:
             sum_uncertainty += uncertainty * bs
@@ -1908,6 +1932,9 @@ def eval_one_epoch(
             target_list.extend([float("nan")] * bs)
             return False
 
+        _append_extra_vector("q_time", all_qtime)
+        _append_extra_vector("q_drift", all_qdrift)
+
         ok_cov = _append_extra_vector("alignment_coverage", all_align_coverage)
         if not ok_cov:
             # If xattn alignment stats are unavailable, try prior mask coverage.
@@ -1953,6 +1980,10 @@ def eval_one_epoch(
             pert_api_values = _tensor_vec(papi)
             pert_graph_values = _tensor_vec(pg)
 
+            q_time_values = _extra_vec("q_time")
+            q_drift_values = _extra_vec("q_drift")
+            time_id_values = _tensor_vec(tids)
+
             uncertainty_values = _extra_vec("uncertainty_score")
             disagreement_values = _extra_vec("gate_disagreement")
             entropy_values = _extra_vec("gate_entropy")
@@ -1967,6 +1998,48 @@ def eval_one_epoch(
                 density_values = _extra_vec("alignment_density_prior")
 
             gate_values = extra.get("gate_weights") if isinstance(extra, dict) else None
+            api_aux_logits = extra.get("api_logits_aux") if isinstance(extra, dict) else None
+            graph_aux_logits = extra.get("graph_logits_aux") if isinstance(extra, dict) else None
+            joint_aux_logits = extra.get("joint_logits_aux") if isinstance(extra, dict) else None
+            if (
+                isinstance(api_aux_logits, torch.Tensor)
+                and api_aux_logits.ndim == 2
+                and api_aux_logits.size(0) == bs_local
+            ):
+                api_probs = torch.softmax(api_aux_logits.detach().float(), dim=-1).cpu()
+                api_conf_values = api_probs.max(dim=-1).values.tolist()
+                api_pred_values = api_probs.argmax(dim=-1).tolist()
+                api_correct_values = [int(p == t) for p, t in zip(api_pred_values, label_values)]
+            else:
+                api_conf_values = [float("nan")] * bs_local
+                api_correct_values = [float("nan")] * bs_local
+
+            if (
+                isinstance(graph_aux_logits, torch.Tensor)
+                and graph_aux_logits.ndim == 2
+                and graph_aux_logits.size(0) == bs_local
+            ):
+                graph_probs = torch.softmax(graph_aux_logits.detach().float(), dim=-1).cpu()
+                graph_conf_values = graph_probs.max(dim=-1).values.tolist()
+                graph_pred_values = graph_probs.argmax(dim=-1).tolist()
+                graph_correct_values = [int(p == t) for p, t in zip(graph_pred_values, label_values)]
+            else:
+                graph_conf_values = [float("nan")] * bs_local
+                graph_correct_values = [float("nan")] * bs_local
+
+            if (
+                isinstance(joint_aux_logits, torch.Tensor)
+                and joint_aux_logits.ndim == 2
+                and joint_aux_logits.size(0) == bs_local
+            ):
+                joint_probs = torch.softmax(joint_aux_logits.detach().float(), dim=-1).cpu()
+                joint_conf_values = joint_probs.max(dim=-1).values.tolist()
+                joint_pred_values = joint_probs.argmax(dim=-1).tolist()
+                joint_correct_values = [int(p == t) for p, t in zip(joint_pred_values, label_values)]
+            else:
+                joint_conf_values = [float("nan")] * bs_local
+                joint_correct_values = [float("nan")] * bs_local
+
             if (
                 isinstance(gate_values, torch.Tensor)
                 and gate_values.ndim == 2
@@ -1993,11 +2066,20 @@ def eval_one_epoch(
                     "q_api": float(q_api_values[i]),
                     "q_graph": float(q_graph_values[i]),
                     "q_align": float(q_align_values[i]),
+                    "q_time": float(q_time_values[i]),
+                    "q_drift": float(q_drift_values[i]),
                     "pert_api": float(pert_api_values[i]),
                     "pert_graph": float(pert_graph_values[i]),
+                    "time_id": float(time_id_values[i]),
                     "gate_api": float(gate_api_values[i]),
                     "gate_graph": float(gate_graph_values[i]),
                     "gate_joint": float(gate_joint_values[i]),
+                    "api_confidence": float(api_conf_values[i]),
+                    "graph_confidence": float(graph_conf_values[i]),
+                    "joint_confidence": float(joint_conf_values[i]),
+                    "api_correct": float(api_correct_values[i]),
+                    "graph_correct": float(graph_correct_values[i]),
+                    "joint_correct": float(joint_correct_values[i]),
                     "uncertainty_score": float(uncertainty_values[i]),
                     "gate_disagreement": float(disagreement_values[i]),
                     "gate_entropy": float(entropy_values[i]),
@@ -2009,6 +2091,12 @@ def eval_one_epoch(
             all_gate_correct.extend((preds == y).detach().float().cpu().tolist())
             all_gate_qapi.extend(qapi.detach().float().view(-1).cpu().tolist())
             all_gate_qgraph.extend(qg.detach().float().view(-1).cpu().tolist())
+            if isinstance(qa, torch.Tensor) and qa.numel() == bs:
+                all_gate_qalign.extend(qa.detach().float().view(-1).cpu().tolist())
+            else:
+                all_gate_qalign.extend([float("nan")] * bs)
+            all_gate_qtime.extend(_extra_vec("q_time"))
+            all_gate_qdrift.extend(_extra_vec("q_drift"))
 
     if not all_labels:
         return (
@@ -2053,7 +2141,35 @@ def eval_one_epoch(
         correct=all_gate_correct,
         q_api=(all_gate_qapi if len(all_gate_qapi) == len(all_gate_weights) else None),
         q_graph=(all_gate_qgraph if len(all_gate_qgraph) == len(all_gate_weights) else None),
+        q_align=(all_gate_qalign if len(all_gate_qalign) == len(all_gate_weights) else None),
+        q_time=(all_gate_qtime if len(all_gate_qtime) == len(all_gate_weights) else None),
+        q_drift=(all_gate_qdrift if len(all_gate_qdrift) == len(all_gate_weights) else None),
     )
+
+    fused_calibration = {}
+    api_calibration = {}
+    graph_calibration = {}
+    joint_calibration = {}
+    if all_fused_probs:
+        fused_calibration = compute_calibration_metrics_from_logits(
+            torch.log(torch.cat(all_fused_probs, dim=0).clamp_min(1e-8)),
+            torch.as_tensor(label_arr, dtype=torch.long),
+        )
+    if all_api_probs and sum(x.size(0) for x in all_api_probs) == len(label_arr):
+        api_calibration = compute_calibration_metrics_from_logits(
+            torch.log(torch.cat(all_api_probs, dim=0).clamp_min(1e-8)),
+            torch.as_tensor(label_arr, dtype=torch.long),
+        )
+    if all_graph_probs and sum(x.size(0) for x in all_graph_probs) == len(label_arr):
+        graph_calibration = compute_calibration_metrics_from_logits(
+            torch.log(torch.cat(all_graph_probs, dim=0).clamp_min(1e-8)),
+            torch.as_tensor(label_arr, dtype=torch.long),
+        )
+    if all_joint_probs and sum(x.size(0) for x in all_joint_probs) == len(label_arr):
+        joint_calibration = compute_calibration_metrics_from_logits(
+            torch.log(torch.cat(all_joint_probs, dim=0).clamp_min(1e-8)),
+            torch.as_tensor(label_arr, dtype=torch.long),
+        )
 
     align_cov_bucket = _compute_bucket_metrics(
         all_align_coverage, all_labels, all_preds, "align_cov"
@@ -2093,9 +2209,24 @@ def eval_one_epoch(
                 f"qapi_low={gate_diag.get('qapi_low')} "
                 f"qapi_high={gate_diag.get('qapi_high')} "
                 f"qgraph_low={gate_diag.get('qgraph_low')} "
-                f"qgraph_high={gate_diag.get('qgraph_high')}"
+                f"qgraph_high={gate_diag.get('qgraph_high')} "
+                f"qalign_low={gate_diag.get('qalign_low')} "
+                f"qalign_high={gate_diag.get('qalign_high')} "
+                f"qtime_low={gate_diag.get('qtime_low')} "
+                f"qtime_high={gate_diag.get('qtime_high')} "
+                f"qdrift_low={gate_diag.get('qdrift_low')} "
+                f"qdrift_high={gate_diag.get('qdrift_high')}"
             )
-            
+
+        if fused_calibration:
+            logger.info(
+                f"[eval][epoch {epoch}] calibration: "
+                f"fused(ece={fused_calibration.get('ece', 0.0):.4f},nll={fused_calibration.get('nll', 0.0):.4f},brier={fused_calibration.get('brier', 0.0):.4f}) "
+                f"api(ece={api_calibration.get('ece', 0.0):.4f},nll={api_calibration.get('nll', 0.0):.4f},brier={api_calibration.get('brier', 0.0):.4f}) "
+                f"graph(ece={graph_calibration.get('ece', 0.0):.4f},nll={graph_calibration.get('nll', 0.0):.4f},brier={graph_calibration.get('brier', 0.0):.4f}) "
+                f"joint(ece={joint_calibration.get('ece', 0.0):.4f},nll={joint_calibration.get('nll', 0.0):.4f},brier={joint_calibration.get('brier', 0.0):.4f})"
+            )
+
         logger.info(
             f"[eval][epoch {epoch}] alignment-buckets: "
             f"{_format_bucket_metrics(align_cov_bucket, 'align_cov')} | "
@@ -2130,11 +2261,20 @@ def eval_one_epoch(
             "q_api",
             "q_graph",
             "q_align",
+            "q_time",
+            "q_drift",
             "pert_api",
             "pert_graph",
+            "time_id",
             "gate_api",
             "gate_graph",
             "gate_joint",
+            "api_confidence",
+            "graph_confidence",
+            "joint_confidence",
+            "api_correct",
+            "graph_correct",
+            "joint_correct",
             "uncertainty_score",
             "gate_disagreement",
             "gate_entropy",
@@ -2569,6 +2709,10 @@ def main():
         use_adaptive_alignment_bias=bool(c_alignment["adaptive_bias"]),
         use_quality_gate_inputs=bool(c_gate["quality_inputs"]),
         use_uncertainty_gate=bool(c_gate["uncertainty_inputs"]),
+        use_time_gate_inputs=bool(c_gate.get("time_inputs", False)),
+        time_feature_set=str(c_gate.get("time_feature_set", "basic")),
+        use_temporal_reliability=bool(c_loss.get("alignment_use_temporal_soft_weight", False)),
+        use_drift_reliability=bool(c_loss.get("alignment_use_temporal_soft_weight", False)),
         gate_mode=str(c_gate["mode"]),
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,

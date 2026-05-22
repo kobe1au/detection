@@ -9,6 +9,48 @@ from fusion.utils import get_amp_context, prepare_batch
 logger = logging.getLogger(__name__)
 
 
+def compute_ece(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    confidences, predictions = probs.max(dim=-1)
+    accuracies = predictions.eq(labels)
+
+    ece = torch.tensor(0.0, device=probs.device)
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
+
+    for i in range(n_bins):
+        in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
+        if in_bin.sum() > 0:
+            bin_acc = accuracies[in_bin].float().mean()
+            bin_conf = confidences[in_bin].mean()
+            ece += (in_bin.sum().float() / len(probs)) * torch.abs(bin_acc - bin_conf)
+
+    return float(ece.item())
+
+
+def compute_nll(probs: torch.Tensor, labels: torch.Tensor) -> float:
+    idx = torch.arange(len(labels), device=labels.device)
+    p_true = probs[idx, labels].clamp_min(1e-12)
+    return float(-p_true.log().mean().item())
+
+
+def compute_brier(probs: torch.Tensor, labels: torch.Tensor) -> float:
+    batch_size, num_classes = probs.shape
+    onehot = F.one_hot(labels, num_classes=num_classes).float()
+    return float(((probs - onehot) ** 2).sum(dim=-1).mean().item())
+
+
+def compute_calibration_metrics_from_probs(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> dict[str, float]:
+    return {
+        "ece": compute_ece(probs, labels, n_bins=n_bins),
+        "nll": compute_nll(probs, labels),
+        "brier": compute_brier(probs, labels),
+    }
+
+
+def compute_calibration_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> dict[str, float]:
+    probs = torch.softmax(logits, dim=-1)
+    return compute_calibration_metrics_from_probs(probs, labels, n_bins=n_bins)
+
+
 class TemperatureScaling(nn.Module):
     """
     温度缩放校准器（Guo et al., ICML 2017）
@@ -113,12 +155,12 @@ class TemperatureScaling(nn.Module):
         with torch.no_grad():
             before_probs = torch.softmax(all_logits, dim=-1)
             after_probs = self(all_logits)
-            ece_b = self._compute_ece(before_probs, all_labels)
-            ece_a = self._compute_ece(after_probs, all_labels)
-            nll_b = self._compute_nll(before_probs, all_labels)
-            nll_a = self._compute_nll(after_probs, all_labels)
-            br_b  = self._compute_brier(before_probs, all_labels)
-            br_a  = self._compute_brier(after_probs, all_labels)
+            ece_b = compute_ece(before_probs, all_labels)
+            ece_a = compute_ece(after_probs, all_labels)
+            nll_b = compute_nll(before_probs, all_labels)
+            nll_a = compute_nll(after_probs, all_labels)
+            br_b  = compute_brier(before_probs, all_labels)
+            br_a  = compute_brier(after_probs, all_labels)
 
         logger.info(
             f"Temperature calibration done: T={self.temperature.item():.4f} | "
@@ -129,30 +171,12 @@ class TemperatureScaling(nn.Module):
 
     @staticmethod
     def _compute_ece(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
-        confidences, predictions = probs.max(dim=-1)
-        accuracies = predictions.eq(labels)
+        return compute_ece(probs, labels, n_bins=n_bins)
 
-        ece = torch.tensor(0.0, device=probs.device)
-        bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
-
-        for i in range(n_bins):
-            in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
-            if in_bin.sum() > 0:
-                bin_acc = accuracies[in_bin].float().mean()
-                bin_conf = confidences[in_bin].mean()
-                ece += (in_bin.sum().float() / len(probs)) * torch.abs(bin_acc - bin_conf)
-
-        return ece.item()
-    
     @staticmethod
     def _compute_nll(probs: torch.Tensor, labels: torch.Tensor) -> float:
-        """Negative log-likelihood (average)."""
-        idx = torch.arange(len(labels), device=labels.device)
-        p_true = probs[idx, labels].clamp_min(1e-12)
-        return float(-p_true.log().mean().item())
+        return compute_nll(probs, labels)
+
     @staticmethod
     def _compute_brier(probs: torch.Tensor, labels: torch.Tensor) -> float:
-        """Multi-class Brier score (lower is better)."""
-        B, C = probs.shape
-        onehot = F.one_hot(labels, num_classes=C).float()
-        return float(((probs - onehot) ** 2).sum(dim=-1).mean().item())
+        return compute_brier(probs, labels)

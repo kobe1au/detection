@@ -342,6 +342,10 @@ class MalwareModelWithXAttn(nn.Module):
         use_adaptive_alignment_bias: bool = False,
         use_uncertainty_gate: bool = True,
         use_quality_gate_inputs: bool = True,
+        use_time_gate_inputs: bool = False,
+        time_feature_set: str = "basic",
+        use_temporal_reliability: bool = False,
+        use_drift_reliability: bool = False,
         gate_mode: str = "learned",
         late_fusion_api_weight: float = 0.5,
     ):
@@ -401,12 +405,18 @@ class MalwareModelWithXAttn(nn.Module):
         self.use_adaptive_alignment_bias = bool(use_adaptive_alignment_bias)
         self.use_uncertainty_gate = bool(use_uncertainty_gate)
         self.use_quality_gate_inputs = bool(use_quality_gate_inputs)
+        self.use_time_gate_inputs = bool(use_time_gate_inputs)
+        self.time_feature_set = str(time_feature_set or "basic").lower()
+        self.use_temporal_reliability = bool(use_temporal_reliability)
+        self.use_drift_reliability = bool(use_drift_reliability)
         self.training_stage = "main"
         self.force_fixed_gate = False
         self.force_disable_alignment = False
         self.gate_mode = str(gate_mode or "learned").lower()
         if self.gate_mode not in {"learned", "fixed"}:
             raise ValueError("gate_mode must be one of: learned, fixed")
+        if self.time_feature_set not in {"basic"}:
+            raise ValueError("time_feature_set must be 'basic'")
 
         self.late_fusion_api_weight = float(late_fusion_api_weight)
         if not (0.0 <= self.late_fusion_api_weight <= 1.0):
@@ -477,7 +487,8 @@ class MalwareModelWithXAttn(nn.Module):
             self.cross_attn = None
 
         if self._need_gates:
-            self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=9)
+            gate_q_dim = 9 + (4 if self.use_time_gate_inputs else 0)
+            self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=gate_q_dim)
         else:
             self.gate_net = None
 
@@ -567,17 +578,63 @@ class MalwareModelWithXAttn(nn.Module):
         return api_z, graph_z
 
     def _explicit_qs_to_tensor(self, explicit_qs, b, device, dtype):
+        width = max(len(explicit_qs), 5) if explicit_qs is not None else 5
         if explicit_qs is None:
-            return torch.ones((b, 5), device=device, dtype=dtype)
+            return torch.ones((b, width), device=device, dtype=dtype)
 
         vals = []
-        for i in range(5):
+        for i in range(width):
             if i < len(explicit_qs) and explicit_qs[i] is not None:
                 vals.append(explicit_qs[i].to(device=device, dtype=dtype).view(b, 1))
             else:
-                vals.append(torch.ones((b, 1), device=device, dtype=dtype))
+                fill = 0.0 if i >= 5 else 1.0
+                vals.append(torch.full((b, 1), fill, device=device, dtype=dtype))
 
         return torch.cat(vals, dim=-1).clamp(0.0, 1.0)
+
+    def _build_temporal_reliability(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
+        if time_ids is None:
+            base = torch.ones((batch_size, 1), device=device, dtype=dtype)
+            zero = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+            return base, zero
+
+        tids = time_ids.to(device=device, dtype=torch.long).view(-1)
+        if tids.numel() != batch_size:
+            tids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+
+        tids_f = tids.to(dtype=torch.float32)
+        t_min = tids_f.min()
+        t_max = tids_f.max()
+        span = (t_max - t_min).clamp_min(1.0)
+        time_pos = ((tids_f - t_min) / span).to(dtype=dtype).view(batch_size, 1)
+        q_time = (1.0 - 0.35 * time_pos).clamp(0.35, 1.0)
+
+        centered = (tids_f - tids_f.mean()) / span
+        q_drift = centered.abs().to(dtype=dtype).view(batch_size, 1).clamp(0.0, 1.0)
+        return q_time, q_drift
+
+    def _build_time_gate_features(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
+        if not self.use_time_gate_inputs:
+            return torch.zeros((batch_size, 0), device=device, dtype=dtype)
+
+        if time_ids is None:
+            return torch.zeros((batch_size, 4), device=device, dtype=dtype)
+
+        tids = time_ids.to(device=device, dtype=torch.long).view(-1)
+        if tids.numel() != batch_size:
+            tids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+
+        tids_f = tids.to(dtype=torch.float32)
+        t_min = tids_f.min()
+        t_max = tids_f.max()
+        span = (t_max - t_min).clamp_min(1.0)
+        time_pos = ((tids_f - t_min) / span).to(dtype=dtype)
+        time_recency = time_pos
+        time_mid = tids_f.median()
+        time_is_future = (tids_f > time_mid).to(dtype=dtype)
+        prev = torch.cat([tids_f[:1], tids_f[:-1]], dim=0)
+        time_delta_prev_stage = ((tids_f - prev).abs() / span).clamp(0.0, 1.0).to(dtype=dtype)
+        return torch.stack([time_pos, time_recency, time_is_future, time_delta_prev_stage], dim=-1)
 
     def _compute_branch_uncertainty(self, api_logits, graph_logits, joint_logits):
         p_api = torch.softmax(api_logits.detach(), dim=-1)
@@ -718,6 +775,60 @@ class MalwareModelWithXAttn(nn.Module):
             density[i] = weight.mean().clamp(0.0, 1.0)
         return coverage, density
 
+    def _build_local_alignment_targets(
+        self,
+        node_dense: torch.Tensor,
+        node_key_mask: torch.Tensor,
+        padded_api: torch.Tensor,
+        token_seqs: List[torch.Tensor],
+        xattn_masks,
+        raw_qs: torch.Tensor,
+        q_time: torch.Tensor,
+        q_drift: torch.Tensor,
+        coverage: torch.Tensor | None,
+        density: torch.Tensor | None,
+    ):
+        B, max_nodes, _ = node_dense.shape
+        _, max_tokens, _ = padded_api.shape
+        device = node_dense.device
+        dtype = node_dense.dtype
+
+        local_masks = torch.zeros((B, max_nodes, max_tokens), device=device, dtype=dtype)
+        api_valid = torch.zeros((B, max_tokens), device=device, dtype=torch.bool)
+        for i, ts in enumerate(token_seqs):
+            n_tok = min(int(ts.size(0)), max_tokens)
+            if n_tok > 0:
+                api_valid[i, :n_tok] = True
+
+        for i, m in enumerate(xattn_masks or []):
+            if m is None or m.numel() == 0 or i >= B:
+                continue
+            n_m = min(int(m.size(0)), max_nodes)
+            t_m = min(int(m.size(1)), max_tokens)
+            if n_m <= 0 or t_m <= 0:
+                continue
+            local_masks[i, :n_m, :t_m] = m[:n_m, :t_m].to(device=device, dtype=dtype).clamp(0.0, 1.0)
+
+        local_quality = raw_qs[:, 2].detach().clamp(0.0, 1.0)
+        if coverage is not None:
+            local_quality = local_quality * coverage.detach().view(-1).clamp(0.0, 1.0)
+        if density is not None:
+            local_quality = local_quality * density.detach().view(-1).clamp(0.0, 1.0).sqrt()
+
+        time_weight = q_time.detach().view(-1).clamp(0.0, 1.0)
+        if self.use_drift_reliability:
+            time_weight = time_weight * (1.0 - q_drift.detach().view(-1).clamp(0.0, 1.0))
+
+        return {
+            "local_alignment_node": node_dense,
+            "local_alignment_api": padded_api,
+            "local_alignment_masks": local_masks,
+            "local_alignment_node_valid": node_key_mask,
+            "local_alignment_api_valid": api_valid,
+            "local_alignment_quality": local_quality,
+            "local_alignment_time_weight": time_weight,
+        }
+
     def _select_xattn_nodes(self, node_emb, graph_batch, masks, batch_size: int):
         if (
             node_emb is None
@@ -827,9 +938,18 @@ class MalwareModelWithXAttn(nn.Module):
         raw_qs = self._explicit_qs_to_tensor(explicit_qs, B, device, dtype)
         gate_qs = raw_qs.clone()
 
+        q_time, q_drift = self._build_temporal_reliability(time_ids, B, device, dtype)
+        time_gate_features = self._build_time_gate_features(time_ids, B, device, dtype)
+
+        if self.use_temporal_reliability:
+            gate_qs = torch.cat([gate_qs, q_time], dim=-1)
+        if self.use_drift_reliability:
+            gate_qs = torch.cat([gate_qs, q_drift], dim=-1)
+
         if not self.use_quality_gate_inputs:
             neutral_qs = torch.ones_like(gate_qs)
-            neutral_qs[:, 3:] = 0.0
+            if neutral_qs.size(1) > 3:
+                neutral_qs[:, 3:] = 0.0
             gate_qs = neutral_qs
 
         feat_drop = ArchitectureConstants.FEATURE_DROPOUT
@@ -841,6 +961,11 @@ class MalwareModelWithXAttn(nn.Module):
 
         if time_ids is not None:
             extra["time_ids"] = time_ids
+        extra["q_time"] = q_time.detach().view(B)
+        extra["q_drift"] = q_drift.detach().view(B)
+        if time_gate_features.numel() > 0:
+            extra["time_gate_features"] = time_gate_features.detach()
+            extra["time_recency_signal"] = time_gate_features[:, 1].detach()
 
         alignment_coverage_prior = None
         alignment_density_prior = None
@@ -892,6 +1017,12 @@ class MalwareModelWithXAttn(nn.Module):
             api_align, graph_align = self.build_alignment_features(api_emb, graph_emb)
             if api_align is not None and graph_align is not None:
                 semantic_quality = raw_qs[:, 2].detach().clamp(0.0, 1.0)
+                if self.use_temporal_reliability:
+                    semantic_quality = semantic_quality * q_time.detach().view(-1).clamp(0.0, 1.0)
+                    extra["semantic_alignment_time_gate"] = q_time.detach().view(-1)
+                if self.use_drift_reliability:
+                    semantic_quality = semantic_quality * (1.0 - q_drift.detach().view(-1).clamp(0.0, 1.0))
+                    extra["semantic_alignment_drift_gate"] = (1.0 - q_drift.detach().view(-1).clamp(0.0, 1.0))
                 if alignment_coverage_prior is not None and alignment_density_prior is not None:
                     coverage_gate = alignment_coverage_prior.detach().view(-1).clamp(0.0, 1.0)
                     density_gate = alignment_density_prior.detach().view(-1).clamp(0.0, 1.0).sqrt()
@@ -1017,6 +1148,19 @@ class MalwareModelWithXAttn(nn.Module):
                     if alignment_coverage is not None:
                         extra["alignment_coverage"] = alignment_coverage.view(B).detach()
                         extra["alignment_density"] = alignment_density.view(B).detach()
+                    if self.training and not self.force_disable_alignment:
+                        extra.update(self._build_local_alignment_targets(
+                            node_dense=node_dense,
+                            node_key_mask=node_key_mask,
+                            padded_api=padded_api,
+                            token_seqs=api_token_seqs,
+                            xattn_masks=xattn_masks,
+                            raw_qs=raw_qs,
+                            q_time=q_time,
+                            q_drift=q_drift,
+                            coverage=alignment_coverage,
+                            density=alignment_density,
+                        ))
 
             else:
                 xattn_pooled = torch.zeros_like(api_emb)
@@ -1068,10 +1212,11 @@ class MalwareModelWithXAttn(nn.Module):
             gate_disagreement = torch.zeros_like(gate_disagreement)
             gate_entropy = torch.zeros_like(gate_entropy)
 
-        gate_inputs = torch.cat(
-            [gate_qs, gate_disagreement, gate_entropy, api_alive, graph_alive],
-            dim=-1,
-        )
+        gate_inputs_parts = [gate_qs]
+        if self.use_time_gate_inputs:
+            gate_inputs_parts.append(time_gate_features)
+        gate_inputs_parts.extend([gate_disagreement, gate_entropy, api_alive, graph_alive])
+        gate_inputs = torch.cat(gate_inputs_parts, dim=-1)
 
         if self.gate_mode == "fixed" or self.force_fixed_gate:
             gate_weights = torch.full(

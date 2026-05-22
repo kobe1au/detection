@@ -87,9 +87,89 @@ def _semantic_alignment_loss(
     return loss.mean()
 
 
+def _local_alignment_loss(
+    node_features: torch.Tensor | None,
+    api_features: torch.Tensor | None,
+    alignment_masks: torch.Tensor | None,
+    node_valid: torch.Tensor | None = None,
+    api_valid: torch.Tensor | None = None,
+    quality_weights: torch.Tensor | None = None,
+    time_weights: torch.Tensor | None = None,
+    margin: float = 0.35,
+) -> torch.Tensor:
+    if (
+        node_features is None
+        or api_features is None
+        or alignment_masks is None
+        or node_features.ndim != 3
+        or api_features.ndim != 3
+        or alignment_masks.ndim != 3
+    ):
+        device = (
+            node_features.device
+            if isinstance(node_features, torch.Tensor)
+            else api_features.device
+            if isinstance(api_features, torch.Tensor)
+            else torch.device("cpu")
+        )
+        return torch.tensor(0.0, device=device, dtype=torch.float32)
+
+    if node_features.size(0) == 0 or api_features.size(0) == 0:
+        return node_features.new_tensor(0.0)
+    if node_features.size(0) != api_features.size(0) or node_features.size(0) != alignment_masks.size(0):
+        return node_features.new_tensor(0.0)
+
+    node_z = F.normalize(node_features.float(), dim=-1)
+    api_z = F.normalize(api_features.float(), dim=-1)
+    sim = torch.matmul(node_z, api_z.transpose(1, 2)).clamp(-1.0, 1.0)
+
+    weights = alignment_masks.float().to(sim.device).clamp(0.0, 1.0)
+    if node_valid is not None and isinstance(node_valid, torch.Tensor):
+        nv = node_valid.to(sim.device).float().view(weights.size(0), weights.size(1), 1)
+        weights = weights * nv
+    if api_valid is not None and isinstance(api_valid, torch.Tensor):
+        av = api_valid.to(sim.device).float().view(weights.size(0), 1, weights.size(2))
+        weights = weights * av
+
+    pos_mass = weights.sum(dim=(1, 2))
+    valid_samples = pos_mass > 0
+    if not valid_samples.any():
+        return sim.new_tensor(0.0)
+
+    pos_sim = (sim * weights).sum(dim=(1, 2)) / pos_mass.clamp_min(1e-8)
+
+    neg_mask = 1.0 - (weights > 0).float()
+    if node_valid is not None and isinstance(node_valid, torch.Tensor):
+        neg_mask = neg_mask * node_valid.to(sim.device).float().view(weights.size(0), weights.size(1), 1)
+    if api_valid is not None and isinstance(api_valid, torch.Tensor):
+        neg_mask = neg_mask * api_valid.to(sim.device).float().view(weights.size(0), 1, weights.size(2))
+
+    neg_scores = sim.masked_fill(neg_mask <= 0, -1.0)
+    hardest_neg = neg_scores.amax(dim=(1, 2))
+    hardest_neg = torch.where(hardest_neg > -1.0, hardest_neg, pos_sim.detach().new_zeros(pos_sim.shape))
+
+    per_sample = F.relu(margin + hardest_neg - pos_sim) + (1.0 - pos_sim)
+
+    sample_weight = torch.ones_like(per_sample)
+    if quality_weights is not None:
+        q = quality_weights.float().view(-1).to(per_sample.device).clamp(0.0, 1.0)
+        if q.numel() == per_sample.numel():
+            sample_weight = sample_weight * q.detach()
+    if time_weights is not None:
+        tw = time_weights.float().view(-1).to(per_sample.device).clamp(0.0, 1.0)
+        if tw.numel() == per_sample.numel():
+            sample_weight = sample_weight * tw.detach()
+
+    per_sample = per_sample[valid_samples]
+    sample_weight = sample_weight[valid_samples]
+    sample_weight = sample_weight / sample_weight.mean().clamp_min(1e-8)
+    return (per_sample * sample_weight).mean()
+
+
 def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epochs=1):
     """Aggregate classification, semantic alignment, and branch auxiliary losses."""
     semantic_align_weight = float(loss_cfg["semantic_alignment_weight"])
+    local_alignment_weight = float(loss_cfg.get("local_alignment_weight", 0.0))
     branch_aux_weight = float(loss_cfg["branch_aux_weight"])
 
     loss_cls = criterion(logits, y)
@@ -121,6 +201,23 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             same_class_positive_weight=float(loss_cfg.get("class_aware_alignment_same_class_weight", 0.0)),
         ))
 
+    loss_local_align = zero
+    if (
+        local_alignment_weight != 0.0
+        and extra.get("local_alignment_node") is not None
+        and extra.get("local_alignment_api") is not None
+        and extra.get("local_alignment_masks") is not None
+    ):
+        loss_local_align = _safe(_local_alignment_loss(
+            extra.get("local_alignment_node"),
+            extra.get("local_alignment_api"),
+            extra.get("local_alignment_masks"),
+            extra.get("local_alignment_node_valid"),
+            extra.get("local_alignment_api_valid"),
+            extra.get("local_alignment_quality"),
+            extra.get("local_alignment_time_weight"),
+        ))
+
     loss_branch_aux = zero
     if branch_aux_weight != 0.0:
         aux_losses = []
@@ -137,6 +234,7 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
     total = (
         loss_cls
         + semantic_align_weight * loss_semantic_align
+        + local_alignment_weight * loss_local_align
         + branch_aux_weight * loss_branch_aux
     )
 
@@ -145,13 +243,15 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
 
     extra["loss_components"] = {
         "semantic_align": loss_semantic_align.detach(),
+        "local_align": loss_local_align.detach(),
         "branch_aux": loss_branch_aux.detach(),
         "weighted_semantic_align": (semantic_align_weight * loss_semantic_align).detach(),
+        "weighted_local_align": (local_alignment_weight * loss_local_align).detach(),
         "weighted_branch_aux": (branch_aux_weight * loss_branch_aux).detach(),
     }
 
     return (
         total,
         loss_cls.detach(),
-        loss_semantic_align.detach(),
+        (loss_semantic_align + loss_local_align).detach(),
     )

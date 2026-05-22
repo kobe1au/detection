@@ -1,0 +1,27 @@
+data:
+  out_dir: "experiments/chapter1_temporal_quality"
+
+model:
+  fusion_mode: ours
+  alignment:
+    enabled: true
+    adaptive_bias: true
+    penalty_scale: 0.15
+    bonus_scale: 0.15
+    context_scale: 0.25
+  gate:
+    mode: learned
+    quality_inputs: true
+    uncertainty_inputs: true
+    time_inputs: true
+
+train:
+  exp_name: "ch1_temporal_reliability"
+  warmup_stage_epochs: 2
+
+loss:
+  semantic_alignment_weight: 0.10
+  class_aware_alignment_same_class_weight: 0.20
+  alignment_use_temporal_soft_weight: true
+  stage1_branch_aux_weight: 0.05
+  branch_aux_weight: 0.10

@@ -1,5 +1,0 @@
-model:
-  fusion_mode: api
-
-train:
-  exp_name: baseline_api_only_2024

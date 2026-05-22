@@ -1,8 +1,0 @@
-model:
-  fusion_mode: concat
-
-train:
-  exp_name: continual_b0_zero_adapt_concat
-  epochs: 60
-  historical_epochs: 60
-  adaptation_epochs: 0

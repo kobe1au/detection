@@ -1,5 +1,0 @@
-model:
-  fusion_mode: concat
-
-train:
-  exp_name: baseline_concat_erm_2024
