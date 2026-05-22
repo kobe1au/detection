@@ -90,10 +90,3 @@ loss:
 
   stage1_branch_aux_weight: 0.0
   branch_aux_weight: 0.0
-
-  gate_oracle_weight: 0.0
-  gate_oracle_temperature: 0.5
-  gate_oracle_smoothing: 0.0
-  gate_oracle_start_epoch: 0
-  gate_oracle_start_phase: null
-  gate_oracle_adaptation_only: false
