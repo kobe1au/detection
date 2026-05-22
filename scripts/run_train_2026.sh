@@ -72,7 +72,6 @@ I3_FUSION=(
   "config/train_2026/i3_fusion/02_quality_gate.yaml"
   "config/train_2026/i3_fusion/03_uncertainty_gate.yaml"
   "config/train_2026/i3_fusion/04_quality_uncertainty_gate.yaml"
-  "config/train_2026/i3_fusion/05_pseudo_oracle_gate.yaml"
 )
 
 run_group() {
