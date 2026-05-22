@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """Run only the adaptation phase from a shared historical checkpoint.
 
-This entrypoint is intended for I1 replay/ratio ablations where the first
-historical training phase is identical across variants. It keeps the default
-`fusion.train` path unchanged, while allowing commands such as:
+This entrypoint is for I1 replay/ratio ablations where all variants share the
+same historical 2018-2021 checkpoint. It leaves `python -m fusion.train`
+unchanged and supports either a CLI checkpoint or warm-start keys in the
+override YAML:
 
-python -m fusion.train_adapt_from_ckpt \
-  --base config/base.yaml \
-  --override config/train_2026/i1_adaptation/03_adapt_020_dynamic_replay.yaml \
-  --historical-ckpt experiments/i1_zero_adapt_concat/42/best_i1_zero_adapt_concat.pt
+train:
+  warm_start_historical_ckpt: experiments/i1_zero_adapt_concat/42/best_i1_zero_adapt_concat.pt
+  start_phase: adaptation
 """
 
 from __future__ import annotations
@@ -22,11 +22,8 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import yaml
-from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader
 
-from fusion.calibration import TemperatureScaling
 from fusion.constants import TrainingConstants
 from fusion.mm_dataset import MultiModalMalwareDataset, hierarchical_collate_fn
 from fusion.model import MalwareModelWithXAttn
@@ -35,6 +32,7 @@ from fusion.train import (
     _binary_detection_metrics,
     _build_continual_adaptation_loader,
     _stage_loss_cfg,
+    append_metrics_csv,
     build_global_domain_years,
     build_grad_scaler,
     build_year_subset_loaders,
@@ -46,7 +44,6 @@ from fusion.train import (
     init_metrics_csv,
     load_yaml_file,
     preflight_validate_protocol,
-    prepare_batch,
     resolve_path,
     save_checkpoint,
     save_config_snapshot,
@@ -58,10 +55,10 @@ from fusion.train import (
     validate_full_config,
     WarmupCosineScheduler,
 )
+from fusion.calibration import TemperatureScaling
 
 
 def _strip_warm_start_keys(cfg: dict) -> tuple[dict, dict]:
-    """Return a schema-compatible cfg plus warm-start-only train keys."""
     cfg_for_validation = copy.deepcopy(cfg)
     train_cfg = cfg_for_validation.setdefault("train", {})
     warm_keys = {}
@@ -85,15 +82,28 @@ def _build_optimizer_scheduler(model, train_cfg: dict, remaining_epochs: int):
     return opt, WarmupCosineScheduler(opt, warmup, after)
 
 
-def _load_state_dict(path: str, model, device, logger):
+def _load_ckpt(path: str, model, device, logger):
     if not path:
-        raise ValueError("A historical checkpoint path is required for adaptation-only training")
+        raise ValueError("historical checkpoint is required")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Historical checkpoint not found: {path}")
     state = torch.load(path, map_location=device, weights_only=False)
-    state_dict = state.get("state_dict", state)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state.get("state_dict", state))
     logger.info(f"Loaded shared historical checkpoint: {path}")
+
+
+def _make_dataset(c_data, fusion_mode, need_alignment_mask, domain_years, drop_hints, csv_path, pt_dir, is_train, data_root):
+    return MultiModalMalwareDataset(
+        pt_dir=resolve_path(data_root, pt_dir) if not os.path.isabs(str(pt_dir)) else str(pt_dir),
+        csv_path=csv_path,
+        is_train=is_train,
+        robust_aug=False,
+        max_api_events_per_sample=c_data["max_api_events_per_sample"],
+        fusion_mode=fusion_mode,
+        need_alignment_mask=need_alignment_mask,
+        domain_years=domain_years,
+        drop_graph_behavior_hints=drop_hints,
+    )
 
 
 def main():
@@ -107,35 +117,27 @@ def main():
     cfg_for_validation, warm_keys = _strip_warm_start_keys(raw_cfg)
     cfg = validate_full_config(cfg_for_validation)
 
-    c_data = cfg["data"]
-    c_model = cfg["model"]
-    c_train = cfg["train"]
-    c_loss = cfg["loss"]
-
+    c_data, c_model, c_train, c_loss = cfg["data"], cfg["model"], cfg["train"], cfg["loss"]
     warm_ckpt = args.historical_ckpt or str(warm_keys.get("warm_start_historical_ckpt") or "")
     start_phase = str(warm_keys.get("start_phase") or "adaptation").lower()
     if start_phase != "adaptation":
         raise ValueError("train_adapt_from_ckpt only supports start_phase=adaptation")
     if not c_data.get("adapt_csv"):
         raise ValueError("adaptation-only training requires data.adapt_csv")
-    if int(c_train.get("adaptation_epochs", 0)) <= 0:
-        raise ValueError("adaptation-only training requires train.adaptation_epochs > 0")
 
     data_root = os.getenv("DATA_ROOT", "")
     set_seed(int(c_train["seed"]))
+    device = select_device(c_train["device"])
+    use_amp = bool(c_train["use_amp"]) and device.type == "cuda"
 
     out_dir = resolve_path(data_root, c_data["out_dir"])
     exp_name = str(c_train["exp_name"])
     ckpt_dir = os.path.join(out_dir, exp_name, str(c_train["seed"]))
     os.makedirs(ckpt_dir, exist_ok=True)
-
     logger = setup_logger(os.path.join(ckpt_dir, "adapt_from_ckpt.log"))
     csv_path = os.path.join(ckpt_dir, "metrics_adapt_from_ckpt.csv")
     init_metrics_csv(csv_path)
     save_config_snapshot(raw_cfg, os.path.join(ckpt_dir, "config_adapt_from_ckpt.yaml"))
-
-    device = select_device(c_train["device"])
-    use_amp = bool(c_train["use_amp"]) and device.type == "cuda"
 
     fusion_mode = str(c_model["fusion_mode"])
     c_api = c_model["api_encoder"]
@@ -143,72 +145,26 @@ def main():
     c_alignment = c_model["alignment"]
     c_gate = c_model["gate"]
     need_alignment_mask = fusion_mode == "ours" and bool(c_alignment["enabled"])
-    drop_graph_behavior_hints = bool(c_graph["drop_extracted_behavior_hints"])
+    drop_hints = bool(c_graph["drop_extracted_behavior_hints"])
 
-    train_csv_path = resolve_path(data_root, c_data["train_csv"])
-    adapt_csv_path = resolve_path(data_root, c_data["adapt_csv"])
-    val_csv_path = resolve_path(data_root, c_data["val_csv"])
-    test_csv_path = resolve_path(data_root, c_data["test_csv"])
-    extra_test_specs = c_data.get("extra_tests", []) or []
-    extra_test_csv_paths = [resolve_path(data_root, spec["test_csv"]) for spec in extra_test_specs]
+    train_csv = resolve_path(data_root, c_data["train_csv"])
+    adapt_csv = resolve_path(data_root, c_data["adapt_csv"])
+    val_csv = resolve_path(data_root, c_data["val_csv"])
+    test_csv = resolve_path(data_root, c_data["test_csv"])
+    extra_test_csvs = [resolve_path(data_root, spec["test_csv"]) for spec in (c_data.get("extra_tests", []) or [])]
 
-    preflight_validate_protocol(
-        cfg,
-        train_csv_path,
-        adapt_csv_path,
-        val_csv_path,
-        test_csv_path,
-        extra_test_csv_paths,
-    )
-    domain_years = build_global_domain_years(
-        train_csv_path,
-        adapt_csv_path,
-        val_csv_path,
-        test_csv_path,
-        *extra_test_csv_paths,
-    )
+    preflight_validate_protocol(cfg, train_csv, adapt_csv, val_csv, test_csv, extra_test_csvs)
+    domain_years = build_global_domain_years(train_csv, adapt_csv, val_csv, test_csv, *extra_test_csvs)
 
-    ds_tr = MultiModalMalwareDataset(
-        pt_dir=resolve_path(data_root, c_data["train_pt_dir"]),
-        csv_path=train_csv_path,
-        is_train=True,
-        robust_aug=False,
-        max_api_events_per_sample=c_data["max_api_events_per_sample"],
-        fusion_mode=fusion_mode,
-        need_alignment_mask=need_alignment_mask,
-        domain_years=domain_years,
-        drop_graph_behavior_hints=drop_graph_behavior_hints,
-    )
-    ds_adapt = MultiModalMalwareDataset(
-        pt_dir=resolve_path("", c_data.get("adapt_pt_dir") or c_data["train_pt_dir"]),
-        csv_path=adapt_csv_path,
-        is_train=True,
-        robust_aug=False,
-        max_api_events_per_sample=c_data["max_api_events_per_sample"],
-        fusion_mode=fusion_mode,
-        need_alignment_mask=need_alignment_mask,
-        domain_years=domain_years,
-        drop_graph_behavior_hints=drop_graph_behavior_hints,
-    )
-    ds_val = MultiModalMalwareDataset(
-        pt_dir=resolve_path(data_root, c_data["val_pt_dir"]),
-        csv_path=val_csv_path,
-        is_train=False,
-        robust_aug=False,
-        max_api_events_per_sample=c_data["max_api_events_per_sample"],
-        fusion_mode=fusion_mode,
-        need_alignment_mask=need_alignment_mask,
-        domain_years=domain_years,
-        drop_graph_behavior_hints=drop_graph_behavior_hints,
-    )
+    ds_tr = _make_dataset(c_data, fusion_mode, need_alignment_mask, domain_years, drop_hints, train_csv, c_data["train_pt_dir"], True, data_root)
+    ds_adapt = _make_dataset(c_data, fusion_mode, need_alignment_mask, domain_years, drop_hints, adapt_csv, c_data.get("adapt_pt_dir") or c_data["train_pt_dir"], True, "")
+    ds_val = _make_dataset(c_data, fusion_mode, need_alignment_mask, domain_years, drop_hints, val_csv, c_data["val_pt_dir"], False, data_root)
 
-    graph_in_feat_dim = int(getattr(ds_tr, "feature_dim", TrainingConstants.IN_FEAT_DIM))
-    if getattr(ds_adapt, "feature_dim", graph_in_feat_dim) != graph_in_feat_dim:
-        raise ValueError("Historical/adaptation graph feature dimensions do not match")
-    if getattr(ds_val, "feature_dim", graph_in_feat_dim) != graph_in_feat_dim:
-        raise ValueError("Historical/validation graph feature dimensions do not match")
+    graph_dim = int(getattr(ds_tr, "feature_dim", TrainingConstants.IN_FEAT_DIM))
+    for name, ds in (("adapt", ds_adapt), ("val", ds_val)):
+        if int(getattr(ds, "feature_dim", graph_dim)) != graph_dim:
+            raise ValueError(f"Historical/{name} graph feature dimensions do not match")
 
-    c_model["in_feat_dim"] = graph_in_feat_dim
     model = MalwareModelWithXAttn(
         num_classes=int(c_model["num_classes"]),
         api_emb_dim=TrainingConstants.API_EMB_DIM,
@@ -216,7 +172,7 @@ def main():
         align_dim=TrainingConstants.ALIGN_DIM,
         max_nodes_gnn=int(c_model["max_nodes_gnn"]),
         max_xattn_nodes=int(c_model["max_xattn_nodes"]),
-        in_feat_dim=graph_in_feat_dim,
+        in_feat_dim=graph_dim,
         xattn_heads=TrainingConstants.XATTN_HEADS,
         fusion_mode=fusion_mode,
         graph_encoder_type=str(c_graph["type"]),
@@ -242,37 +198,23 @@ def main():
         late_fusion_api_weight=0.5,
     ).to(device)
     save_run_metadata(os.path.join(ckpt_dir, "run_metadata_adapt_from_ckpt.yaml"), cfg, model)
-    _load_state_dict(warm_ckpt, model, device, logger)
+    _load_ckpt(warm_ckpt, model, device, logger)
 
-    pin_memory_requested = bool(c_train["pin_memory"])
-    pin_memory_enabled = pin_memory_requested and not need_alignment_mask
+    pin_memory = bool(c_train["pin_memory"]) and not need_alignment_mask
     loader_base = dict(
         num_workers=int(c_train["num_workers"]),
         collate_fn=hierarchical_collate_fn,
-        pin_memory=pin_memory_enabled,
+        pin_memory=pin_memory,
         persistent_workers=bool(c_train["persistent_workers"]),
     )
     if int(c_train["num_workers"]) > 0:
         loader_base["prefetch_factor"] = int(c_train["prefetch_factor"])
 
-    train_lk = {**loader_base}
-    val_lk = {**loader_base}
     dl_adapt, n_adapt, n_replay = _build_continual_adaptation_loader(
-        ds_tr,
-        ds_adapt,
-        cfg,
-        int(c_train["batch_size"]),
-        train_lk,
+        ds_tr, ds_adapt, cfg, int(c_train["batch_size"]), dict(loader_base)
     )
-    dl_val = DataLoader(ds_val, batch_size=int(c_train["eval_batch_size"]), shuffle=False, **val_lk)
-    val_year_loaders = build_year_subset_loaders(ds_val, int(c_train["eval_batch_size"]), val_lk)
-
-    logger.info(
-        "Adaptation-only run | "
-        f"ckpt={warm_ckpt} adapt_samples_per_epoch={n_adapt} replay_samples_per_epoch={n_replay} "
-        f"adapt_ratio={float(c_train.get('adaptation_ratio', 1.0)):.3f} "
-        f"replay_ratio={float(c_train.get('replay_ratio', 0.25)):.3f}"
-    )
+    dl_val = DataLoader(ds_val, batch_size=int(c_train["eval_batch_size"]), shuffle=False, **loader_base)
+    val_year_loaders = build_year_subset_loaders(ds_val, int(c_train["eval_batch_size"]), dict(loader_base))
 
     adaptation_epochs = int(c_train["adaptation_epochs"])
     historical_epochs = int(c_train.get("historical_epochs", 0))
@@ -285,55 +227,37 @@ def main():
     min_delta = float(c_train["min_delta"])
     best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
 
+    logger.info(
+        "Adaptation-only run | "
+        f"ckpt={warm_ckpt} adapt_samples_per_epoch={n_adapt} replay_samples_per_epoch={n_replay} "
+        f"adapt_ratio={float(c_train.get('adaptation_ratio', 1.0)):.3f} "
+        f"replay_ratio={float(c_train.get('replay_ratio', 0.25)):.3f}"
+    )
+
     for local_epoch in range(1, adaptation_epochs + 1):
         epoch = historical_epochs + local_epoch
         sampler = getattr(dl_adapt, "sampler", None)
         if hasattr(sampler, "set_epoch"):
             sampler.set_epoch(epoch)
 
-        epoch_loss_cfg = _stage_loss_cfg(c_loss, "main")
-        epoch_loss_cfg["_continual_phase"] = "adaptation"
-
+        loss_cfg = _stage_loss_cfg(c_loss, "main")
+        loss_cfg["_continual_phase"] = "adaptation"
         tr = train_one_epoch(
-            model,
-            dl_adapt,
-            optimizer,
-            scaler,
-            criterion,
-            device,
-            epoch,
-            historical_epochs + adaptation_epochs,
-            loss_cfg=epoch_loss_cfg,
-            logger=logger,
-            use_amp=use_amp,
-            grad_accum_steps=int(c_train["grad_accum_steps"]),
+            model, dl_adapt, optimizer, scaler, criterion, device, epoch,
+            historical_epochs + adaptation_epochs, loss_cfg=loss_cfg, logger=logger,
+            use_amp=use_amp, grad_accum_steps=int(c_train["grad_accum_steps"])
         )
         val = eval_one_epoch(
-            model,
-            dl_val,
-            criterion,
-            device,
-            epoch,
+            model, dl_val, criterion, device, epoch,
             num_epochs=historical_epochs + adaptation_epochs,
-            use_amp=use_amp,
-            logger=logger,
-            strict=True,
-            phase="val",
+            use_amp=use_amp, logger=logger, strict=True, phase="val"
         )
-
         selection_score, latest_f1, worst_f1, aut_f1 = val[2], val[2], val[2], val[2]
         if val_year_loaders:
             ym = evaluate_temporal_windows(
-                model,
-                val_year_loaders,
-                criterion,
-                device,
-                epoch,
-                historical_epochs + adaptation_epochs,
-                use_amp=use_amp,
-                logger=logger,
-                tag="val",
-                strict=True,
+                model, val_year_loaders, criterion, device, epoch,
+                historical_epochs + adaptation_epochs, use_amp=use_amp,
+                logger=logger, tag="val", strict=True,
             )
             selection_score, latest_f1, worst_f1, aut_f1 = compute_temporal_selection_score(ym)
 
@@ -344,39 +268,21 @@ def main():
             save_checkpoint(best_p, epoch, model, optimizer, scheduler, scaler, best_score, no_improve, cfg)
         else:
             no_improve += 1
-
-        save_checkpoint(
-            os.path.join(ckpt_dir, f"last_{exp_name}.pt"),
-            epoch,
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            best_score,
-            no_improve,
-            cfg,
-        )
+        save_checkpoint(os.path.join(ckpt_dir, f"last_{exp_name}.pt"), epoch, model, optimizer, scheduler, scaler, best_score, no_improve, cfg)
 
         append_metrics_csv(csv_path, dict(
-            epoch=epoch,
-            stage="main",
-            continual_phase="adaptation",
-            train_loss=tr[0], train_f1=tr[1], train_acc=tr[2],
-            train_cls=tr[3], train_alignment=tr[4], train_branch_aux=tr[5], train_gate_oracle=0.0,
+            epoch=epoch, stage="main", continual_phase="adaptation",
+            train_loss=tr[0], train_f1=tr[1], train_acc=tr[2], train_cls=tr[3],
+            train_alignment=tr[4], train_branch_aux=tr[5], train_gate_oracle=0.0,
             train_uncertainty=tr[7], train_gate_disagreement=tr[8], train_gate_entropy=tr[9],
             train_gate_api=tr[10], train_gate_graph=tr[11], train_gate_joint=tr[12],
             val_loss=val[0], val_cls_loss=val[1], val_f1=val[2], val_acc=val[3],
             val_softmax_aurc=val[4], val_softmax_eaurc=val[5],
             val_gate_api=val[6], val_gate_graph=val[7], val_gate_joint=val[8],
             val_uncertainty=val[9], val_gate_disagreement=val[10], val_gate_entropy=val[11],
-            lr=optimizer.param_groups[0]["lr"],
-            best_score=best_score,
-            is_best=int(improved),
-            no_improve=no_improve,
-            selection_score=selection_score,
-            latest_f1=latest_f1,
-            worst_f1=worst_f1,
-            aut_f1=aut_f1,
+            lr=optimizer.param_groups[0]["lr"], best_score=best_score, is_best=int(improved),
+            no_improve=no_improve, selection_score=selection_score, latest_f1=latest_f1,
+            worst_f1=worst_f1, aut_f1=aut_f1,
         ))
         scheduler.step()
         if no_improve >= patience:
@@ -386,54 +292,24 @@ def main():
     if os.path.exists(best_p):
         model.load_state_dict(torch.load(best_p, map_location=device, weights_only=False)["state_dict"])
 
-    test_pt = resolve_path("", c_data["test_pt_dir"])
-    ds_test = MultiModalMalwareDataset(
-        pt_dir=test_pt,
-        csv_path=test_csv_path,
-        is_train=False,
-        robust_aug=False,
-        max_api_events_per_sample=c_data["max_api_events_per_sample"],
-        fusion_mode=fusion_mode,
-        need_alignment_mask=need_alignment_mask,
-        domain_years=domain_years,
-        drop_graph_behavior_hints=drop_graph_behavior_hints,
-    )
-    test_lk = dict(val_lk)
+    ds_test = _make_dataset(c_data, fusion_mode, need_alignment_mask, domain_years, drop_hints, test_csv, c_data["test_pt_dir"], False, "")
+    test_lk = dict(loader_base)
     test_lk["pin_memory"] = False
     test_lk["persistent_workers"] = False
     dl_test = DataLoader(ds_test, batch_size=int(c_train["eval_batch_size"]), shuffle=False, **test_lk)
     test_dump_path = os.path.join(ckpt_dir, "eval_dumps", f"eval_dump_{exp_name}_test.csv")
     test = eval_one_epoch(
-        model,
-        dl_test,
-        criterion,
-        device,
-        epoch=0,
-        num_epochs=1,
-        use_amp=use_amp,
-        logger=logger,
-        dump_path=test_dump_path,
-        strict=True,
-        phase="test",
+        model, dl_test, criterion, device, epoch=0, num_epochs=1,
+        use_amp=use_amp, logger=logger, dump_path=test_dump_path, strict=True, phase="test"
     )
 
     calibrator = TemperatureScaling().to(device)
     calibrator.fit(model, dl_val, device, max_iter=50, lr=0.01, use_amp=use_amp, strict=True)
-    test_probs, test_labels = collect_calibrated_outputs(
-        model,
-        calibrator,
-        dl_test,
-        device,
-        use_amp,
-        strict=True,
-        phase="test_calibrated",
-    )
+    test_probs, test_labels = collect_calibrated_outputs(model, calibrator, dl_test, device, use_amp, strict=True, phase="test_calibrated")
     test_preds = test_probs.argmax(axis=1)
     det_metrics = _binary_detection_metrics(test_labels, test_probs, test_preds)
     test_conf = test_probs.max(axis=1)
     test_correct = (test_preds == test_labels).astype(np.float64)
-    cal_softmax_aurc = float(aurc(test_conf, test_correct))
-    cal_softmax_eaurc = float(eaurc(test_conf, test_correct))
 
     final_metrics_path = os.path.join(ckpt_dir, f"final_metrics_{exp_name}.csv")
     with open(final_metrics_path, "w", newline="", encoding="utf-8") as f:
@@ -455,8 +331,8 @@ def main():
             "auprc": f"{det_metrics['auprc']:.6f}",
             "raw_softmax_aurc": f"{test[4]:.6f}",
             "raw_softmax_eaurc": f"{test[5]:.6f}",
-            "cal_softmax_aurc": f"{cal_softmax_aurc:.6f}",
-            "cal_softmax_eaurc": f"{cal_softmax_eaurc:.6f}",
+            "cal_softmax_aurc": f"{float(aurc(test_conf, test_correct)):.6f}",
+            "cal_softmax_eaurc": f"{float(eaurc(test_conf, test_correct)):.6f}",
             "gate_api": f"{test[6]:.6f}",
             "gate_graph": f"{test[7]:.6f}",
             "gate_joint": f"{test[8]:.6f}",
