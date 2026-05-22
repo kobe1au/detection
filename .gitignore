@@ -52,7 +52,7 @@ checkpoints/
 runs/
 wandb/
 mlruns/
-experiments/
+/experiments/
 
 # Dataset / generated feature files
 pts/

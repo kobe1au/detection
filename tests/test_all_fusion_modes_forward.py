@@ -63,6 +63,8 @@ class AllFusionModesForwardTest(unittest.TestCase):
             use_time_gate_inputs=True,
             use_temporal_reliability=True,
             use_drift_reliability=True,
+            num_time_domains=4,
+            historical_time_id_max=1,
         )
         model.eval()
         logits, extra = model(
@@ -80,6 +82,30 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertEqual(tuple(extra["q_drift"].shape), (2,))
         self.assertEqual(tuple(extra["time_gate_features"].shape), (2, 4))
         self.assertEqual(tuple(extra["gate_weights"].shape), (2, 3))
+
+    def test_temporal_features_are_batch_invariant(self):
+        model = make_model(
+            "ours",
+            use_time_gate_inputs=True,
+            use_temporal_reliability=True,
+            use_drift_reliability=True,
+            num_time_domains=5,
+            historical_time_id_max=2,
+        )
+        q_time_single, q_drift_single = model._build_temporal_reliability(
+            torch.tensor([3], dtype=torch.long),
+            1,
+            torch.device("cpu"),
+            torch.float32,
+        )
+        q_time_mixed, q_drift_mixed = model._build_temporal_reliability(
+            torch.tensor([0, 3, 4], dtype=torch.long),
+            3,
+            torch.device("cpu"),
+            torch.float32,
+        )
+        self.assertTrue(torch.allclose(q_time_single.view(-1), q_time_mixed[1].view(-1)))
+        self.assertTrue(torch.allclose(q_drift_single.view(-1), q_drift_mixed[1].view(-1)))
 
 
 if __name__ == "__main__":

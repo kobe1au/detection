@@ -1,6 +1,7 @@
 # 2026 main experiment base config.
-# Protocol: 2018-2021 historical train / 2022 validation / 2024 final test.
-# Continual configs explicitly set 2023 as the recent-year adaptation pool.
+# Default protocol: 2018-2021 historical train / 2022 validation /
+# 2023 recent adaptation / 2024 final test.
+# Override YAMLs should only state experimental deltas.
 
 data:
   out_dir: "experiments"
@@ -10,8 +11,8 @@ data:
   test_pt_dir: "pts/test"
 
   train_csv: "results/labels/train.csv"
-  adapt_pt_dir: null
-  adapt_csv: null
+  adapt_pt_dir: "pts/adapt"
+  adapt_csv: "results/labels/adapt_2023.csv"
   val_csv: "results/labels/val.csv"
   test_csv: "results/labels/test_2024.csv"
   extra_tests: []
@@ -20,7 +21,7 @@ data:
 
 model:
   num_classes: 2
-  fusion_mode: concat
+  fusion_mode: ours
   max_nodes_gnn: 12288
   max_xattn_nodes: 1024
 
@@ -41,28 +42,28 @@ model:
     drop_extracted_behavior_hints: true
 
   alignment:
-    enabled: false
-    adaptive_bias: false
-    penalty_scale: 0.0
-    bonus_scale: 0.0
-    context_scale: 0.0
+    enabled: true
+    adaptive_bias: true
+    penalty_scale: 0.30
+    bonus_scale: 0.80
+    context_scale: 0.25
 
   gate:
-    mode: fixed
-    quality_inputs: false
-    uncertainty_inputs: false
-    time_inputs: false
+    mode: learned
+    quality_inputs: true
+    uncertainty_inputs: true
+    time_inputs: true
     time_feature_set: basic
     detach: true
 
 train:
-  exp_name: base_concat_erm
+  exp_name: base_full_dbta020
   warm_start_historical_ckpt: ""
   seed: 42
   device: auto
   use_amp: true
 
-  epochs: 60
+  epochs: 80
   batch_size: 32
   eval_batch_size: 32
   grad_accum_steps: 1
@@ -75,13 +76,13 @@ train:
   lr: 0.0003
   weight_decay: 0.01
   warmup_epochs: 3
-  warmup_stage_epochs: 0
+  warmup_stage_epochs: 3
   historical_epochs: 60
-  adaptation_epochs: 0
-  adaptation_ratio: 1.0
+  adaptation_epochs: 20
+  adaptation_ratio: 0.20
   replay_ratio: 0.25
-  replay_strategy: static
-  adaptation_selection: random
+  replay_strategy: drift_matched
+  adaptation_selection: dbta
   dbta_balance: predicted_label
   dbta_uncertainty_weight: 1.0
   dbta_disagreement_weight: 1.0
@@ -93,13 +94,15 @@ train:
   min_delta: 0.0001
 
 loss:
-  semantic_alignment_weight: 0.0
-  class_aware_alignment_same_class_weight: 0.0
+  semantic_alignment_weight: 0.05
+  class_aware_alignment_same_class_weight: 0.20
   class_aware_alignment_temperature: 0.2
-  local_alignment_weight: 0.0
+  local_alignment_weight: 0.02
+  max_local_align_nodes: 128
+  max_local_align_tokens: 256
   alignment_use_temporal_soft_weight: false
-  alignment_use_temporal_reliability: false
-  alignment_use_drift_reliability: false
+  alignment_use_temporal_reliability: true
+  alignment_use_drift_reliability: true
 
-  stage1_branch_aux_weight: 0.0
-  branch_aux_weight: 0.0
+  stage1_branch_aux_weight: 0.10
+  branch_aux_weight: 0.10

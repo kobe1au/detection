@@ -1,5 +1,0 @@
-data:
-  out_dir: "experiments/chapter1_temporal_quality"
-
-train:
-  exp_name: "ch1_baseline_erm"

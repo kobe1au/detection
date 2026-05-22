@@ -4,26 +4,35 @@ set -euo pipefail
 STAGE="${1:-all}"
 
 case "${STAGE}" in
-  temporal|t1)
+  temporal|t1|i1|adaptation|dbta)
     exec bash scripts/run_train_2026.sh i1
     ;;
-  align|t2)
+  replay|memory)
+    exec bash scripts/run_train_2026.sh replay
+    ;;
+  align|alignment|t2|i2)
     exec bash scripts/run_train_2026.sh i2
     ;;
-  gate|t3)
+  gate|fusion|t3|i3)
     exec bash scripts/run_train_2026.sh i3
     ;;
   baseline|base|baselines|cmp)
     exec bash scripts/run_train_2026.sh baselines
     ;;
-  final)
-    exec bash scripts/run_train_2026.sh final
+  sweep|ratio|ratios)
+    exec bash scripts/run_train_2026.sh ratio
+    ;;
+  final|full)
+    exec bash scripts/run_train_2026.sh full
+    ;;
+  main|chain|story)
+    exec bash scripts/run_train_2026.sh main
     ;;
   all)
     exec bash scripts/run_train_2026.sh all
     ;;
   *)
-    echo "Usage: $0 [temporal|align|gate|baseline|baselines|cmp|final|all]"
+    echo "Usage: $0 [all|baselines|i1|replay|i2|i3|ratio|full|main]"
     exit 1
     ;;
 esac

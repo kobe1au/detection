@@ -1,99 +1,55 @@
-# 2026 实验计划：base + override
+# 2026 实验计划：base + generated overrides
 
-所有实验使用同一个 base：
+所有实验共享 `config/base.yaml`。base 默认就是 full DBTA020 continual 协议；override 只写相对 base 的关键差异。差异配置由 `scripts/make_ablation_configs.py` 生成到 `config/experiments/**.yaml`，入口清单是 `config/experiments/_manifest.yaml`。
 
-```text
-config/base.yaml
-```
+当前协议要写清楚：2018-2021 作为 historical train，2022 validation，2023 只作为 recent adaptation pool，2024 final test。不要再把 2023 写成 final test，否则读者会质疑 adaptation/test 泄漏。
 
-base 只保留数据路径、模型默认值和训练超参。实验差异全部放在 `config/train_2026/**.yaml` override 中。
+## 分组
 
-## 数据划分
+| 组 | 数量 | 目的 |
+|---|---:|---|
+| `baselines` | 5 | API、Graph、Concat、Late Fusion、Cross Attention 的 historical ERM 对照 |
+| `i1` | 8 | 在 concat 上隔离 DBTA selection、replay、adaptation budget |
+| `replay` | 4 | 固定 full model + DBTA 20%，比较 no/static/dynamic/drift-matched replay |
+| `i2` | 5 | 固定 I1，固定 gate，拆解 semantic、class-aware、method-bias、local alignment |
+| `i3` | 6 | 固定 I1+I2，拆解 fixed/learned gate、quality、uncertainty、time-drift 输入 |
+| `ratio` / `full` | 5 | full model 的 0%、5%、10%、20%、100% recent adaptation budget |
+| `main` | 5 | 最短论文主线：concat ERM -> I1 -> I1+I2 -> full -> random100 static stress test |
 
-主实验使用：
+## 主线
 
-```text
-Train: 2018-2021
-Val:   2022
-Test:  2023
-Test:  2024
-Test:  2023-2024 combined
-```
-
-训练时仍使用 `test.csv` 汇总测试集，训练日志会额外输出 per-year AUT。
-
-## I1：跨年份-标签-子簇原型演化时间底座
-
-| ID | YAML | 设置 | 目的 |
-|---|---|---|---|
-| I1-0 | `config/train_2026/i1_temporal/00_erm_concat.yaml` | 无时间约束 | 时间漂移基线 |
-| I1-1 | `config/train_2026/i1_temporal/01_proto_current.yaml` | 当前 year-label-cluster 原型 | 验证跨 batch 多子簇原型记忆 |
-| I1-2 | `config/train_2026/i1_temporal/02_proto_current_010.yaml` | 当前原型权重 0.10 | 验证权重敏感性 |
-| I1-3 | `config/train_2026/i1_temporal/03_proto_future_weak.yaml` | 当前 + 未来原型 | 验证原型演化约束 |
-| I1-4 | `config/train_2026/i1_temporal/04_ours_fixed_scaffold_erm.yaml` | ours fixed，无时间约束 | 控制最终骨架变量 |
-| I1-5 | `config/train_2026/i1_temporal/05_ours_fixed_proto_trajectory.yaml` | ours fixed + 当前/未来原型 | 验证时间底座可迁移到最终骨架 |
-
-重点看 `train_proto_current`、`train_proto_future`、`latest_F1`、`worst_F1`、`AUT_F1`。
-
-## I2：时间引导的 API-Graph 语义对齐
-
-I2 固定使用 I1 的时间底座，且 gate 使用 fixed average，避免门控影响对齐模块归因。
-
-| ID | YAML | 设置 | 目的 |
-|---|---|---|---|
-| I2-0 | `config/train_2026/i2_alignment/00_temporal_concat.yaml` | concat | 无结构交互基线 |
-| I2-1 | `config/train_2026/i2_alignment/01_cross_attention.yaml` | 普通 cross-attention | 验证跨模态注意力 |
-| I2-2 | `config/train_2026/i2_alignment/02_ours_fixed_no_alignment.yaml` | ours fixed，无 alignment/semantic loss | 控制 ours 骨架变量 |
-| I2-3 | `config/train_2026/i2_alignment/03_semantic_alignment.yaml` | semantic loss only | 验证全局语义对齐损失 |
-| I2-4 | `config/train_2026/i2_alignment/04_method_aware_context.yaml` | method-aware bias/context only | 验证结构先验 |
-| I2-5 | `config/train_2026/i2_alignment/05_temporal_guided_alignment.yaml` | drift-guided bias/context + semantic loss | 验证完整 I2 |
-
-重点看 `train_alignment`、`alignment_coverage`、`alignment_density`、`alignment_temporal_drift` 和按年份 F1。
-
-## I3：漂移感知可靠性门控
-
-I3 固定使用完整 I1 + I2。
-
-| ID | YAML | gate.mode | 质量信号 | 漂移信号 | 目的 |
-|---|---|---|---|---|---|
-| I3-0 | `config/train_2026/i3_fusion/00_fixed_no_gate.yaml` | fixed | 0 | 0 | 真正无 learned gate |
-| I3-1 | `config/train_2026/i3_fusion/01_learned_gate_no_reliability.yaml` | learned | 0 | 0 | 只验证 learned gate 结构 |
-| I3-2 | `config/train_2026/i3_fusion/02_quality_gate.yaml` | learned | 1 | 0 | 只验证质量感知 |
-| I3-3 | `config/train_2026/i3_fusion/03_drift_gate.yaml` | learned | 0 | 1 | 只验证漂移感知 |
-| I3-4 | `config/train_2026/i3_fusion/04_quality_drift_gate.yaml` | learned | 1 | 1 | 完整可靠性门控 |
-
-重点看 `train_gate_api`、`train_gate_graph`、`train_gate_joint` 是否随年份、漂移和模态质量变化。
-
-## Baselines
-
-| ID | YAML | 类型 |
+| ID | YAML | 解释 |
 |---|---|---|
-| B0 | `config/train_2026/baselines/00_api_only.yaml` | API 单模态 |
-| B1 | `config/train_2026/baselines/01_graph_only.yaml` | Graph 单模态 |
-| B2 | `config/train_2026/baselines/02_concat_erm.yaml` | concat ERM |
-| B3 | `config/train_2026/baselines/03_cross_attention.yaml` | 普通 cross-attention |
-
-## Final Ablation
-
-| ID | YAML | 目的 |
-|---|---|---|
-| F0 | `config/train_2026/final/ours_2026_no_future.yaml` | 去掉未来原型 |
-| F1 | `config/train_2026/final/ours_2026_no_semantic_align.yaml` | 去掉语义对齐模块 |
-| F2 | `config/train_2026/final/ours_2026_no_reliability_gate.yaml` | fixed average，去掉 learned reliability gate |
-| F3 | `config/train_2026/final/ours_2026.yaml` | 完整模型 |
+| M0 | `config/experiments/main_chain/M0_concat_erm.yaml` | historical concat ERM |
+| M1 | `config/experiments/main_chain/M1_i1_dbta_concat020.yaml` | concat + DBTA 20% + drift-matched replay |
+| M2 | `config/experiments/main_chain/M2_i1_i2_alignment_fixed_gate020.yaml` | M1 + hierarchical alignment，gate 固定 |
+| M3 | `config/experiments/main_chain/M3_full_dbta020.yaml` | M2 + learned quality/uncertainty/time gate |
+| M4 | `config/experiments/main_chain/M4_full_random100_static.yaml` | full model + random 100% + static replay，用来压力测试 DBTA 20% 的效率叙事 |
 
 ## 运行
 
-```bash
-bash scripts/run_train_2026.sh all
-```
-
-单独运行：
+先重建 YAML：
 
 ```bash
-bash scripts/run_train_2026.sh baselines
-bash scripts/run_train_2026.sh i1
-bash scripts/run_train_2026.sh i2
-bash scripts/run_train_2026.sh i3
-bash scripts/run_train_2026.sh final
+python scripts/make_ablation_configs.py
 ```
+
+查看分组：
+
+```bash
+python run.py --list
+python run.py main --dry-run
+```
+
+运行单组：
+
+```bash
+python run.py baselines
+python run.py i1
+python run.py replay
+python run.py i2
+python run.py i3
+python run.py full
+```
+
+严苛判断标准：如果 `M3_full_dbta020` 不能稳定超过 `M4_full_random100_static` 或至少在显著更低 adaptation budget 下接近它，那么“少量 recent adaptation + DBTA”的贡献只能写成效率/成本优势，不能写成绝对性能优势。

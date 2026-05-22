@@ -193,6 +193,17 @@ def build_global_domain_years(*csv_paths: str) -> list[int]:
     return list(range(min(years), max(years) + 1))
 
 
+def max_domain_id_for_years(domain_years: list[int], years: list[int]) -> int:
+    year_to_domain_id = {int(year): idx for idx, year in enumerate(domain_years)}
+    missing = sorted(set(int(y) for y in years) - set(year_to_domain_id))
+    if missing:
+        raise ValueError(
+            "domain_years must include every historical train year; "
+            f"missing={missing}, domain_years={domain_years}"
+        )
+    return max(year_to_domain_id[int(year)] for year in years)
+
+
 def validate_full_config(cfg):
     for k in ("data", "model", "train", "loss"):
         if k not in cfg:
@@ -261,6 +272,8 @@ def validate_full_config(cfg):
         "class_aware_alignment_same_class_weight",
         "class_aware_alignment_temperature",
         "local_alignment_weight",
+        "max_local_align_nodes",
+        "max_local_align_tokens",
         "alignment_use_temporal_soft_weight",
         "alignment_use_temporal_reliability",
         "alignment_use_drift_reliability",
@@ -319,6 +332,8 @@ def validate_full_config(cfg):
         optional={
             "class_aware_alignment_same_class_weight",
             "class_aware_alignment_temperature",
+            "max_local_align_nodes",
+            "max_local_align_tokens",
         },
     )
 
@@ -2563,6 +2578,8 @@ def main():
         test_csv_path,
         *extra_test_csv_paths,
     )
+    train_years = read_split_years(train_csv_path)
+    historical_time_id_max = max_domain_id_for_years(domain_years, train_years)
 
     ds_tr = MultiModalMalwareDataset(
         pt_dir=resolve_path(data_root, c_data["train_pt_dir"]),
@@ -2587,7 +2604,7 @@ def main():
     ds_adapt = None
     if adapt_csv_path is not None:
         ds_adapt = MultiModalMalwareDataset(
-            pt_dir=resolve_path("", c_data.get("adapt_pt_dir") or c_data["train_pt_dir"]),
+            pt_dir=resolve_path(data_root, c_data.get("adapt_pt_dir") or c_data["train_pt_dir"]),
             csv_path=adapt_csv_path,
             is_train=True, robust_aug=False,
             max_api_events_per_sample=c_data["max_api_events_per_sample"],
@@ -2698,6 +2715,8 @@ def main():
         in_feat_dim=graph_in_feat_dim,
         xattn_heads=TrainingConstants.XATTN_HEADS,
         fusion_mode=_fm,
+        num_time_domains=len(domain_years),
+        historical_time_id_max=historical_time_id_max,
         graph_encoder_type=str(c_graph["type"]),
         graph_hidden=int(c_graph["hidden"]),
         graph_heads=int(c_graph["heads"]),
@@ -2779,6 +2798,11 @@ def main():
         f"main_aux={float(c_loss['branch_aux_weight']):.3f}"
     )
     logger.info(f"Temporal domains | years={domain_years}")
+    logger.info(
+        "Temporal normalization | "
+        f"num_time_domains={len(domain_years)} "
+        f"historical_time_id_max={historical_time_id_max}"
+    )
 
     # ═══════════════════════════════════════════════════════════════════
     # Training loop
@@ -3048,7 +3072,7 @@ def main():
     torch.save(calibrator.state_dict(), os.path.join(ckpt_dir, f"calibrator_{exp_name}.pt"))
 
     # ── Test ──
-    test_pt = resolve_path("", c_data["test_pt_dir"])
+    test_pt = resolve_path(data_root, c_data["test_pt_dir"])
     test_csv = resolve_path(data_root, c_data["test_csv"])
     if not (os.path.exists(test_pt) and os.path.exists(test_csv)):
         raise FileNotFoundError(f"Test set not found: pt_dir={test_pt}, csv={test_csv}")
@@ -3203,7 +3227,7 @@ def main():
 
     for spec in extra_test_specs:
         extra_name = str(spec["name"])
-        extra_pt = resolve_path("", spec["test_pt_dir"])
+        extra_pt = resolve_path(data_root, spec["test_pt_dir"])
         extra_csv = resolve_path(data_root, spec["test_csv"])
         if not (os.path.exists(extra_pt) and os.path.exists(extra_csv)):
             raise FileNotFoundError(

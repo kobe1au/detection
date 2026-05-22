@@ -101,10 +101,11 @@ model:
 
 | ID | 设定 | 目的 |
 |---|---|---|
-| B0 | zero-adapt concat baseline | 只用 2018-2021 训练，2024 测试 |
-| B1 | I1 DBTA + drift-matched replay | 验证漂移感知预算适应 |
-| B2 | B1 + class-aware alignment | 验证类别感知跨模态判别对齐 |
-| B3 | B2 + quality/uncertainty tri-branch gate | 验证质量感知多分支融合 |
+| M0 | zero-adapt concat baseline | 只用 2018-2021 训练，2024 测试 |
+| M1 | I1 DBTA 20% + drift-matched replay | 验证漂移感知预算适应 |
+| M2 | M1 + hierarchical alignment, fixed gate | 验证类别感知跨模态判别对齐 |
+| M3 | M2 + quality/uncertainty/time gate | 验证质量感知和漂移感知融合 |
+| M4 | full + random 100% + static replay | 压力测试 DBTA 20% 的效率叙事 |
 
 ratio sweep：
 
@@ -116,12 +117,13 @@ Final test: 2024 only
 配置入口：
 
 ```text
-config/train_2026/main_chain/00_zero_adapt_concat.yaml
-config/train_2026/main_chain/01_i1_adapt_020.yaml
-config/train_2026/main_chain/02_i1_i2_adapt_020.yaml
-config/train_2026/main_chain/03_i1_i2_i3_adapt_020.yaml
+config/experiments/main_chain/M0_concat_erm.yaml
+config/experiments/main_chain/M1_i1_dbta_concat020.yaml
+config/experiments/main_chain/M2_i1_i2_alignment_fixed_gate020.yaml
+config/experiments/main_chain/M3_full_dbta020.yaml
+config/experiments/main_chain/M4_full_random100_static.yaml
 
-config/train_2026/ratio_sweep/*full_adapt*.yaml
+config/experiments/ratio_sweep/R*_full_*.yaml
 ```
 
-当前 YAML 仍使用 `results/labels/test_2023.csv` / `/pts/test` 作为 2023 recent-year adaptation pool 的路径命名；论文和最终归档配置应改成 `adapt_2023` 语义命名，避免被误读成测试集泄漏。当前 replay 实现是 epoch-level mixture：每个 adaptation epoch 由选中的 2023 recent samples 和 historical replay samples 混合训练。论文中不要写成每个 batch 固定包含 recent/replay，除非后续实现 dedicated replay batch sampler。
+当前 continual YAML 使用 `results/labels/adapt_2023.csv` 和 `pts/adapt` 作为 2023 recent-year adaptation pool。论文中要明确 replay 是 epoch-level mixture：每个 adaptation epoch 由选中的 2023 recent samples 和 historical replay samples 混合训练。不要写成每个 batch 固定包含 recent/replay，除非后续实现 dedicated replay batch sampler。

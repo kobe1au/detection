@@ -14,6 +14,11 @@ class ConfigSchemaCleanTest(unittest.TestCase):
         override_paths = []
         override_paths.extend(sorted((root / "config" / "chapters").rglob("*.yaml")))
         override_paths.extend(sorted(root.glob("config/exp_*.yaml")))
+        override_paths.extend(
+            path
+            for path in sorted((root / "config" / "experiments").rglob("*.yaml"))
+            if not path.name.startswith("_")
+        )
 
         for override_path in override_paths:
             with self.subTest(config=str(override_path.relative_to(root))):

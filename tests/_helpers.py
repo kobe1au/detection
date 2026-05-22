@@ -55,6 +55,8 @@ def make_model(
     use_time_gate_inputs: bool = False,
     use_temporal_reliability: bool = False,
     use_drift_reliability: bool = False,
+    num_time_domains: int = 2,
+    historical_time_id_max: int = 0,
 ):
     return MalwareModelWithXAttn(
         num_classes=2,
@@ -75,6 +77,8 @@ def make_model(
         api_layers=1,
         xattn_heads=2,
         gate_mode=gate_mode,
+        num_time_domains=num_time_domains,
+        historical_time_id_max=historical_time_id_max,
         use_time_gate_inputs=use_time_gate_inputs,
         use_temporal_reliability=use_temporal_reliability,
         use_drift_reliability=use_drift_reliability,
@@ -86,6 +90,8 @@ def make_loss_cfg():
         "semantic_alignment_weight": 0.03,
         "class_aware_alignment_same_class_weight": 0.25,
         "class_aware_alignment_temperature": 0.2,
+        "max_local_align_nodes": 8,
+        "max_local_align_tokens": 8,
         "stage1_branch_aux_weight": 0.0,
         "branch_aux_weight": 0.10,
     }

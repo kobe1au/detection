@@ -42,6 +42,8 @@ from fusion.model import MalwareModelWithXAttn
 from fusion.train import (
     build_global_domain_years,
     deep_update,
+    max_domain_id_for_years,
+    read_split_years,
     resolve_path,
     select_device,
     validate_full_config,
@@ -112,7 +114,24 @@ def load_checkpoint_config(base_cfg: dict[str, Any], ckpt_path: str) -> dict[str
     return validate_full_config(base_cfg)
 
 
-def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareModelWithXAttn:
+def _temporal_context_from_cfg(cfg: dict[str, Any], data_root: str) -> tuple[list[int], int]:
+    c_data = cfg["data"]
+    csv_paths = [
+        resolve_path(data_root, c_data["train_csv"]),
+        resolve_path(data_root, c_data["val_csv"]),
+        resolve_path(data_root, c_data["test_csv"]),
+    ]
+    if c_data.get("adapt_csv"):
+        csv_paths.insert(1, resolve_path(data_root, c_data["adapt_csv"]))
+    for spec in c_data.get("extra_tests", []) or []:
+        csv_paths.append(resolve_path(data_root, spec["test_csv"]))
+
+    domain_years = build_global_domain_years(*csv_paths)
+    train_years = read_split_years(resolve_path(data_root, c_data["train_csv"]))
+    return domain_years, max_domain_id_for_years(domain_years, train_years)
+
+
+def build_model_from_cfg(cfg: dict[str, Any], device: torch.device, data_root: str = ".") -> MalwareModelWithXAttn:
     c_model = cfg["model"]
     c_api = c_model["api_encoder"]
     c_graph = c_model["graph_encoder"]
@@ -122,6 +141,7 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
     legacy_temporal = bool(cfg["loss"].get("alignment_use_temporal_soft_weight", False))
     use_temporal_reliability = bool(cfg["loss"].get("alignment_use_temporal_reliability", legacy_temporal))
     use_drift_reliability = bool(cfg["loss"].get("alignment_use_drift_reliability", legacy_temporal))
+    domain_years, historical_time_id_max = _temporal_context_from_cfg(cfg, data_root)
     model = MalwareModelWithXAttn(
         num_classes=int(c_model["num_classes"]),
         api_emb_dim=TrainingConstants.API_EMB_DIM,
@@ -132,6 +152,8 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
         in_feat_dim=int(c_model.get("in_feat_dim", TrainingConstants.IN_FEAT_DIM)),
         xattn_heads=TrainingConstants.XATTN_HEADS,
         fusion_mode=fusion_mode,
+        num_time_domains=len(domain_years),
+        historical_time_id_max=historical_time_id_max,
         graph_encoder_type=str(c_graph["type"]),
         graph_hidden=int(c_graph["hidden"]),
         graph_heads=int(c_graph["heads"]),
@@ -161,13 +183,13 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device) -> MalwareMo
     return model
 
 
-def load_model(spec: ModelSpec, device: torch.device) -> MalwareModelWithXAttn:
+def load_model(spec: ModelSpec, device: torch.device, data_root: str = ".") -> MalwareModelWithXAttn:
     ckpt = torch.load(spec.ckpt_path, map_location=device, weights_only=False)
     state = ckpt.get("state_dict", ckpt)
     in_proj_key = next((k for k in state.keys() if k.endswith("graph_encoder.in_proj.weight")), None)
     if in_proj_key is not None and getattr(state[in_proj_key], "ndim", 0) == 2:
         spec.cfg.setdefault("model", {})["in_feat_dim"] = int(state[in_proj_key].shape[1])
-    model = build_model_from_cfg(spec.cfg, device)
+    model = build_model_from_cfg(spec.cfg, device, data_root=data_root)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"[warn] {spec.name}: missing keys={len(missing)}")
@@ -234,7 +256,7 @@ def collect_predictions(
     num_workers: int,
     use_amp: bool,
 ) -> PredictionPack:
-    model = load_model(spec, device)
+    model = load_model(spec, device, data_root=data_root)
     fusion_mode = model.fusion_mode
     loader = make_loader(spec.cfg, data_root, split, batch_size, num_workers)
 

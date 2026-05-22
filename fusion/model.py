@@ -348,6 +348,8 @@ class MalwareModelWithXAttn(nn.Module):
         use_drift_reliability: bool = False,
         gate_mode: str = "learned",
         late_fusion_api_weight: float = 0.5,
+        num_time_domains: int = 1,
+        historical_time_id_max: int | None = None,
     ):
         super().__init__()
 
@@ -409,6 +411,16 @@ class MalwareModelWithXAttn(nn.Module):
         self.time_feature_set = str(time_feature_set or "basic").lower()
         self.use_temporal_reliability = bool(use_temporal_reliability)
         self.use_drift_reliability = bool(use_drift_reliability)
+        self.num_time_domains = max(int(num_time_domains), 1)
+        self.historical_time_id_max = (
+            max(int(historical_time_id_max), 0)
+            if historical_time_id_max is not None
+            else self.num_time_domains - 1
+        )
+        self.historical_time_id_max = min(
+            self.historical_time_id_max,
+            self.num_time_domains - 1,
+        )
         self.training_stage = "main"
         self.force_fixed_gate = False
         self.force_disable_alignment = False
@@ -601,49 +613,45 @@ class MalwareModelWithXAttn(nn.Module):
 
         return torch.cat(vals, dim=-1).clamp(0.0, 1.0)
 
-    def _build_temporal_reliability(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
+    def _normalize_time_ids(self, time_ids: torch.Tensor | None, batch_size: int, device):
         if time_ids is None:
-            base = torch.ones((batch_size, 1), device=device, dtype=dtype)
-            zero = torch.zeros((batch_size, 1), device=device, dtype=dtype)
-            return base, zero
+            return torch.zeros((batch_size,), device=device, dtype=torch.long)
 
         tids = time_ids.to(device=device, dtype=torch.long).view(-1)
         if tids.numel() != batch_size:
             tids = torch.zeros((batch_size,), device=device, dtype=torch.long)
+        return tids.clamp(0, self.num_time_domains - 1)
 
+    def _global_time_position(self, tids: torch.Tensor, dtype):
+        denom = max(self.num_time_domains - 1, 1)
+        return (tids.to(dtype=torch.float32) / float(denom)).to(dtype=dtype)
+
+    def _global_drift_position(self, tids: torch.Tensor, dtype):
         tids_f = tids.to(dtype=torch.float32)
-        t_min = tids_f.min()
-        t_max = tids_f.max()
-        span = (t_max - t_min).clamp_min(1.0)
-        time_pos = ((tids_f - t_min) / span).to(dtype=dtype).view(batch_size, 1)
-        q_time = (1.0 - 0.35 * time_pos).clamp(0.35, 1.0)
+        hist_max = float(self.historical_time_id_max)
+        future_span = max(float(self.num_time_domains - 1) - hist_max, 1.0)
+        return ((tids_f - hist_max).clamp_min(0.0) / future_span).to(dtype=dtype).clamp(0.0, 1.0)
 
-        centered = (tids_f - tids_f.mean()) / span
-        q_drift = centered.abs().to(dtype=dtype).view(batch_size, 1).clamp(0.0, 1.0)
+    def _build_temporal_reliability(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
+        tids = self._normalize_time_ids(time_ids, batch_size, device)
+        time_pos = self._global_time_position(tids, dtype).view(batch_size, 1)
+        q_time = (1.0 - 0.35 * time_pos).clamp(0.35, 1.0)
+        q_drift = self._global_drift_position(tids, dtype).view(batch_size, 1)
         return q_time, q_drift
 
     def _build_time_gate_features(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
         if not self.use_time_gate_inputs:
             return torch.zeros((batch_size, 0), device=device, dtype=dtype)
 
-        if time_ids is None:
-            return torch.zeros((batch_size, 4), device=device, dtype=dtype)
-
-        tids = time_ids.to(device=device, dtype=torch.long).view(-1)
-        if tids.numel() != batch_size:
-            tids = torch.zeros((batch_size,), device=device, dtype=torch.long)
-
+        tids = self._normalize_time_ids(time_ids, batch_size, device)
         tids_f = tids.to(dtype=torch.float32)
-        t_min = tids_f.min()
-        t_max = tids_f.max()
-        span = (t_max - t_min).clamp_min(1.0)
-        time_pos = ((tids_f - t_min) / span).to(dtype=dtype)
+        denom = max(self.num_time_domains - 1, 1)
+        hist_max = float(self.historical_time_id_max)
+        time_pos = self._global_time_position(tids, dtype)
         time_recency = time_pos
-        time_mid = tids_f.median()
-        time_is_future = (tids_f > time_mid).to(dtype=dtype)
-        prev = torch.cat([tids_f[:1], tids_f[:-1]], dim=0)
-        time_delta_prev_stage = ((tids_f - prev).abs() / span).clamp(0.0, 1.0).to(dtype=dtype)
-        return torch.stack([time_pos, time_recency, time_is_future, time_delta_prev_stage], dim=-1)
+        time_is_future = (tids_f > hist_max).to(dtype=dtype)
+        time_delta_from_history = ((tids_f - hist_max).abs() / float(denom)).clamp(0.0, 1.0).to(dtype=dtype)
+        return torch.stack([time_pos, time_recency, time_is_future, time_delta_from_history], dim=-1)
 
     def _compute_branch_uncertainty(self, api_logits, graph_logits, joint_logits):
         p_api = torch.softmax(api_logits.detach(), dim=-1)

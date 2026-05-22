@@ -87,6 +87,84 @@ def _semantic_alignment_loss(
     return loss.mean()
 
 
+def _limit_local_alignment_scope(
+    node_features: torch.Tensor,
+    api_features: torch.Tensor,
+    weights: torch.Tensor,
+    node_valid: torch.Tensor | None,
+    api_valid: torch.Tensor | None,
+    max_nodes: int = 0,
+    max_tokens: int = 0,
+):
+    max_nodes = int(max_nodes or 0)
+    max_tokens = int(max_tokens or 0)
+    batch_size, num_nodes, node_dim = node_features.shape
+    _, num_tokens, api_dim = api_features.shape
+    keep_nodes = min(num_nodes, max_nodes) if max_nodes > 0 else num_nodes
+    keep_tokens = min(num_tokens, max_tokens) if max_tokens > 0 else num_tokens
+
+    if keep_nodes == num_nodes and keep_tokens == num_tokens:
+        return node_features, api_features, weights, node_valid, api_valid
+    if keep_nodes <= 0 or keep_tokens <= 0:
+        return (
+            node_features[:, :0],
+            api_features[:, :0],
+            weights[:, :0, :0],
+            node_valid[:, :0] if isinstance(node_valid, torch.Tensor) else node_valid,
+            api_valid[:, :0] if isinstance(api_valid, torch.Tensor) else api_valid,
+        )
+
+    device = node_features.device
+    limited_nodes = node_features.new_zeros((batch_size, keep_nodes, node_dim))
+    limited_api = api_features.new_zeros((batch_size, keep_tokens, api_dim))
+    limited_weights = weights.new_zeros((batch_size, keep_nodes, keep_tokens))
+    limited_node_valid = (
+        node_valid.new_zeros((batch_size, keep_nodes))
+        if isinstance(node_valid, torch.Tensor)
+        else None
+    )
+    limited_api_valid = (
+        api_valid.new_zeros((batch_size, keep_tokens))
+        if isinstance(api_valid, torch.Tensor)
+        else None
+    )
+
+    node_arange = torch.arange(num_nodes, device=device)
+    api_arange = torch.arange(num_tokens, device=device)
+
+    for b in range(batch_size):
+        w = weights[b]
+        node_score = w.max(dim=1).values
+        api_score = w.max(dim=0).values
+        if isinstance(node_valid, torch.Tensor):
+            node_score = node_score + node_valid[b].to(device=device, dtype=node_score.dtype) * 1e-6
+        if isinstance(api_valid, torch.Tensor):
+            api_score = api_score + api_valid[b].to(device=device, dtype=api_score.dtype) * 1e-6
+
+        node_idx = (
+            torch.argsort(node_score, descending=True)[:keep_nodes]
+            if keep_nodes < num_nodes
+            else node_arange
+        )
+        api_idx = (
+            torch.argsort(api_score, descending=True)[:keep_tokens]
+            if keep_tokens < num_tokens
+            else api_arange
+        )
+
+        limited_nodes[b, : node_idx.numel()] = node_features[b].index_select(0, node_idx)
+        limited_api[b, : api_idx.numel()] = api_features[b].index_select(0, api_idx)
+        limited_weights[b, : node_idx.numel(), : api_idx.numel()] = (
+            w.index_select(0, node_idx).index_select(1, api_idx)
+        )
+        if limited_node_valid is not None:
+            limited_node_valid[b, : node_idx.numel()] = node_valid[b].index_select(0, node_idx)
+        if limited_api_valid is not None:
+            limited_api_valid[b, : api_idx.numel()] = api_valid[b].index_select(0, api_idx)
+
+    return limited_nodes, limited_api, limited_weights, limited_node_valid, limited_api_valid
+
+
 def _local_alignment_loss(
     node_features: torch.Tensor | None,
     api_features: torch.Tensor | None,
@@ -96,6 +174,8 @@ def _local_alignment_loss(
     quality_weights: torch.Tensor | None = None,
     time_weights: torch.Tensor | None = None,
     margin: float = 0.35,
+    max_nodes: int = 0,
+    max_tokens: int = 0,
 ) -> torch.Tensor:
     if (
         node_features is None
@@ -119,17 +199,31 @@ def _local_alignment_loss(
     if node_features.size(0) != api_features.size(0) or node_features.size(0) != alignment_masks.size(0):
         return node_features.new_tensor(0.0)
 
+    weights = alignment_masks.float().to(node_features.device).clamp(0.0, 1.0)
+    if node_valid is not None and isinstance(node_valid, torch.Tensor):
+        node_valid = node_valid.to(node_features.device)
+        nv = node_valid.float().view(weights.size(0), weights.size(1), 1)
+        weights = weights * nv
+    if api_valid is not None and isinstance(api_valid, torch.Tensor):
+        api_valid = api_valid.to(node_features.device)
+        av = api_valid.float().view(weights.size(0), 1, weights.size(2))
+        weights = weights * av
+
+    node_features, api_features, weights, node_valid, api_valid = _limit_local_alignment_scope(
+        node_features,
+        api_features,
+        weights,
+        node_valid,
+        api_valid,
+        max_nodes=max_nodes,
+        max_tokens=max_tokens,
+    )
+    if node_features.size(1) == 0 or api_features.size(1) == 0:
+        return weights.new_tensor(0.0)
+
     node_z = F.normalize(node_features.float(), dim=-1)
     api_z = F.normalize(api_features.float(), dim=-1)
     sim = torch.matmul(node_z, api_z.transpose(1, 2)).clamp(-1.0, 1.0)
-
-    weights = alignment_masks.float().to(sim.device).clamp(0.0, 1.0)
-    if node_valid is not None and isinstance(node_valid, torch.Tensor):
-        nv = node_valid.to(sim.device).float().view(weights.size(0), weights.size(1), 1)
-        weights = weights * nv
-    if api_valid is not None and isinstance(api_valid, torch.Tensor):
-        av = api_valid.to(sim.device).float().view(weights.size(0), 1, weights.size(2))
-        weights = weights * av
 
     pos_mass = weights.sum(dim=(1, 2))
     valid_samples = pos_mass > 0
@@ -216,6 +310,8 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             extra.get("local_alignment_api_valid"),
             extra.get("local_alignment_quality"),
             extra.get("local_alignment_time_weight"),
+            max_nodes=int(loss_cfg.get("max_local_align_nodes", 0) or 0),
+            max_tokens=int(loss_cfg.get("max_local_align_tokens", 0) or 0),
         ))
 
     loss_branch_aux = zero
