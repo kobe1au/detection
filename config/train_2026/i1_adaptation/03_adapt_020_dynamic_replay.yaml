@@ -7,6 +7,7 @@ model:
 
 train:
   exp_name: i1_adapt_020_dynamic_replay
+  warm_start_historical_ckpt: ""
   epochs: 70
   historical_epochs: 60
   adaptation_epochs: 10

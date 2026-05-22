@@ -55,6 +55,7 @@ model:
 
 train:
   exp_name: base_concat_erm
+  warm_start_historical_ckpt: ""
   seed: 42
   device: auto
   use_amp: true
