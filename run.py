@@ -41,7 +41,7 @@ ALIASES = {
     "fusion": "i3",
     "sweep": "ratio",
     "ratios": "ratio",
-    "final": "full",
+    "final": "final",
     "chain": "main",
 }
 

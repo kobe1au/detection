@@ -13,7 +13,8 @@
 | `replay` | 4 | 固定 full model + DBTA 20%，比较 no/static/dynamic/drift-matched replay |
 | `i2` | 5 | 固定 I1，固定 gate，拆解 semantic、class-aware、method-bias、local alignment |
 | `i3` | 7 | 固定 I1+I2，拆解 fixed/learned gate、quality、q_time/q_drift、time features、uncertainty 输入 |
-| `ratio` / `full` | 5 | full model 的 0%、5%、10%、20%、100% recent adaptation budget |
+| `ratio` / `full` | 6 | full model 的 0%、5%、10%、20%、50%、100% recent adaptation budget |
+| `final` | 1 | 单个最终模型 `M3_full_dbta020`，避免误跑完整 ratio sweep |
 | `main` | 5 | 最短论文主线：concat ERM -> I1 -> I1+I2 -> full -> random100 static stress test |
 
 ## 主线
@@ -49,6 +50,7 @@ python run.py i1
 python run.py replay
 python run.py i2
 python run.py i3
+python run.py final
 python run.py full
 ```
 

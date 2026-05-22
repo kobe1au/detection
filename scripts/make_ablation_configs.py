@@ -432,7 +432,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I2_00_no_alignment_fixed_gate.yaml",
         "I2_00_no_alignment_fixed_gate",
         continual_train(0.20, 0.25, "drift_matched", "dbta"),
-        ours_base(),
+        method_alignment(False),
+        fixed_gate(),
+        {"loss": {"semantic_alignment_weight": 0.0, "local_alignment_weight": 0.0}},
     )
     add(
         configs,
@@ -440,7 +442,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I2_01_semantic_only_fixed_gate.yaml",
         "I2_01_semantic_only_fixed_gate",
         continual_train(0.20, 0.25, "drift_matched", "dbta"),
-        ours_base(),
+        method_alignment(False),
         fixed_gate(),
         semantic_alignment_loss(semantic=0.05, class_aware=0.00, local=0.0),
     )
@@ -450,7 +452,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I2_02_class_aware_semantic_fixed_gate.yaml",
         "I2_02_class_aware_semantic_fixed_gate",
         continual_train(0.20, 0.25, "drift_matched", "dbta"),
-        ours_base(),
+        method_alignment(False),
         fixed_gate(),
         semantic_alignment_loss(semantic=0.05, class_aware=0.20, local=0.0),
     )
@@ -505,7 +507,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         historical_train(),
         full_model(),
     )
-    for idx, ratio in enumerate([0.05, 0.10, 0.20, 1.00], start=1):
+    for idx, ratio in enumerate([0.05, 0.10, 0.20, 0.50, 1.00], start=1):
         tag = ratio_tag(ratio)
         add(
             configs,
@@ -571,6 +573,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "main": sorted(k for k in configs if k.startswith("main_chain/")),
     }
     groups["full"] = groups["ratio"]
+    groups["final"] = ["main_chain/M3_full_dbta020.yaml"]
     groups["all"] = (
         groups["baselines"]
         + groups["i1"]
@@ -580,6 +583,24 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         + groups["ratio"]
     )
     return configs, groups
+
+
+def build_i3_gate_signal_manifest(configs: dict[str, dict], groups: dict[str, list[str]]) -> dict:
+    signals = {}
+    for rel_path in groups.get("i3", []):
+        effective = merge(BASE_DEFAULTS, configs[rel_path])
+        exp_name = str(effective.get("train", {}).get("exp_name", Path(rel_path).stem))
+        gate = effective.get("model", {}).get("gate", {})
+        mode = str(gate.get("mode", "learned"))
+        gate_uses_inputs = mode != "fixed"
+        signals[exp_name] = {
+            "mode": mode,
+            "quality_inputs": gate_uses_inputs and bool(gate.get("quality_inputs", False)),
+            "temporal_reliability_inputs": gate_uses_inputs and bool(gate.get("temporal_reliability_inputs", False)),
+            "time_inputs": gate_uses_inputs and bool(gate.get("time_inputs", False)),
+            "uncertainty_inputs": gate_uses_inputs and bool(gate.get("uncertainty_inputs", False)),
+        }
+    return signals
 
 
 def write_yaml(path: Path, cfg: dict, generated: bool = True) -> None:
@@ -658,6 +679,7 @@ def main() -> None:
             key: [str(out_dir / path).replace("\\", "/") for path in paths]
             for key, paths in groups.items()
         },
+        "i3_gate_signals": build_i3_gate_signal_manifest(configs, groups),
         "recommended_order": ["baselines", "i1", "replay", "i2", "i3", "ratio", "main"],
     }
     write_yaml(out_dir / "_manifest.yaml", manifest)

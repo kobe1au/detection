@@ -22,7 +22,10 @@ case "${STAGE}" in
   sweep|ratio|ratios)
     exec bash scripts/run_train_2026.sh ratio
     ;;
-  final|full)
+  final)
+    exec bash scripts/run_train_2026.sh final
+    ;;
+  full)
     exec bash scripts/run_train_2026.sh full
     ;;
   main|chain|story)

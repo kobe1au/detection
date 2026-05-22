@@ -3,14 +3,13 @@ data:
   out_dir: "experiments/i2_alignment"
 train:
   exp_name: "I2_01_semantic_only_fixed_gate"
-  warmup_stage_epochs: 0
 model:
   alignment:
     enabled: false
   gate:
     mode: "fixed"
 loss:
-  local_alignment_weight: 0
   class_aware_alignment_same_class_weight: 0
+  local_alignment_weight: 0
   alignment_use_temporal_reliability: false
   alignment_use_drift_reliability: false

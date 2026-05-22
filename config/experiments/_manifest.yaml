@@ -41,7 +41,8 @@ groups:
     - "config/experiments/ratio_sweep/R1_full_dbta005.yaml"
     - "config/experiments/ratio_sweep/R2_full_dbta010.yaml"
     - "config/experiments/ratio_sweep/R3_full_dbta020.yaml"
-    - "config/experiments/ratio_sweep/R4_full_dbta100.yaml"
+    - "config/experiments/ratio_sweep/R4_full_dbta050.yaml"
+    - "config/experiments/ratio_sweep/R5_full_dbta100.yaml"
   main:
     - "config/experiments/main_chain/M0_concat_erm.yaml"
     - "config/experiments/main_chain/M1_i1_dbta_concat020.yaml"
@@ -53,7 +54,10 @@ groups:
     - "config/experiments/ratio_sweep/R1_full_dbta005.yaml"
     - "config/experiments/ratio_sweep/R2_full_dbta010.yaml"
     - "config/experiments/ratio_sweep/R3_full_dbta020.yaml"
-    - "config/experiments/ratio_sweep/R4_full_dbta100.yaml"
+    - "config/experiments/ratio_sweep/R4_full_dbta050.yaml"
+    - "config/experiments/ratio_sweep/R5_full_dbta100.yaml"
+  final:
+    - "config/experiments/main_chain/M3_full_dbta020.yaml"
   all:
     - "config/experiments/baselines/B0_api_erm.yaml"
     - "config/experiments/baselines/B1_graph_erm.yaml"
@@ -88,7 +92,51 @@ groups:
     - "config/experiments/ratio_sweep/R1_full_dbta005.yaml"
     - "config/experiments/ratio_sweep/R2_full_dbta010.yaml"
     - "config/experiments/ratio_sweep/R3_full_dbta020.yaml"
-    - "config/experiments/ratio_sweep/R4_full_dbta100.yaml"
+    - "config/experiments/ratio_sweep/R4_full_dbta050.yaml"
+    - "config/experiments/ratio_sweep/R5_full_dbta100.yaml"
+i3_gate_signals:
+  I3_00_fixed_gate:
+    mode: "fixed"
+    quality_inputs: false
+    temporal_reliability_inputs: false
+    time_inputs: false
+    uncertainty_inputs: false
+  I3_01_learned_emb_only:
+    mode: "learned"
+    quality_inputs: false
+    temporal_reliability_inputs: false
+    time_inputs: false
+    uncertainty_inputs: false
+  I3_02_quality_only:
+    mode: "learned"
+    quality_inputs: true
+    temporal_reliability_inputs: false
+    time_inputs: false
+    uncertainty_inputs: false
+  I3_03_temporal_reliability_only:
+    mode: "learned"
+    quality_inputs: false
+    temporal_reliability_inputs: true
+    time_inputs: false
+    uncertainty_inputs: false
+  I3_04_time_features_only:
+    mode: "learned"
+    quality_inputs: false
+    temporal_reliability_inputs: false
+    time_inputs: true
+    uncertainty_inputs: false
+  I3_05_uncertainty_only:
+    mode: "learned"
+    quality_inputs: false
+    temporal_reliability_inputs: false
+    time_inputs: false
+    uncertainty_inputs: true
+  I3_06_full_gate:
+    mode: "learned"
+    quality_inputs: true
+    temporal_reliability_inputs: true
+    time_inputs: true
+    uncertainty_inputs: true
 recommended_order:
   - "baselines"
   - "i1"

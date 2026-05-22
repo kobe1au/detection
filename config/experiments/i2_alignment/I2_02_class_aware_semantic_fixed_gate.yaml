@@ -3,7 +3,6 @@ data:
   out_dir: "experiments/i2_alignment"
 train:
   exp_name: "I2_02_class_aware_semantic_fixed_gate"
-  warmup_stage_epochs: 0
 model:
   alignment:
     enabled: false

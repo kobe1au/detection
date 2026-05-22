@@ -110,7 +110,7 @@ model:
 ratio sweep：
 
 ```text
-2023 adaptation: 5% / 10% / 20% / 100%
+2023 adaptation: 5% / 10% / 20% / 50% / 100%
 Final test: 2024 only
 ```
 
