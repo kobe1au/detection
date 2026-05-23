@@ -35,7 +35,8 @@ groups:
     - "config/experiments/i3_gate/I3_03_temporal_reliability_only.yaml"
     - "config/experiments/i3_gate/I3_04_time_features_only.yaml"
     - "config/experiments/i3_gate/I3_05_uncertainty_only.yaml"
-    - "config/experiments/i3_gate/I3_06_full_gate.yaml"
+    - "config/experiments/i3_gate/I3_06_confidence_only.yaml"
+    - "config/experiments/i3_gate/I3_07_full_gate.yaml"
   ratio:
     - "config/experiments/ratio_sweep/R0_full_no_adapt.yaml"
     - "config/experiments/ratio_sweep/R1_full_dbta005.yaml"
@@ -87,7 +88,8 @@ groups:
     - "config/experiments/i3_gate/I3_03_temporal_reliability_only.yaml"
     - "config/experiments/i3_gate/I3_04_time_features_only.yaml"
     - "config/experiments/i3_gate/I3_05_uncertainty_only.yaml"
-    - "config/experiments/i3_gate/I3_06_full_gate.yaml"
+    - "config/experiments/i3_gate/I3_06_confidence_only.yaml"
+    - "config/experiments/i3_gate/I3_07_full_gate.yaml"
     - "config/experiments/ratio_sweep/R0_full_no_adapt.yaml"
     - "config/experiments/ratio_sweep/R1_full_dbta005.yaml"
     - "config/experiments/ratio_sweep/R2_full_dbta010.yaml"
@@ -101,42 +103,56 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    confidence_inputs: false
   I3_01_learned_emb_only:
     mode: "learned"
     quality_inputs: false
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    confidence_inputs: false
   I3_02_quality_only:
     mode: "learned"
     quality_inputs: true
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    confidence_inputs: false
   I3_03_temporal_reliability_only:
     mode: "learned"
     quality_inputs: false
     temporal_reliability_inputs: true
     time_inputs: false
     uncertainty_inputs: false
+    confidence_inputs: false
   I3_04_time_features_only:
     mode: "learned"
     quality_inputs: false
     temporal_reliability_inputs: false
     time_inputs: true
     uncertainty_inputs: false
+    confidence_inputs: false
   I3_05_uncertainty_only:
     mode: "learned"
     quality_inputs: false
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: true
-  I3_06_full_gate:
+    confidence_inputs: false
+  I3_06_confidence_only:
+    mode: "learned"
+    quality_inputs: false
+    temporal_reliability_inputs: false
+    time_inputs: false
+    uncertainty_inputs: false
+    confidence_inputs: true
+  I3_07_full_gate:
     mode: "learned"
     quality_inputs: true
     temporal_reliability_inputs: true
     time_inputs: true
     uncertainty_inputs: true
+    confidence_inputs: true
 recommended_order:
   - "baselines"
   - "i1"

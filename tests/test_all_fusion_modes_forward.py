@@ -97,6 +97,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
             use_gate_temporal_reliability_inputs=True,
             use_temporal_reliability=True,
             use_drift_reliability=True,
+            confidence_inputs=False,
             num_time_domains=4,
             historical_time_id_max=1,
         )
@@ -112,9 +113,9 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits).all())
         self.assertIn("q_time", extra)
         self.assertIn("q_drift", extra)
-        self.assertIn("api_confidence", extra)
-        self.assertIn("graph_confidence", extra)
-        self.assertIn("joint_confidence", extra)
+        self.assertNotIn("api_confidence", extra)
+        self.assertNotIn("graph_confidence", extra)
+        self.assertNotIn("joint_confidence", extra)
 
     def test_quality_only_gate_excludes_temporal_reliability_inputs(self):
         model = make_model(
@@ -125,6 +126,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
             use_gate_temporal_reliability_inputs=False,
             use_temporal_reliability=True,
             use_drift_reliability=True,
+            confidence_inputs=False,
             num_time_domains=4,
             historical_time_id_max=1,
         )
@@ -140,6 +142,21 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits).all())
         self.assertIn("q_time", extra)
         self.assertIn("q_drift", extra)
+
+    def test_confidence_inputs_add_three_gate_dimensions(self):
+        model = make_model(
+            "ours",
+            use_quality_gate_inputs=False,
+            use_uncertainty_gate=False,
+            use_time_gate_inputs=False,
+            use_gate_temporal_reliability_inputs=True,
+            use_temporal_reliability=True,
+            use_drift_reliability=True,
+            confidence_inputs=True,
+            num_time_domains=4,
+            historical_time_id_max=1,
+        )
+        self.assertEqual(model.gate_net.q_dim, 15)
 
     def test_gate_confidence_source_raw_ignores_temperatures(self):
         model = make_model(

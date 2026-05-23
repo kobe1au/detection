@@ -1096,7 +1096,7 @@ class MalwareModelWithXAttn(nn.Module):
         uncertainty_score = torch.zeros((B, 1), device=device, dtype=dtype)
         gate_disagreement = torch.zeros((B, 1), device=device, dtype=dtype)
         gate_entropy = torch.zeros((B, 1), device=device, dtype=dtype)
-        q_time, q_drift, drift_prior, drift_evidence, drift_score = self._build_temporal_reliability(
+        q_time, _, _, _, _ = self._build_temporal_reliability(
             time_ids,
             B,
             device,
@@ -1112,11 +1112,6 @@ class MalwareModelWithXAttn(nn.Module):
             if neutral_qs.size(1) > 3:
                 neutral_qs[:, 3:] = 0.0
             gate_quality_qs = neutral_qs
-
-        gate_q_parts = [gate_quality_qs]
-        if self.use_gate_temporal_reliability_inputs:
-            gate_q_parts.extend([q_time, q_drift])
-        gate_qs = torch.cat(gate_q_parts, dim=-1)
 
         feat_drop = ArchitectureConstants.FEATURE_DROPOUT
         if self.training and feat_drop > 0.0:
@@ -1169,22 +1164,8 @@ class MalwareModelWithXAttn(nn.Module):
         ):
             api_align, graph_align = self.build_alignment_features(api_emb, graph_emb)
             if api_align is not None and graph_align is not None:
-                semantic_quality = raw_qs[:, 2].detach().clamp(0.0, 1.0)
-                if self.use_temporal_reliability:
-                    semantic_quality = semantic_quality * q_time.detach().view(-1).clamp(0.0, 1.0)
-                    extra["semantic_alignment_time_gate"] = q_time.detach().view(-1)
-                if self.use_drift_reliability:
-                    semantic_quality = semantic_quality * q_drift.detach().view(-1).clamp(0.0, 1.0)
-                    extra["semantic_alignment_drift_gate"] = q_drift.detach().view(-1).clamp(0.0, 1.0)
-                if alignment_coverage_prior is not None and alignment_density_prior is not None:
-                    coverage_gate = alignment_coverage_prior.detach().view(-1).clamp(0.0, 1.0)
-                    density_gate = alignment_density_prior.detach().view(-1).clamp(0.0, 1.0).sqrt()
-                    semantic_quality = semantic_quality * coverage_gate * density_gate
-                    extra["semantic_alignment_coverage_gate"] = coverage_gate.detach()
-                    extra["semantic_alignment_density_gate"] = density_gate.detach()
                 extra["semantic_alignment_api"] = api_align
                 extra["semantic_alignment_graph"] = graph_align
-                extra["semantic_alignment_quality"] = semantic_quality
 
         if self._need_cross_attn and api_token_seqs is not None and node_emb is not None:
             max_api_tokens = max(ts.size(0) for ts in api_token_seqs) if api_token_seqs else 0
@@ -1301,19 +1282,17 @@ class MalwareModelWithXAttn(nn.Module):
                     if alignment_coverage is not None:
                         extra["alignment_coverage"] = alignment_coverage.view(B).detach()
                         extra["alignment_density"] = alignment_density.view(B).detach()
+                    local_alignment_context = None
                     if self.training and not self.force_disable_alignment:
-                        extra.update(self._build_local_alignment_targets(
-                            node_dense=node_dense,
-                            node_key_mask=node_key_mask,
-                            padded_api=padded_api,
-                            token_seqs=api_token_seqs,
-                            xattn_masks=xattn_masks,
-                            raw_qs=raw_qs,
-                            q_time=q_time,
-                            q_drift=q_drift,
-                            coverage=alignment_coverage,
-                            density=alignment_density,
-                        ))
+                        local_alignment_context = {
+                            "node_dense": node_dense,
+                            "node_key_mask": node_key_mask,
+                            "padded_api": padded_api,
+                            "token_seqs": api_token_seqs,
+                            "xattn_masks": xattn_masks,
+                            "coverage": alignment_coverage,
+                            "density": alignment_density,
+                        }
 
             else:
                 xattn_pooled = torch.zeros_like(api_emb)
@@ -1375,10 +1354,43 @@ class MalwareModelWithXAttn(nn.Module):
         extra["drift_evidence"] = drift_evidence.detach().view(B)
         extra["drift_score"] = drift_score.detach().view(B)
 
+        semantic_quality = raw_qs[:, 2].detach().clamp(0.0, 1.0)
+        if alignment_coverage_prior is not None:
+            semantic_quality = semantic_quality * alignment_coverage_prior.detach().view(-1).clamp(0.0, 1.0)
+        if alignment_density_prior is not None:
+            semantic_quality = semantic_quality * alignment_density_prior.detach().view(-1).clamp(0.0, 1.0).sqrt()
+        if self.use_temporal_reliability:
+            semantic_quality = semantic_quality * q_time.detach().view(-1).clamp(0.0, 1.0)
+            extra["semantic_alignment_time_gate"] = q_time.detach().view(-1)
+        if self.use_drift_reliability:
+            semantic_quality = semantic_quality * q_drift.detach().view(-1).clamp(0.0, 1.0)
+            extra["semantic_alignment_drift_gate"] = q_drift.detach().view(-1).clamp(0.0, 1.0)
+        if extra.get("semantic_alignment_api") is not None and extra.get("semantic_alignment_graph") is not None:
+            extra["semantic_alignment_quality"] = semantic_quality
+
+        if local_alignment_context is not None:
+            extra.update(self._build_local_alignment_targets(
+                local_alignment_context["node_dense"],
+                local_alignment_context["node_key_mask"],
+                local_alignment_context["padded_api"],
+                local_alignment_context["token_seqs"],
+                local_alignment_context["xattn_masks"],
+                raw_qs,
+                q_time,
+                q_drift,
+                local_alignment_context["coverage"],
+                local_alignment_context["density"],
+            ))
+
         if not self.use_uncertainty_gate:
             uncertainty_score = torch.zeros_like(uncertainty_score)
             gate_disagreement = torch.zeros_like(gate_disagreement)
             gate_entropy = torch.zeros_like(gate_entropy)
+
+        gate_q_parts = [gate_quality_qs]
+        if self.use_gate_temporal_reliability_inputs:
+            gate_q_parts.extend([q_time, q_drift])
+        gate_qs = torch.cat(gate_q_parts, dim=-1)
 
         gate_inputs_parts = [gate_qs]
         if self.use_time_gate_inputs:
