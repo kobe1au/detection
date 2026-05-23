@@ -219,10 +219,10 @@ def validate_full_config(cfg):
             )
 
     replay_strategy = str(cfg["train"].get("replay_strategy", "static")).lower()
-    if replay_strategy not in {"static", "dynamic_year_class", "drift_matched"}:
+    if replay_strategy not in {"static", "dynamic_year_class", "dynamic", "drift_matched"}:
         raise ValueError(
             "train.replay_strategy must be one of: "
-            "static, dynamic_year_class, drift_matched"
+            "static, dynamic_year_class, dynamic, drift_matched"
         )
     adaptation_selection = str(cfg["train"].get("adaptation_selection", "random")).lower()
     if adaptation_selection not in {"random", "dbta"}:
@@ -787,6 +787,13 @@ def _count_group_samples(groups, ratio: float, min_per_group: int = 1) -> int:
     return total
 
 
+def _canonical_replay_strategy(value) -> str:
+    strategy = str(value or "static").lower()
+    if strategy == "dynamic":
+        return "dynamic_year_class"
+    return strategy
+
+
 class YearClassBalancedReplaySampler(Sampler[int]):
     """
     Dynamic sampler for continual adaptation.
@@ -904,7 +911,7 @@ def _build_continual_adaptation_loader(
     train_cfg = cfg["train"]
     adapt_ratio = float(train_cfg.get("adaptation_ratio", 1.0))
     replay_ratio = float(train_cfg.get("replay_ratio", 0.25))
-    replay_strategy = str(train_cfg.get("replay_strategy", "static")).lower()
+    replay_strategy = _canonical_replay_strategy(train_cfg.get("replay_strategy", "static"))
     seed = int(train_cfg.get("seed", 42))
 
     if replay_strategy == "dynamic_year_class":
@@ -934,7 +941,7 @@ def _build_continual_adaptation_loader(
     if replay_strategy != "static":
         raise ValueError(
             f"Unsupported replay_strategy={replay_strategy}; "
-            "expected static or dynamic_year_class"
+            "expected static, dynamic/dynamic_year_class, or drift_matched"
         )
 
     adapt_indices = _balanced_sample_indices(adapt_dataset, adapt_ratio, seed)
@@ -1552,7 +1559,7 @@ def build_adaptation_loader(
     loader_cfg = copy.deepcopy(cfg)
     loader_cfg["train"]["adaptation_ratio"] = 1.0
 
-    replay_strategy = str(loader_cfg["train"].get("replay_strategy", "static")).lower()
+    replay_strategy = _canonical_replay_strategy(loader_cfg["train"].get("replay_strategy", "static"))
     if replay_strategy == "drift_matched":
         replay_indices = _build_drift_matched_replay_indices(
             historical_dataset,

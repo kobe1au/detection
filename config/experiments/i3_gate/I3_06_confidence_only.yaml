@@ -9,4 +9,3 @@ model:
     temporal_reliability_inputs: false
     uncertainty_inputs: false
     time_inputs: false
-    confidence_inputs: true

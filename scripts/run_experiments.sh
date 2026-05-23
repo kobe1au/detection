@@ -4,7 +4,7 @@ set -euo pipefail
 STAGE="${1:-all}"
 
 case "${STAGE}" in
-  temporal|t1|i1|adaptation|dbta)
+  temporal|t1|i1|i1_dbta|adaptation|dbta)
     exec bash scripts/run_train_2026.sh i1
     ;;
   replay|memory)
@@ -35,7 +35,7 @@ case "${STAGE}" in
     exec bash scripts/run_train_2026.sh all
     ;;
   *)
-    echo "Usage: $0 [all|baselines|i1|replay|i2|i3|ratio|full|main]"
+    echo "Usage: $0 [all|baselines|i1|i1_dbta|replay|i2|i3|ratio|final|full|main]"
     exit 1
     ;;
 esac

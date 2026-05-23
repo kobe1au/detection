@@ -16,8 +16,8 @@ from pathlib import Path
 
 
 DEFAULT_OUT_DIR = Path("config/experiments")
-ADAPT_PT_DIR = "pts/adapt"
-ADAPT_CSV = "results/labels/adapt_2023.csv"
+ADAPT_PT_DIR = "/pts/adapt"
+ADAPT_CSV = "results/labels/test_2023.csv"
 DROP = object()
 
 BASE_DEFAULTS = {
@@ -297,6 +297,7 @@ def full_alignment(fixed: bool = True) -> dict:
         temporal_reliability=True,
         uncertainty=True,
         time=True,
+        confidence=True,
     )
     return merge(
         {
@@ -383,8 +384,26 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_03_dbta020_static_replay.yaml",
-        "I1_03_dbta020_static_replay",
+        "I1_03_random020_dynamic_replay.yaml",
+        "I1_03_random020_dynamic_replay",
+        continual_train(0.20, 0.25, "dynamic_year_class", "random"),
+        alignment_off_model("concat"),
+        alignment_off_loss(),
+    )
+    add(
+        configs,
+        i1_group,
+        "I1_04_dbta020_no_replay.yaml",
+        "I1_04_dbta020_no_replay",
+        continual_train(0.20, 0.0, "static", "dbta"),
+        alignment_off_model("concat"),
+        alignment_off_loss(),
+    )
+    add(
+        configs,
+        i1_group,
+        "I1_05_dbta020_static_replay.yaml",
+        "I1_05_dbta020_static_replay",
         continual_train(0.20, 0.25, "static", "dbta"),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -392,13 +411,22 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_04_dbta020_drift_matched.yaml",
-        "I1_04_dbta020_drift_matched",
+        "I1_06_dbta020_dynamic_replay.yaml",
+        "I1_06_dbta020_dynamic_replay",
+        continual_train(0.20, 0.25, "dynamic_year_class", "dbta"),
+        alignment_off_model("concat"),
+        alignment_off_loss(),
+    )
+    add(
+        configs,
+        i1_group,
+        "I1_07_dbta020_drift_matched.yaml",
+        "I1_07_dbta020_drift_matched",
         continual_train(0.20, 0.25, "drift_matched", "dbta"),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
-    for idx, ratio in enumerate([0.05, 0.10, 1.00], start=5):
+    for idx, ratio in enumerate([0.05, 0.10, 0.50, 1.00], start=8):
         tag = ratio_tag(ratio)
         add(
             configs,

@@ -34,6 +34,7 @@ ALIASES = {
     "cmp": "baselines",
     "adaptation": "i1",
     "dbta": "i1",
+    "i1_dbta": "i1",
     "memory": "replay",
     "align": "i2",
     "alignment": "i2",

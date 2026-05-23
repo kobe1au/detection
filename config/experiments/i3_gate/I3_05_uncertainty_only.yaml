@@ -7,6 +7,5 @@ model:
   gate:
     quality_inputs: false
     temporal_reliability_inputs: false
-    uncertainty_inputs: true
     time_inputs: false
     confidence_inputs: false

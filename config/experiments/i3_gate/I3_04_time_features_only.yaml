@@ -8,5 +8,4 @@ model:
     quality_inputs: false
     temporal_reliability_inputs: false
     uncertainty_inputs: false
-    time_inputs: true
     confidence_inputs: false

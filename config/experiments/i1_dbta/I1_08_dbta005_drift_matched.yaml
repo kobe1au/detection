@@ -3,6 +3,7 @@ data:
   out_dir: "experiments/i1_dbta"
 train:
   exp_name: "I1_08_dbta005_drift_matched"
+  warm_start_historical_ckpt: "experiments/i1_dbta/I1_00_historical_concat/best_I1_00_historical_concat.pt"
   adaptation_ratio: 0.05
 model:
   fusion_mode: "concat"

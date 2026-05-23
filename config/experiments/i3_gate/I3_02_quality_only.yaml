@@ -5,7 +5,6 @@ train:
   exp_name: "I3_02_quality_only"
 model:
   gate:
-    quality_inputs: true
     temporal_reliability_inputs: false
     uncertainty_inputs: false
     time_inputs: false

@@ -9,10 +9,10 @@
 | 组 | 数量 | 目的 |
 |---|---:|---|
 | `baselines` | 5 | API、Graph、Concat、Late Fusion、Cross Attention 的 historical ERM 对照 |
-| `i1` | 8 | 在 concat 上隔离 DBTA selection、replay、adaptation budget |
+| `i1` / `i1_dbta` | 12 | 在 concat 上隔离 random/DBTA selection、static/dynamic/drift-matched replay、adaptation budget |
 | `replay` | 4 | 固定 full model + DBTA 20%，比较 no/static/dynamic/drift-matched replay |
 | `i2` | 5 | 固定 I1，固定 gate，拆解 semantic、class-aware、method-bias、local alignment |
-| `i3` | 7 | 固定 I1+I2，拆解 fixed/learned gate、quality、q_time/q_drift、time features、uncertainty 输入 |
+| `i3` | 8 | 固定 I1+I2，拆解 fixed/learned gate、quality、q_time/q_drift、time features、uncertainty、confidence 输入 |
 | `ratio` / `full` | 6 | full model 的 0%、5%、10%、20%、50%、100% recent adaptation budget |
 | `final` | 1 | 单个最终模型 `M3_full_dbta020`，避免误跑完整 ratio sweep |
 | `main` | 5 | 最短论文主线：concat ERM -> I1 -> I1+I2 -> full -> random100 static stress test |
@@ -46,7 +46,7 @@ python run.py main --dry-run
 
 ```bash
 python run.py baselines
-python run.py i1
+python run.py i1_dbta
 python run.py replay
 python run.py i2
 python run.py i3
