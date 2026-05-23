@@ -59,7 +59,7 @@ def make_model(
     use_temporal_reliability: bool = False,
     use_drift_reliability: bool = False,
     confidence_inputs: bool = True,
-    confidence_source: str = "raw_or_calibrated",
+    confidence_source: str = "raw",
     confidence_detach: bool = True,
     drift_mix_lambda: float = 0.5,
     drift_evidence_uncertainty_weight: float = 1.0,

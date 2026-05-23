@@ -352,7 +352,7 @@ class MalwareModelWithXAttn(nn.Module):
         drift_evidence_disagreement_weight: float = 1.0,
         drift_evidence_alignment_weight: float = 1.0,
         confidence_inputs: bool = True,
-        confidence_source: str = "raw_or_calibrated",
+        confidence_source: str = "raw",
         confidence_detach: bool = True,
         gate_mode: str = "learned",
         late_fusion_api_weight: float = 0.5,
@@ -429,7 +429,7 @@ class MalwareModelWithXAttn(nn.Module):
         self.drift_evidence_disagreement_weight = max(float(drift_evidence_disagreement_weight), 0.0)
         self.drift_evidence_alignment_weight = max(float(drift_evidence_alignment_weight), 0.0)
         self.confidence_inputs = bool(confidence_inputs)
-        self.confidence_source = str(confidence_source or "raw_or_calibrated").lower()
+        self.confidence_source = str(confidence_source or "raw").lower()
         self.confidence_detach = bool(confidence_detach)
         self.num_time_domains = max(int(num_time_domains), 1)
         self.historical_time_id_max = (

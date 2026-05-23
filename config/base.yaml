@@ -60,7 +60,7 @@ model:
     time_inputs: true
     time_feature_set: basic
     confidence_inputs: true
-    confidence_source: raw_or_calibrated
+    confidence_source: raw
     confidence_detach: true
     detach: true
 

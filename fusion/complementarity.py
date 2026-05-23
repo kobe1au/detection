@@ -183,7 +183,7 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device, data_root: s
         use_temporal_reliability=use_temporal_reliability,
         use_drift_reliability=use_drift_reliability,
         confidence_inputs=bool(c_gate.get("confidence_inputs", True)),
-        confidence_source=str(c_gate.get("confidence_source", "raw_or_calibrated")),
+        confidence_source=str(c_gate.get("confidence_source", "raw")),
         confidence_detach=bool(c_gate.get("confidence_detach", True)),
         gate_mode=str(c_gate.get("mode", "learned")),
         gate_detach=bool(c_gate["detach"]),

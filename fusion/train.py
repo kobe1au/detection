@@ -2898,7 +2898,7 @@ def main():
         drift_evidence_disagreement_weight=float(c_model.get("drift_evidence_disagreement_weight", 1.0)),
         drift_evidence_alignment_weight=float(c_model.get("drift_evidence_alignment_weight", 1.0)),
         confidence_inputs=bool(c_gate.get("confidence_inputs", True)),
-        confidence_source=str(c_gate.get("confidence_source", "raw_or_calibrated")),
+        confidence_source=str(c_gate.get("confidence_source", "raw")),
         confidence_detach=bool(c_gate.get("confidence_detach", True)),
         gate_mode=str(c_gate["mode"]),
         gate_detach=bool(c_gate["detach"]),
