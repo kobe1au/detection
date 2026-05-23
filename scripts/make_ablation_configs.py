@@ -221,6 +221,7 @@ def learned_gate(
     temporal_reliability: bool,
     uncertainty: bool,
     time: bool,
+    confidence: bool,
 ) -> dict:
     return {
         "model": {
@@ -230,6 +231,7 @@ def learned_gate(
                 "temporal_reliability_inputs": temporal_reliability,
                 "uncertainty_inputs": uncertainty,
                 "time_inputs": time,
+                "confidence_inputs": confidence,
                 "time_feature_set": "basic",
                 "detach": True,
             },
@@ -479,12 +481,13 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     i3_group = "i3_gate"
     gate_variants = [
         ("I3_00_fixed_gate.yaml", "I3_00_fixed_gate", fixed_gate()),
-        ("I3_01_learned_emb_only.yaml", "I3_01_learned_emb_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=False)),
-        ("I3_02_quality_only.yaml", "I3_02_quality_only", learned_gate(quality=True, temporal_reliability=False, uncertainty=False, time=False)),
-        ("I3_03_temporal_reliability_only.yaml", "I3_03_temporal_reliability_only", learned_gate(quality=False, temporal_reliability=True, uncertainty=False, time=False)),
-        ("I3_04_time_features_only.yaml", "I3_04_time_features_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=True)),
-        ("I3_05_uncertainty_only.yaml", "I3_05_uncertainty_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=True, time=False)),
-        ("I3_06_full_gate.yaml", "I3_06_full_gate", learned_gate(quality=True, temporal_reliability=True, uncertainty=True, time=True)),
+        ("I3_01_learned_emb_only.yaml", "I3_01_learned_emb_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=False, confidence=False)),
+        ("I3_02_quality_only.yaml", "I3_02_quality_only", learned_gate(quality=True, temporal_reliability=False, uncertainty=False, time=False, confidence=False)),
+        ("I3_03_temporal_reliability_only.yaml", "I3_03_temporal_reliability_only", learned_gate(quality=False, temporal_reliability=True, uncertainty=False, time=False, confidence=False)),
+        ("I3_04_time_features_only.yaml", "I3_04_time_features_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=True, confidence=False)),
+        ("I3_05_uncertainty_only.yaml", "I3_05_uncertainty_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=True, time=False, confidence=False)),
+        ("I3_06_confidence_only.yaml", "I3_06_confidence_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=False, confidence=True)),
+        ("I3_07_full_gate.yaml", "I3_07_full_gate", learned_gate(quality=True, temporal_reliability=True, uncertainty=True, time=True, confidence=True)),
     ]
     for filename, exp_name, gate_patch in gate_variants:
         add(
@@ -599,6 +602,7 @@ def build_i3_gate_signal_manifest(configs: dict[str, dict], groups: dict[str, li
             "temporal_reliability_inputs": gate_uses_inputs and bool(gate.get("temporal_reliability_inputs", False)),
             "time_inputs": gate_uses_inputs and bool(gate.get("time_inputs", False)),
             "uncertainty_inputs": gate_uses_inputs and bool(gate.get("uncertainty_inputs", False)),
+            "confidence_inputs": gate_uses_inputs and bool(gate.get("confidence_inputs", False)),
         }
     return signals
 

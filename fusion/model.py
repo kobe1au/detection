@@ -352,6 +352,7 @@ class MalwareModelWithXAttn(nn.Module):
         drift_evidence_disagreement_weight: float = 1.0,
         drift_evidence_alignment_weight: float = 1.0,
         confidence_inputs: bool = True,
+        confidence_source: str = "raw_or_calibrated",
         confidence_detach: bool = True,
         gate_mode: str = "learned",
         late_fusion_api_weight: float = 0.5,
@@ -428,6 +429,7 @@ class MalwareModelWithXAttn(nn.Module):
         self.drift_evidence_disagreement_weight = max(float(drift_evidence_disagreement_weight), 0.0)
         self.drift_evidence_alignment_weight = max(float(drift_evidence_alignment_weight), 0.0)
         self.confidence_inputs = bool(confidence_inputs)
+        self.confidence_source = str(confidence_source or "raw_or_calibrated").lower()
         self.confidence_detach = bool(confidence_detach)
         self.num_time_domains = max(int(num_time_domains), 1)
         self.historical_time_id_max = (
@@ -447,6 +449,8 @@ class MalwareModelWithXAttn(nn.Module):
             raise ValueError("gate_mode must be one of: learned, fixed")
         if self.time_feature_set not in {"basic"}:
             raise ValueError("time_feature_set must be 'basic'")
+        if self.confidence_source not in {"raw", "calibrated", "raw_or_calibrated"}:
+            raise ValueError("confidence_source must be one of: raw, calibrated, raw_or_calibrated")
 
         self.late_fusion_api_weight = float(late_fusion_api_weight)
         if not (0.0 <= self.late_fusion_api_weight <= 1.0):
@@ -527,7 +531,7 @@ class MalwareModelWithXAttn(nn.Module):
                 gate_q_dim += 4
             gate_q_dim += 4  # disagreement, entropy, api_alive, graph_alive
             if self.confidence_inputs:
-                gate_q_dim += 3  # api, graph, joint calibrated confidences
+                gate_q_dim += 3  # api, graph, joint branch confidences
             self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=gate_q_dim)
         else:
             self.gate_net = None
@@ -776,9 +780,15 @@ class MalwareModelWithXAttn(nn.Module):
                 return value.to(device=api_logits.device, dtype=torch.float32).clamp_min(1e-6)
             return torch.tensor(float(value), device=api_logits.device, dtype=torch.float32).clamp_min(1e-6)
 
+        use_calibrated = False
+        if self.confidence_source == "calibrated":
+            use_calibrated = True
+        elif self.confidence_source == "raw_or_calibrated" and len(temperatures) > 0:
+            use_calibrated = True
+
         confidences = []
         for name, logits in (("api", api_logits), ("graph", graph_logits), ("joint", joint_logits)):
-            scaled = logits.float() / _temperature(name)
+            scaled = logits.float() / _temperature(name) if use_calibrated else logits.float()
             conf = torch.softmax(scaled, dim=-1).amax(dim=-1, keepdim=True)
             if self.confidence_detach:
                 conf = conf.detach()
@@ -1086,24 +1096,13 @@ class MalwareModelWithXAttn(nn.Module):
         uncertainty_score = torch.zeros((B, 1), device=device, dtype=dtype)
         gate_disagreement = torch.zeros((B, 1), device=device, dtype=dtype)
         gate_entropy = torch.zeros((B, 1), device=device, dtype=dtype)
-        if api_logits is not None and graph_logits is not None:
-            provisional_joint = self.joint_head(torch.cat([api_emb, graph_emb], dim=-1)) if self.joint_head is not None else api_logits
-            uncertainty_score, gate_disagreement, gate_entropy = self._compute_branch_uncertainty(
-                api_logits,
-                graph_logits,
-                provisional_joint,
-            )
-            uncertainty_score = uncertainty_score.to(device=device, dtype=dtype)
-            gate_disagreement = gate_disagreement.to(device=device, dtype=dtype)
-            gate_entropy = gate_entropy.to(device=device, dtype=dtype)
-
         q_time, q_drift, drift_prior, drift_evidence, drift_score = self._build_temporal_reliability(
             time_ids,
             B,
             device,
             dtype,
-            disagreement=gate_disagreement,
-            entropy=gate_entropy,
+            disagreement=None,
+            entropy=None,
             alignment_coverage=alignment_coverage_prior,
             alignment_density=alignment_density_prior,
         )
@@ -1128,11 +1127,6 @@ class MalwareModelWithXAttn(nn.Module):
 
         if time_ids is not None:
             extra["time_ids"] = time_ids
-        extra["q_time"] = q_time.detach().view(B)
-        extra["q_drift"] = q_drift.detach().view(B)
-        extra["drift_prior"] = drift_prior.detach().view(B)
-        extra["drift_evidence"] = drift_evidence.detach().view(B)
-        extra["drift_score"] = drift_score.detach().view(B)
         if time_gate_features.numel() > 0:
             extra["time_gate_features"] = time_gate_features.detach()
             extra["time_recency_signal"] = time_gate_features[:, 1].detach()
@@ -1365,6 +1359,21 @@ class MalwareModelWithXAttn(nn.Module):
         uncertainty_score = uncertainty_score.to(device=device, dtype=dtype)
         gate_disagreement = gate_disagreement.to(device=device, dtype=dtype)
         gate_entropy = gate_entropy.to(device=device, dtype=dtype)
+        q_time, q_drift, drift_prior, drift_evidence, drift_score = self._build_temporal_reliability(
+            time_ids,
+            B,
+            device,
+            dtype,
+            disagreement=gate_disagreement,
+            entropy=gate_entropy,
+            alignment_coverage=alignment_coverage_prior,
+            alignment_density=alignment_density_prior,
+        )
+        extra["q_time"] = q_time.detach().view(B)
+        extra["q_drift"] = q_drift.detach().view(B)
+        extra["drift_prior"] = drift_prior.detach().view(B)
+        extra["drift_evidence"] = drift_evidence.detach().view(B)
+        extra["drift_score"] = drift_score.detach().view(B)
 
         if not self.use_uncertainty_gate:
             uncertainty_score = torch.zeros_like(uncertainty_score)

@@ -265,6 +265,7 @@ def validate_full_config(cfg):
         "time_inputs",
         "time_feature_set",
         "confidence_inputs",
+        "confidence_source",
         "confidence_detach",
     }
     allowed_train = {
@@ -1239,6 +1240,7 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
                     for chosen in selected
                     if chosen.get("embedding") is not None
                 ) if any(chosen.get("embedding") is not None for chosen in selected) else 0.0
+                diversity = min(max(float(diversity) / 2.0, 0.0), 1.0)
             combined = (1.0 - diversity_weight) * float(record.get("drift_score", 0.0)) + diversity_weight * float(diversity)
             if combined > best_score:
                 best_score = combined
@@ -1263,6 +1265,8 @@ def _select_dbta_records(records, target: int, cfg):
 
     def _select_subset(pool, budget):
         if selection_mode == "topk":
+            return sorted(pool, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
+        if diversity_weight <= 0.0:
             return sorted(pool, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
         return _greedy_diversity_select(
             pool,
@@ -2894,6 +2898,7 @@ def main():
         drift_evidence_disagreement_weight=float(c_model.get("drift_evidence_disagreement_weight", 1.0)),
         drift_evidence_alignment_weight=float(c_model.get("drift_evidence_alignment_weight", 1.0)),
         confidence_inputs=bool(c_gate.get("confidence_inputs", True)),
+        confidence_source=str(c_gate.get("confidence_source", "raw_or_calibrated")),
         confidence_detach=bool(c_gate.get("confidence_detach", True)),
         gate_mode=str(c_gate["mode"]),
         gate_detach=bool(c_gate["detach"]),

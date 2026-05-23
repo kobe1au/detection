@@ -141,7 +141,54 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertIn("q_time", extra)
         self.assertIn("q_drift", extra)
 
-    def test_temporal_features_are_batch_invariant_when_sample_evidence_matches(self):
+    def test_gate_confidence_source_raw_ignores_temperatures(self):
+        model = make_model(
+            "ours",
+            confidence_source="raw",
+        )
+        model.branch_temperatures = {"api": 9.0, "graph": 7.0, "joint": 5.0}
+        api_logits = torch.tensor([[4.0, 1.0]], dtype=torch.float32)
+        graph_logits = torch.tensor([[2.5, 0.5]], dtype=torch.float32)
+        joint_logits = torch.tensor([[3.0, 0.0]], dtype=torch.float32)
+
+        api_conf, graph_conf, joint_conf = model._compute_branch_confidences(
+            api_logits,
+            graph_logits,
+            joint_logits,
+            torch.float32,
+        )
+
+        expected_api = torch.softmax(api_logits, dim=-1).amax(dim=-1, keepdim=True)
+        expected_graph = torch.softmax(graph_logits, dim=-1).amax(dim=-1, keepdim=True)
+        expected_joint = torch.softmax(joint_logits, dim=-1).amax(dim=-1, keepdim=True)
+        self.assertTrue(torch.allclose(api_conf, expected_api, atol=1e-6))
+        self.assertTrue(torch.allclose(graph_conf, expected_graph, atol=1e-6))
+        self.assertTrue(torch.allclose(joint_conf, expected_joint, atol=1e-6))
+
+    def test_gate_confidence_source_calibrated_uses_temperatures(self):
+        model = make_model(
+            "ours",
+            confidence_source="calibrated",
+        )
+        model.branch_temperatures = {"api": 2.0, "graph": 4.0, "joint": 8.0}
+        api_logits = torch.tensor([[4.0, 1.0]], dtype=torch.float32)
+        graph_logits = torch.tensor([[2.5, 0.5]], dtype=torch.float32)
+        joint_logits = torch.tensor([[3.0, 0.0]], dtype=torch.float32)
+
+        api_conf, graph_conf, joint_conf = model._compute_branch_confidences(
+            api_logits,
+            graph_logits,
+            joint_logits,
+            torch.float32,
+        )
+
+        expected_api = torch.softmax(api_logits / 2.0, dim=-1).amax(dim=-1, keepdim=True)
+        expected_graph = torch.softmax(graph_logits / 4.0, dim=-1).amax(dim=-1, keepdim=True)
+        expected_joint = torch.softmax(joint_logits / 8.0, dim=-1).amax(dim=-1, keepdim=True)
+        self.assertTrue(torch.allclose(api_conf, expected_api, atol=1e-6))
+        self.assertTrue(torch.allclose(graph_conf, expected_graph, atol=1e-6))
+        self.assertTrue(torch.allclose(joint_conf, expected_joint, atol=1e-6))
+
         model = make_model(
             "ours",
             use_time_gate_inputs=True,
