@@ -101,7 +101,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
             historical_time_id_max=1,
         )
         model.eval()
-        self.assertEqual(model.gate_net.q_dim, 11)
+        self.assertEqual(model.gate_net.q_dim, 12)
         logits, extra = model(
             graph_data=make_graph_batch(),
             explicit_qs=make_explicit_qs(),
@@ -112,6 +112,9 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits).all())
         self.assertIn("q_time", extra)
         self.assertIn("q_drift", extra)
+        self.assertIn("api_confidence", extra)
+        self.assertIn("graph_confidence", extra)
+        self.assertIn("joint_confidence", extra)
 
     def test_quality_only_gate_excludes_temporal_reliability_inputs(self):
         model = make_model(
@@ -126,7 +129,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
             historical_time_id_max=1,
         )
         model.eval()
-        self.assertEqual(model.gate_net.q_dim, 9)
+        self.assertEqual(model.gate_net.q_dim, 10)
         logits, extra = model(
             graph_data=make_graph_batch(),
             explicit_qs=make_explicit_qs(),
@@ -138,7 +141,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
         self.assertIn("q_time", extra)
         self.assertIn("q_drift", extra)
 
-    def test_temporal_features_are_batch_invariant(self):
+    def test_temporal_features_are_batch_invariant_when_sample_evidence_matches(self):
         model = make_model(
             "ours",
             use_time_gate_inputs=True,
@@ -147,20 +150,52 @@ class AllFusionModesForwardTest(unittest.TestCase):
             num_time_domains=5,
             historical_time_id_max=2,
         )
-        q_time_single, q_drift_single = model._build_temporal_reliability(
+        q_time_single, q_drift_single, _, _, _ = model._build_temporal_reliability(
             torch.tensor([3], dtype=torch.long),
             1,
             torch.device("cpu"),
             torch.float32,
+            disagreement=torch.tensor([0.25], dtype=torch.float32),
+            entropy=torch.tensor([0.40], dtype=torch.float32),
+            alignment_coverage=torch.tensor([0.60], dtype=torch.float32),
+            alignment_density=torch.tensor([0.81], dtype=torch.float32),
         )
-        q_time_mixed, q_drift_mixed = model._build_temporal_reliability(
+        q_time_mixed, q_drift_mixed, _, _, _ = model._build_temporal_reliability(
             torch.tensor([0, 3, 4], dtype=torch.long),
             3,
             torch.device("cpu"),
             torch.float32,
+            disagreement=torch.tensor([0.10, 0.25, 0.90], dtype=torch.float32),
+            entropy=torch.tensor([0.20, 0.40, 0.95], dtype=torch.float32),
+            alignment_coverage=torch.tensor([0.90, 0.60, 0.10], dtype=torch.float32),
+            alignment_density=torch.tensor([0.90, 0.81, 0.05], dtype=torch.float32),
         )
         self.assertTrue(torch.allclose(q_time_single.view(-1), q_time_mixed[1].view(-1)))
         self.assertTrue(torch.allclose(q_drift_single.view(-1), q_drift_mixed[1].view(-1)))
+
+    def test_q_drift_changes_with_sample_evidence_at_fixed_time(self):
+        model = make_model(
+            "ours",
+            use_temporal_reliability=True,
+            use_drift_reliability=True,
+            num_time_domains=5,
+            historical_time_id_max=2,
+        )
+        q_time, q_drift, drift_prior, drift_evidence, drift_score = model._build_temporal_reliability(
+            torch.tensor([3, 3], dtype=torch.long),
+            2,
+            torch.device("cpu"),
+            torch.float32,
+            disagreement=torch.tensor([0.05, 0.95], dtype=torch.float32),
+            entropy=torch.tensor([0.10, 0.90], dtype=torch.float32),
+            alignment_coverage=torch.tensor([0.95, 0.15], dtype=torch.float32),
+            alignment_density=torch.tensor([0.90, 0.10], dtype=torch.float32),
+        )
+        self.assertTrue(torch.allclose(q_time[0].view(-1), q_time[1].view(-1)))
+        self.assertTrue(torch.allclose(drift_prior[0].view(-1), drift_prior[1].view(-1)))
+        self.assertGreater(float(drift_evidence[1].item()), float(drift_evidence[0].item()))
+        self.assertGreater(float(drift_score[1].item()), float(drift_score[0].item()))
+        self.assertLess(float(q_drift[1].item()), float(q_drift[0].item()))
 
 
 if __name__ == "__main__":

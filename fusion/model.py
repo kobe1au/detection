@@ -347,6 +347,12 @@ class MalwareModelWithXAttn(nn.Module):
         time_feature_set: str = "basic",
         use_temporal_reliability: bool = False,
         use_drift_reliability: bool = False,
+        drift_mix_lambda: float = 0.5,
+        drift_evidence_uncertainty_weight: float = 1.0,
+        drift_evidence_disagreement_weight: float = 1.0,
+        drift_evidence_alignment_weight: float = 1.0,
+        confidence_inputs: bool = True,
+        confidence_detach: bool = True,
         gate_mode: str = "learned",
         late_fusion_api_weight: float = 0.5,
         num_time_domains: int = 1,
@@ -417,6 +423,12 @@ class MalwareModelWithXAttn(nn.Module):
         self.time_feature_set = str(time_feature_set or "basic").lower()
         self.use_temporal_reliability = bool(use_temporal_reliability)
         self.use_drift_reliability = bool(use_drift_reliability)
+        self.drift_mix_lambda = min(max(float(drift_mix_lambda), 0.0), 1.0)
+        self.drift_evidence_uncertainty_weight = max(float(drift_evidence_uncertainty_weight), 0.0)
+        self.drift_evidence_disagreement_weight = max(float(drift_evidence_disagreement_weight), 0.0)
+        self.drift_evidence_alignment_weight = max(float(drift_evidence_alignment_weight), 0.0)
+        self.confidence_inputs = bool(confidence_inputs)
+        self.confidence_detach = bool(confidence_detach)
         self.num_time_domains = max(int(num_time_domains), 1)
         self.historical_time_id_max = (
             max(int(historical_time_id_max), 0)
@@ -507,13 +519,15 @@ class MalwareModelWithXAttn(nn.Module):
         if self._need_gates:
             # Gate input dimensions must exactly match forward() concatenation.
             # Composition: 5 explicit quality features + optional
-            # q_time/q_drift + optional time features + 4 uncertainty/alive.
+            # q_time/q_drift + optional time features + uncertainty/alive + optional confidences.
             gate_q_dim = 5
             if self.use_gate_temporal_reliability_inputs:
                 gate_q_dim += 2
             if self.use_time_gate_inputs:
                 gate_q_dim += 4
             gate_q_dim += 4  # disagreement, entropy, api_alive, graph_alive
+            if self.confidence_inputs:
+                gate_q_dim += 3  # api, graph, joint calibrated confidences
             self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=gate_q_dim)
         else:
             self.gate_net = None
@@ -637,12 +651,77 @@ class MalwareModelWithXAttn(nn.Module):
         future_span = max(float(self.num_time_domains - 1) - hist_max, 1.0)
         return ((tids_f - hist_max).clamp_min(0.0) / future_span).to(dtype=dtype).clamp(0.0, 1.0)
 
-    def _build_temporal_reliability(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
+    def _build_sample_drift_evidence(
+        self,
+        disagreement: torch.Tensor | None,
+        entropy: torch.Tensor | None,
+        alignment_coverage: torch.Tensor | None,
+        alignment_density: torch.Tensor | None,
+        batch_size: int,
+        device,
+        dtype,
+    ):
+        disagreement_term = (
+            disagreement.to(device=device, dtype=dtype).view(batch_size, 1).clamp(0.0, 1.0)
+            if isinstance(disagreement, torch.Tensor)
+            else torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        )
+        entropy_term = (
+            entropy.to(device=device, dtype=dtype).view(batch_size, 1).clamp(0.0, 1.0)
+            if isinstance(entropy, torch.Tensor)
+            else torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        )
+
+        alignment_strength = torch.ones((batch_size, 1), device=device, dtype=dtype)
+        if isinstance(alignment_coverage, torch.Tensor):
+            alignment_strength = alignment_strength * alignment_coverage.to(device=device, dtype=dtype).view(batch_size, 1).clamp(0.0, 1.0)
+        if isinstance(alignment_density, torch.Tensor):
+            alignment_strength = alignment_strength * alignment_density.to(device=device, dtype=dtype).view(batch_size, 1).clamp(0.0, 1.0).sqrt()
+        alignment_weakness = (1.0 - alignment_strength).clamp(0.0, 1.0)
+
+        weight_sum = max(
+            self.drift_evidence_uncertainty_weight
+            + self.drift_evidence_disagreement_weight
+            + self.drift_evidence_alignment_weight,
+            1e-8,
+        )
+        evidence = (
+            self.drift_evidence_uncertainty_weight * entropy_term
+            + self.drift_evidence_disagreement_weight * disagreement_term
+            + self.drift_evidence_alignment_weight * alignment_weakness
+        ) / weight_sum
+        return evidence.clamp(0.0, 1.0)
+
+    def _build_temporal_reliability(
+        self,
+        time_ids: torch.Tensor | None,
+        batch_size: int,
+        device,
+        dtype,
+        disagreement: torch.Tensor | None = None,
+        entropy: torch.Tensor | None = None,
+        alignment_coverage: torch.Tensor | None = None,
+        alignment_density: torch.Tensor | None = None,
+    ):
         tids = self._normalize_time_ids(time_ids, batch_size, device)
         time_pos = self._global_time_position(tids, dtype).view(batch_size, 1)
         q_time = (1.0 - 0.35 * time_pos).clamp(0.35, 1.0)
-        q_drift = self._global_drift_position(tids, dtype).view(batch_size, 1)
-        return q_time, q_drift
+        drift_prior = self._global_drift_position(tids, dtype).view(batch_size, 1)
+        drift_evidence = self._build_sample_drift_evidence(
+            disagreement=disagreement,
+            entropy=entropy,
+            alignment_coverage=alignment_coverage,
+            alignment_density=alignment_density,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        drift_score = (
+            self.drift_mix_lambda * drift_prior
+            + (1.0 - self.drift_mix_lambda) * drift_evidence
+        ).clamp(0.0, 1.0)
+        q_drift = (1.0 - drift_score).clamp(0.0, 1.0)
+        return q_time, q_drift, drift_prior, drift_evidence, drift_score
 
     def _build_time_gate_features(self, time_ids: torch.Tensor | None, batch_size: int, device, dtype):
         if not self.use_time_gate_inputs:
@@ -687,6 +766,24 @@ class MalwareModelWithXAttn(nn.Module):
         ) / denom
 
         return uncertainty_score.clamp(0.0, 1.0), disagreement, entropy
+
+    def _compute_branch_confidences(self, api_logits, graph_logits, joint_logits, dtype):
+        temperatures = getattr(self, "branch_temperatures", None) or {}
+
+        def _temperature(name: str):
+            value = temperatures.get(name, 1.0)
+            if isinstance(value, torch.Tensor):
+                return value.to(device=api_logits.device, dtype=torch.float32).clamp_min(1e-6)
+            return torch.tensor(float(value), device=api_logits.device, dtype=torch.float32).clamp_min(1e-6)
+
+        confidences = []
+        for name, logits in (("api", api_logits), ("graph", graph_logits), ("joint", joint_logits)):
+            scaled = logits.float() / _temperature(name)
+            conf = torch.softmax(scaled, dim=-1).amax(dim=-1, keepdim=True)
+            if self.confidence_detach:
+                conf = conf.detach()
+            confidences.append(conf.to(device=api_logits.device, dtype=dtype).clamp(0.0, 1.0))
+        return tuple(confidences)
 
     @staticmethod
     def _modality_alive(emb: torch.Tensor) -> torch.Tensor:
@@ -839,7 +936,7 @@ class MalwareModelWithXAttn(nn.Module):
 
         time_weight = q_time.detach().view(-1).clamp(0.0, 1.0)
         if self.use_drift_reliability:
-            time_weight = time_weight * (1.0 - q_drift.detach().view(-1).clamp(0.0, 1.0))
+            time_weight = time_weight * q_drift.detach().view(-1).clamp(0.0, 1.0)
 
         return {
             "local_alignment_node": node_dense,
@@ -959,10 +1056,58 @@ class MalwareModelWithXAttn(nn.Module):
 
         raw_qs = self._explicit_qs_to_tensor(explicit_qs, B, device, dtype)
 
-        q_time, q_drift = self._build_temporal_reliability(time_ids, B, device, dtype)
         time_gate_features = self._build_time_gate_features(time_ids, B, device, dtype)
 
-        gate_quality_qs = raw_qs.clone()
+        alignment_coverage_prior = None
+        alignment_density_prior = None
+        if masks is not None and self.fusion_mode == "ours":
+            alignment_coverage_prior, alignment_density_prior = self._summarize_alignment_masks(
+                masks,
+                B,
+                device,
+                dtype,
+            )
+            extra_alignment = {
+                "alignment_coverage_prior": alignment_coverage_prior.detach(),
+                "alignment_density_prior": alignment_density_prior.detach(),
+            }
+        else:
+            extra_alignment = {}
+
+        if self._need_api_encoder:
+            api_logits = self.api_head(api_emb) if self.api_head is not None else None
+        else:
+            api_logits = None
+        if self._need_graph_encoder:
+            graph_logits = self.graph_head(graph_emb) if self.graph_head is not None else None
+        else:
+            graph_logits = None
+
+        uncertainty_score = torch.zeros((B, 1), device=device, dtype=dtype)
+        gate_disagreement = torch.zeros((B, 1), device=device, dtype=dtype)
+        gate_entropy = torch.zeros((B, 1), device=device, dtype=dtype)
+        if api_logits is not None and graph_logits is not None:
+            provisional_joint = self.joint_head(torch.cat([api_emb, graph_emb], dim=-1)) if self.joint_head is not None else api_logits
+            uncertainty_score, gate_disagreement, gate_entropy = self._compute_branch_uncertainty(
+                api_logits,
+                graph_logits,
+                provisional_joint,
+            )
+            uncertainty_score = uncertainty_score.to(device=device, dtype=dtype)
+            gate_disagreement = gate_disagreement.to(device=device, dtype=dtype)
+            gate_entropy = gate_entropy.to(device=device, dtype=dtype)
+
+        q_time, q_drift, drift_prior, drift_evidence, drift_score = self._build_temporal_reliability(
+            time_ids,
+            B,
+            device,
+            dtype,
+            disagreement=gate_disagreement,
+            entropy=gate_entropy,
+            alignment_coverage=alignment_coverage_prior,
+            alignment_density=alignment_density_prior,
+        )
+        gate_quality_qs = raw_qs[:, :5]
         if not self.use_quality_gate_inputs:
             neutral_qs = torch.ones_like(gate_quality_qs)
             if neutral_qs.size(1) > 3:
@@ -985,21 +1130,13 @@ class MalwareModelWithXAttn(nn.Module):
             extra["time_ids"] = time_ids
         extra["q_time"] = q_time.detach().view(B)
         extra["q_drift"] = q_drift.detach().view(B)
+        extra["drift_prior"] = drift_prior.detach().view(B)
+        extra["drift_evidence"] = drift_evidence.detach().view(B)
+        extra["drift_score"] = drift_score.detach().view(B)
         if time_gate_features.numel() > 0:
             extra["time_gate_features"] = time_gate_features.detach()
             extra["time_recency_signal"] = time_gate_features[:, 1].detach()
-
-        alignment_coverage_prior = None
-        alignment_density_prior = None
-        if masks is not None and self.fusion_mode == "ours":
-            alignment_coverage_prior, alignment_density_prior = self._summarize_alignment_masks(
-                masks,
-                B,
-                device,
-                dtype,
-            )
-            extra["alignment_coverage_prior"] = alignment_coverage_prior.detach()
-            extra["alignment_density_prior"] = alignment_density_prior.detach()
+        extra.update(extra_alignment)
 
         if self.fusion_mode == "api":
             logits = self.api_head(api_emb)
@@ -1043,8 +1180,8 @@ class MalwareModelWithXAttn(nn.Module):
                     semantic_quality = semantic_quality * q_time.detach().view(-1).clamp(0.0, 1.0)
                     extra["semantic_alignment_time_gate"] = q_time.detach().view(-1)
                 if self.use_drift_reliability:
-                    semantic_quality = semantic_quality * (1.0 - q_drift.detach().view(-1).clamp(0.0, 1.0))
-                    extra["semantic_alignment_drift_gate"] = (1.0 - q_drift.detach().view(-1).clamp(0.0, 1.0))
+                    semantic_quality = semantic_quality * q_drift.detach().view(-1).clamp(0.0, 1.0)
+                    extra["semantic_alignment_drift_gate"] = q_drift.detach().view(-1).clamp(0.0, 1.0)
                 if alignment_coverage_prior is not None and alignment_density_prior is not None:
                     coverage_gate = alignment_coverage_prior.detach().view(-1).clamp(0.0, 1.0)
                     density_gate = alignment_density_prior.detach().view(-1).clamp(0.0, 1.0).sqrt()
@@ -1238,6 +1375,17 @@ class MalwareModelWithXAttn(nn.Module):
         if self.use_time_gate_inputs:
             gate_inputs_parts.append(time_gate_features)
         gate_inputs_parts.extend([gate_disagreement, gate_entropy, api_alive, graph_alive])
+        if self.confidence_inputs:
+            api_conf, graph_conf, joint_conf = self._compute_branch_confidences(
+                api_logits,
+                graph_logits,
+                joint_logits,
+                dtype,
+            )
+            gate_inputs_parts.extend([api_conf, graph_conf, joint_conf])
+            extra["api_confidence"] = api_conf.detach().view(B)
+            extra["graph_confidence"] = graph_conf.detach().view(B)
+            extra["joint_confidence"] = joint_conf.detach().view(B)
         gate_inputs = torch.cat(gate_inputs_parts, dim=-1)
 
         if self.gate_mode == "fixed" or self.force_fixed_gate:

@@ -26,6 +26,7 @@ from fusion.losses import compute_total_loss
 from fusion.constants import TrainingConstants
 from fusion.calibration import (
     TemperatureScaling,
+    MultiBranchTemperatureScaling,
     compute_calibration_metrics_from_logits,
 )
 from fusion.utils import get_amp_context, build_grad_scaler, prepare_batch
@@ -249,6 +250,8 @@ def validate_full_config(cfg):
         "num_classes", "fusion_mode", "max_nodes_gnn", "max_xattn_nodes",
         "api_encoder", "graph_encoder", "alignment", "gate",
         "in_feat_dim",
+        "drift_mix_lambda", "drift_evidence_uncertainty_weight",
+        "drift_evidence_disagreement_weight", "drift_evidence_alignment_weight",
     }
     allowed_api = {"type", "num_hash_buckets", "type_vocab_size", "max_seq_len", "layers", "heads"}
     allowed_graph = {"type", "hidden", "heads", "layers", "use_behavior_hint", "drop_extracted_behavior_hints"}
@@ -261,6 +264,8 @@ def validate_full_config(cfg):
         "detach",
         "time_inputs",
         "time_feature_set",
+        "confidence_inputs",
+        "confidence_detach",
     }
     allowed_train = {
         "exp_name", "seed", "device", "use_amp", "epochs", "batch_size",
@@ -272,6 +277,8 @@ def validate_full_config(cfg):
         "replay_strategy", "adaptation_selection", "dbta_balance",
         "dbta_uncertainty_weight", "dbta_disagreement_weight",
         "dbta_prototype_weight", "dbta_drift_replay_fraction",
+        "dbta_selection_mode", "dbta_diversity_weight",
+        "dbta_diversity_metric", "dbta_diversity_within_balance",
     }
     allowed_loss = {
         "semantic_alignment_weight",
@@ -285,6 +292,10 @@ def validate_full_config(cfg):
         "alignment_use_temporal_soft_weight",
         "alignment_use_temporal_reliability",
         "alignment_use_drift_reliability",
+        "local_alignment_positive_weight",
+        "local_alignment_negative_weight",
+        "local_alignment_negative_temperature",
+        "local_alignment_margin",
     }
 
     def _reject_unknown(path, value, allowed):
@@ -317,7 +328,13 @@ def validate_full_config(cfg):
     _reject_unknown("loss", cfg["loss"], allowed_loss)
 
     _require_keys("data", cfg["data"], allowed_data, optional={"extra_tests", "adapt_pt_dir", "adapt_csv"})
-    _require_keys("model", cfg["model"], allowed_model, optional={"in_feat_dim"})
+    _require_keys("model", cfg["model"], allowed_model, optional={
+        "in_feat_dim",
+        "drift_mix_lambda",
+        "drift_evidence_uncertainty_weight",
+        "drift_evidence_disagreement_weight",
+        "drift_evidence_alignment_weight",
+    })
     _require_keys("model.api_encoder", cfg["model"]["api_encoder"], allowed_api)
     _require_keys("model.graph_encoder", cfg["model"]["graph_encoder"], allowed_graph)
     _require_keys("model.alignment", cfg["model"]["alignment"], allowed_alignment)
@@ -331,6 +348,8 @@ def validate_full_config(cfg):
             "replay_strategy", "adaptation_selection", "dbta_balance",
             "dbta_uncertainty_weight", "dbta_disagreement_weight",
             "dbta_prototype_weight", "dbta_drift_replay_fraction",
+            "dbta_selection_mode", "dbta_diversity_weight",
+            "dbta_diversity_metric", "dbta_diversity_within_balance",
         },
     )
     _require_keys(
@@ -342,6 +361,10 @@ def validate_full_config(cfg):
             "class_aware_alignment_temperature",
             "max_local_align_nodes",
             "max_local_align_tokens",
+            "local_alignment_positive_weight",
+            "local_alignment_negative_weight",
+            "local_alignment_negative_temperature",
+            "local_alignment_margin",
         },
     )
 
@@ -1176,6 +1199,124 @@ def _select_predicted_label_balanced(records, target: int):
     return selected[:target]
 
 
+def _embedding_cosine_distance(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    a = vec_a.astype(np.float32, copy=False)
+    b = vec_b.astype(np.float32, copy=False)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1e-8:
+        return 0.0
+    sim = float(np.dot(a, b) / denom)
+    return float(np.clip(1.0 - sim, 0.0, 2.0))
+
+
+def _greedy_diversity_select(records, target: int, diversity_weight: float, metric: str = "cosine"):
+    if target <= 0 or not records:
+        return []
+    if target >= len(records):
+        return list(records)
+    if str(metric).lower() != "cosine":
+        raise ValueError(f"Unsupported train.dbta_diversity_metric={metric}; expected cosine")
+
+    diversity_weight = min(max(float(diversity_weight), 0.0), 1.0)
+    if diversity_weight <= 0.0:
+        return sorted(records, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:target]
+
+    selected = []
+    remaining = list(records)
+    remaining.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
+    selected.append(remaining.pop(0))
+
+    while remaining and len(selected) < target:
+        best_idx = 0
+        best_score = -float("inf")
+        for idx, record in enumerate(remaining):
+            emb = record.get("embedding")
+            if emb is None:
+                diversity = 0.0
+            else:
+                diversity = min(
+                    _embedding_cosine_distance(emb, chosen.get("embedding"))
+                    for chosen in selected
+                    if chosen.get("embedding") is not None
+                ) if any(chosen.get("embedding") is not None for chosen in selected) else 0.0
+            combined = (1.0 - diversity_weight) * float(record.get("drift_score", 0.0)) + diversity_weight * float(diversity)
+            if combined > best_score:
+                best_score = combined
+                best_idx = idx
+        selected.append(remaining.pop(best_idx))
+
+    return selected[:target]
+
+
+def _select_dbta_records(records, target: int, cfg):
+    train_cfg = cfg["train"]
+    balance = str(train_cfg.get("dbta_balance", "predicted_label")).lower()
+    selection_mode = str(train_cfg.get("dbta_selection_mode", "diversity_aware")).lower()
+    diversity_weight = float(train_cfg.get("dbta_diversity_weight", 0.3))
+    diversity_metric = str(train_cfg.get("dbta_diversity_metric", "cosine")).lower()
+    diversity_within_balance = bool(train_cfg.get("dbta_diversity_within_balance", True))
+
+    if selection_mode not in {"topk", "diversity_aware"}:
+        raise ValueError(
+            f"Unsupported train.dbta_selection_mode={selection_mode}; expected topk or diversity_aware"
+        )
+
+    def _select_subset(pool, budget):
+        if selection_mode == "topk":
+            return sorted(pool, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
+        return _greedy_diversity_select(
+            pool,
+            budget,
+            diversity_weight=diversity_weight,
+            metric=diversity_metric,
+        )
+
+    if balance == "predicted_label":
+        if not diversity_within_balance:
+            balanced = _select_predicted_label_balanced(records, target)
+            return _select_subset(balanced, min(target, len(balanced)))
+
+        groups: dict[int, list[dict]] = {}
+        for record in records:
+            groups.setdefault(int(record.get("pred_label", 0)), []).append(record)
+        for group_records in groups.values():
+            group_records.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
+
+        n = len(records)
+        quotas = {}
+        remainders = []
+        for group, group_records in groups.items():
+            raw = target * (len(group_records) / max(n, 1))
+            quota = min(len(group_records), int(np.floor(raw)))
+            quotas[group] = quota
+            remainders.append((raw - quota, group))
+
+        remaining_budget = target - sum(quotas.values())
+        for _, group in sorted(remainders, reverse=True):
+            if remaining_budget <= 0:
+                break
+            if quotas[group] < len(groups[group]):
+                quotas[group] += 1
+                remaining_budget -= 1
+
+        selected = []
+        for group, quota in quotas.items():
+            selected.extend(_select_subset(groups[group], quota))
+
+        if len(selected) < target:
+            selected_ids = {id(r) for r in selected}
+            leftovers = [r for r in records if id(r) not in selected_ids]
+            selected.extend(_select_subset(leftovers, target - len(selected)))
+
+        selected.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
+        return selected[:target]
+
+    if balance == "none":
+        return _select_subset(records, target)
+
+    raise ValueError(f"Unsupported train.dbta_balance={balance}; expected predicted_label or none")
+
+
 def _score_and_select_dbta_records(records, cfg):
     train_cfg = cfg["train"]
     target = _budget_count(len(records), float(train_cfg.get("adaptation_ratio", 1.0)))
@@ -1200,12 +1341,7 @@ def _score_and_select_dbta_records(records, cfg):
             score += max(weight, 0.0) * float(normalized[key][i])
         record["drift_score"] = score / weight_sum
 
-    balance = str(train_cfg.get("dbta_balance", "predicted_label")).lower()
-    if balance == "predicted_label":
-        return _select_predicted_label_balanced(records, target)
-    if balance == "none":
-        return sorted(records, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:target]
-    raise ValueError(f"Unsupported train.dbta_balance={balance}; expected predicted_label or none")
+    return _select_dbta_records(records, target, cfg)
 
 
 def _nearest_historical_indices(hist_records, adapt_records, count: int, exclude=None):
@@ -2495,7 +2631,7 @@ def collect_calibrated_outputs(model, calibrator, loader, device, use_amp=False,
                 masks=masks,
             )
 
-        all_p.append(calibrator(logits.float()).detach().cpu().numpy())
+        all_p.append(calibrator(logits.float(), branch="fused").detach().cpu().numpy())
         all_y.append(y.detach().cpu().numpy())
 
     if not all_p or not all_y:
@@ -2753,6 +2889,12 @@ def main():
         time_feature_set=str(c_gate.get("time_feature_set", "basic")),
         use_temporal_reliability=use_temporal_reliability,
         use_drift_reliability=use_drift_reliability,
+        drift_mix_lambda=float(c_model.get("drift_mix_lambda", 0.5)),
+        drift_evidence_uncertainty_weight=float(c_model.get("drift_evidence_uncertainty_weight", 1.0)),
+        drift_evidence_disagreement_weight=float(c_model.get("drift_evidence_disagreement_weight", 1.0)),
+        drift_evidence_alignment_weight=float(c_model.get("drift_evidence_alignment_weight", 1.0)),
+        confidence_inputs=bool(c_gate.get("confidence_inputs", True)),
+        confidence_detach=bool(c_gate.get("confidence_detach", True)),
         gate_mode=str(c_gate["mode"]),
         gate_detach=bool(c_gate["detach"]),
         late_fusion_api_weight=0.5,
@@ -3070,7 +3212,7 @@ def main():
     logger.info("=" * 60)
     logger.info("🎯 Temperature scaling calibration")
 
-    calibrator = TemperatureScaling().to(device)
+    calibrator = MultiBranchTemperatureScaling().to(device)
     best_p = os.path.join(ckpt_dir, f"best_{exp_name}.pt")
     if os.path.exists(best_p):
         model.load_state_dict(
@@ -3083,6 +3225,7 @@ def main():
         logger.info(f"Calibrating on latest year: {ly}")
     # train.py 中 calibrator.fit 调用，增加 use_amp 参数
     calibrator.fit(model, cal_loader, device, max_iter=50, lr=0.01, use_amp=use_amp,strict=True)
+    model.branch_temperatures = calibrator.get_temperature_dict()
     torch.save(calibrator.state_dict(), os.path.join(ckpt_dir, f"calibrator_{exp_name}.pt"))
 
     # ── Test ──

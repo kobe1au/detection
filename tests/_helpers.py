@@ -58,6 +58,12 @@ def make_model(
     use_gate_temporal_reliability_inputs: bool | None = None,
     use_temporal_reliability: bool = False,
     use_drift_reliability: bool = False,
+    confidence_inputs: bool = True,
+    confidence_detach: bool = True,
+    drift_mix_lambda: float = 0.5,
+    drift_evidence_uncertainty_weight: float = 1.0,
+    drift_evidence_disagreement_weight: float = 1.0,
+    drift_evidence_alignment_weight: float = 1.0,
     num_time_domains: int = 2,
     historical_time_id_max: int = 0,
 ):
@@ -88,6 +94,12 @@ def make_model(
         use_gate_temporal_reliability_inputs=use_gate_temporal_reliability_inputs,
         use_temporal_reliability=use_temporal_reliability,
         use_drift_reliability=use_drift_reliability,
+        confidence_inputs=confidence_inputs,
+        confidence_detach=confidence_detach,
+        drift_mix_lambda=drift_mix_lambda,
+        drift_evidence_uncertainty_weight=drift_evidence_uncertainty_weight,
+        drift_evidence_disagreement_weight=drift_evidence_disagreement_weight,
+        drift_evidence_alignment_weight=drift_evidence_alignment_weight,
     )
 
 
@@ -96,6 +108,11 @@ def make_loss_cfg():
         "semantic_alignment_weight": 0.03,
         "class_aware_alignment_same_class_weight": 0.25,
         "class_aware_alignment_temperature": 0.2,
+        "local_alignment_weight": 0.02,
+        "local_alignment_positive_weight": 1.0,
+        "local_alignment_negative_weight": 0.5,
+        "local_alignment_negative_temperature": 0.2,
+        "local_alignment_margin": 0.35,
         "max_local_align_nodes": 8,
         "max_local_align_tokens": 8,
         "stage1_branch_aux_weight": 0.0,

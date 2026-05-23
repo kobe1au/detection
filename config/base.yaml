@@ -24,6 +24,10 @@ model:
   fusion_mode: ours
   max_nodes_gnn: 12288
   max_xattn_nodes: 1024
+  drift_mix_lambda: 0.5
+  drift_evidence_uncertainty_weight: 1.0
+  drift_evidence_disagreement_weight: 1.0
+  drift_evidence_alignment_weight: 1.0
 
   api_encoder:
     type: transformer
@@ -55,6 +59,8 @@ model:
     uncertainty_inputs: true
     time_inputs: true
     time_feature_set: basic
+    confidence_inputs: true
+    confidence_detach: true
     detach: true
 
 train:
@@ -88,6 +94,10 @@ train:
   dbta_uncertainty_weight: 1.0
   dbta_disagreement_weight: 1.0
   dbta_prototype_weight: 1.0
+  dbta_selection_mode: diversity_aware
+  dbta_diversity_weight: 0.3
+  dbta_diversity_metric: cosine
+  dbta_diversity_within_balance: true
   dbta_drift_replay_fraction: 0.5
   eta_min: 0.000001
   label_smoothing: 0.05
@@ -99,6 +109,10 @@ loss:
   class_aware_alignment_same_class_weight: 0.20
   class_aware_alignment_temperature: 0.2
   local_alignment_weight: 0.02
+  local_alignment_positive_weight: 1.0
+  local_alignment_negative_weight: 0.5
+  local_alignment_negative_temperature: 0.2
+  local_alignment_margin: 0.35
   max_local_align_nodes: 128
   max_local_align_tokens: 256
   alignment_use_temporal_soft_weight: false

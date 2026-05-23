@@ -64,8 +64,26 @@ class TemperatureScaling(nn.Module):
     def temperature(self):
         return self.log_temperature.exp().clamp_min(1e-6)
 
+    def scale_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        return logits / self.temperature
+
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(logits / self.temperature, dim=-1)
+        return torch.softmax(self.scale_logits(logits), dim=-1)
+
+    def fit_logits(self, logits: torch.Tensor, labels: torch.Tensor, device, max_iter=50, lr=0.01):
+        logits = logits.to(device).float()
+        labels = labels.to(device)
+        optimizer = torch.optim.LBFGS([self.log_temperature], lr=lr, max_iter=max_iter)
+
+        def eval_loss():
+            optimizer.zero_grad()
+            loss = F.cross_entropy(self.scale_logits(logits), labels)
+            if not torch.isfinite(loss):
+                loss = logits.new_tensor(0.0, requires_grad=True)
+            loss.backward()
+            return loss
+
+        optimizer.step(eval_loss)
 
     def fit(self, model, val_loader, device, max_iter=50, lr=0.01, use_amp=False, strict=True):
         model.eval()
@@ -118,7 +136,7 @@ class TemperatureScaling(nn.Module):
                         failed_batches += 1
                         continue
                     all_logits.append(logits.detach().cpu())
-                    all_labels.append(y.detach().cpu()) 
+                    all_labels.append(y.detach().cpu())
                 except Exception as e:
                     if strict:
                         raise RuntimeError(f"[calibration] batch failed under strict mode: {e}") from e
@@ -137,30 +155,21 @@ class TemperatureScaling(nn.Module):
         if failed_batches > 0:
             logger.warning(f"Calibration: {failed_batches} batches failed")
 
-        all_logits = torch.cat(all_logits, dim=0).to(device).float()
-        all_labels = torch.cat(all_labels, dim=0).to(device)
-
-        optimizer = torch.optim.LBFGS([self.log_temperature], lr=lr, max_iter=max_iter)
-
-        def eval_loss():
-            optimizer.zero_grad()
-            loss = F.cross_entropy(all_logits / self.temperature, all_labels)
-            if not torch.isfinite(loss):
-                loss = all_logits.new_tensor(0.0, requires_grad=True)
-            loss.backward()
-            return loss
-
-        optimizer.step(eval_loss)
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+        self.fit_logits(all_logits, all_labels, device=device, max_iter=max_iter, lr=lr)
 
         with torch.no_grad():
-            before_probs = torch.softmax(all_logits, dim=-1)
-            after_probs = self(all_logits)
-            ece_b = compute_ece(before_probs, all_labels)
-            ece_a = compute_ece(after_probs, all_labels)
-            nll_b = compute_nll(before_probs, all_labels)
-            nll_a = compute_nll(after_probs, all_labels)
-            br_b  = compute_brier(before_probs, all_labels)
-            br_a  = compute_brier(after_probs, all_labels)
+            logits_device = all_logits.to(device).float()
+            labels_device = all_labels.to(device)
+            before_probs = torch.softmax(logits_device, dim=-1)
+            after_probs = self(logits_device)
+            ece_b = compute_ece(before_probs, labels_device)
+            ece_a = compute_ece(after_probs, labels_device)
+            nll_b = compute_nll(before_probs, labels_device)
+            nll_a = compute_nll(after_probs, labels_device)
+            br_b  = compute_brier(before_probs, labels_device)
+            br_a  = compute_brier(after_probs, labels_device)
 
         logger.info(
             f"Temperature calibration done: T={self.temperature.item():.4f} | "
@@ -180,3 +189,94 @@ class TemperatureScaling(nn.Module):
     @staticmethod
     def _compute_brier(probs: torch.Tensor, labels: torch.Tensor) -> float:
         return compute_brier(probs, labels)
+
+
+class MultiBranchTemperatureScaling(nn.Module):
+    def __init__(self, branch_names=("api", "graph", "joint", "fused")):
+        super().__init__()
+        self.branch_names = tuple(branch_names)
+        self.calibrators = nn.ModuleDict({name: TemperatureScaling() for name in self.branch_names})
+
+    def scale_logits(self, logits: torch.Tensor, branch: str = "fused") -> torch.Tensor:
+        return self.calibrators[branch].scale_logits(logits)
+
+    def forward(self, logits: torch.Tensor, branch: str = "fused") -> torch.Tensor:
+        return self.calibrators[branch](logits)
+
+    def get_temperature_dict(self) -> dict[str, float]:
+        return {
+            name: float(cal.temperature.detach().cpu().item())
+            for name, cal in self.calibrators.items()
+        }
+
+    def fit(self, model, val_loader, device, max_iter=50, lr=0.01, use_amp=False, strict=True):
+        model.eval()
+        self.to(device)
+        self.train()
+        all_labels = []
+        branch_logits = {name: [] for name in self.branch_names}
+        failed_batches = 0
+        logger.info("Collecting validation branch logits for calibration...")
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Calibration data collection"):
+                if batch is None:
+                    if strict:
+                        raise RuntimeError("[calibration] got None batch")
+                    failed_batches += 1
+                    continue
+
+                if strict and int(batch.get("num_failed", 0) or 0) > 0:
+                    raise RuntimeError(
+                        "[calibration] failed samples found: "
+                        + "; ".join(
+                            f"sid={x.get('sid')} path={x.get('path')} reason={x.get('reason')}"
+                            for x in (batch.get("failed_items", []) or [])[:5]
+                        )
+                    )
+                try:
+                    result = prepare_batch(batch, device,
+                                        skip_graph=False,
+                                        skip_masks=(model.fusion_mode != "ours" or not getattr(model, "use_alignment_bias", False)))
+                    if result[2] is None:
+                        msg = "[calibration] prepare_batch produced invalid batch"
+                        if strict:
+                            raise RuntimeError(msg)
+                        failed_batches += 1
+                        continue
+                    graph, masks, y, _, explicit_info, _ = result
+                    q_apis, q_graphs, q_aligns, pert_apis, pert_graphs, time_ids = explicit_info
+                    with get_amp_context(device, enabled=use_amp):
+                        logits, extra = model(
+                            graph_data=graph,
+                            explicit_qs=(q_apis, q_graphs, q_aligns, pert_apis, pert_graphs),
+                            time_ids=time_ids,
+                            masks=masks,
+                        )
+                    all_labels.append(y.detach().cpu())
+                    branch_logits["fused"].append(logits.detach().cpu())
+                    for name, key in (("api", "api_logits_aux"), ("graph", "graph_logits_aux"), ("joint", "joint_logits_aux")):
+                        value = extra.get(key)
+                        if not isinstance(value, torch.Tensor):
+                            raise RuntimeError(f"[calibration] missing branch logits: {key}")
+                        branch_logits[name].append(value.detach().cpu())
+                except Exception as e:
+                    if strict:
+                        raise RuntimeError(f"[calibration] batch failed under strict mode: {e}") from e
+                    logger.warning(f"Calibration batch failed: {e}")
+                    failed_batches += 1
+                    continue
+
+        if not all_labels or not branch_logits["fused"]:
+            raise RuntimeError("Calibration failed: no valid data collected")
+        if failed_batches > 0:
+            logger.warning(f"Calibration: {failed_batches} batches failed")
+
+        labels = torch.cat(all_labels, dim=0)
+        for name in self.branch_names:
+            logits = torch.cat(branch_logits[name], dim=0)
+            self.calibrators[name].fit_logits(logits, labels, device=device, max_iter=max_iter, lr=lr)
+
+        logger.info(
+            "Branch temperature calibration done: "
+            + ", ".join(f"{name}={temp:.4f}" for name, temp in self.get_temperature_dict().items())
+        )

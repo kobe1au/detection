@@ -89,6 +89,10 @@ class LossComponentsFiniteTest(unittest.TestCase):
             {
                 "semantic_alignment_weight": 0.0,
                 "local_alignment_weight": 0.5,
+                "local_alignment_positive_weight": 1.0,
+                "local_alignment_negative_weight": 0.7,
+                "local_alignment_negative_temperature": 0.15,
+                "local_alignment_margin": 0.20,
                 "max_local_align_nodes": 2,
                 "max_local_align_tokens": 3,
                 "branch_aux_weight": 0.0,

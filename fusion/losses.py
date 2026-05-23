@@ -176,6 +176,9 @@ def _local_alignment_loss(
     margin: float = 0.35,
     max_nodes: int = 0,
     max_tokens: int = 0,
+    positive_weight: float = 1.0,
+    negative_weight: float = 0.5,
+    negative_temperature: float = 0.2,
 ) -> torch.Tensor:
     if (
         node_features is None
@@ -231,18 +234,28 @@ def _local_alignment_loss(
         return sim.new_tensor(0.0)
 
     pos_sim = (sim * weights).sum(dim=(1, 2)) / pos_mass.clamp_min(1e-8)
+    pos_loss = positive_weight * (1.0 - pos_sim)
 
-    neg_mask = 1.0 - (weights > 0).float()
+    neg_mask = (weights <= 0).float()
     if node_valid is not None and isinstance(node_valid, torch.Tensor):
         neg_mask = neg_mask * node_valid.to(sim.device).float().view(weights.size(0), weights.size(1), 1)
     if api_valid is not None and isinstance(api_valid, torch.Tensor):
         neg_mask = neg_mask * api_valid.to(sim.device).float().view(weights.size(0), 1, weights.size(2))
 
-    neg_scores = sim.masked_fill(neg_mask <= 0, -1.0)
-    hardest_neg = neg_scores.amax(dim=(1, 2))
-    hardest_neg = torch.where(hardest_neg > -1.0, hardest_neg, pos_sim.detach().new_zeros(pos_sim.shape))
+    neg_temp = max(float(negative_temperature), 1e-4)
+    neg_logits = sim / neg_temp
+    neg_logits = neg_logits.masked_fill(neg_mask <= 0, float("-inf"))
+    has_neg = neg_mask.sum(dim=(1, 2)) > 0
+    soft_neg = torch.zeros_like(pos_sim)
+    if has_neg.any():
+        neg_lse = torch.logsumexp(neg_logits[has_neg].view(has_neg.sum(), -1), dim=-1)
+        neg_norm = neg_mask[has_neg].sum(dim=(1, 2)).clamp_min(1.0).log()
+        soft_neg_val = (neg_lse - neg_norm).tanh().clamp_min(0.0)
+        if margin is not None:
+            soft_neg_val = F.relu(soft_neg_val - max(float(margin), 0.0))
+        soft_neg[has_neg] = soft_neg_val
 
-    per_sample = F.relu(margin + hardest_neg - pos_sim) + (1.0 - pos_sim)
+    per_sample = pos_loss + negative_weight * soft_neg
 
     sample_weight = torch.ones_like(per_sample)
     if quality_weights is not None:
@@ -310,8 +323,12 @@ def compute_total_loss(logits, extra, y, criterion, loss_cfg, epoch=0, total_epo
             extra.get("local_alignment_api_valid"),
             extra.get("local_alignment_quality"),
             extra.get("local_alignment_time_weight"),
+            margin=float(loss_cfg.get("local_alignment_margin", 0.35)),
             max_nodes=int(loss_cfg.get("max_local_align_nodes", 0) or 0),
             max_tokens=int(loss_cfg.get("max_local_align_tokens", 0) or 0),
+            positive_weight=float(loss_cfg.get("local_alignment_positive_weight", 1.0)),
+            negative_weight=float(loss_cfg.get("local_alignment_negative_weight", 0.5)),
+            negative_temperature=float(loss_cfg.get("local_alignment_negative_temperature", 0.2)),
         ))
 
     loss_branch_aux = zero
