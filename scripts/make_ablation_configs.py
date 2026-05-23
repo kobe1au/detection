@@ -127,6 +127,18 @@ def meta(exp_name: str, group: str) -> dict:
         },
     }
 
+I1_HIST_CKPT = (
+    "experiments/i1_dbta/I1_00_historical_concat/42/"
+    "best_I1_00_historical_concat.pt"
+)
+
+def i1_warm_start() -> dict:
+    return {
+        "train": {
+            "warm_start_historical_ckpt": I1_HIST_CKPT,
+        }
+    }
+
 
 def historical_train() -> dict:
     return {
@@ -369,6 +381,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_01_random020_no_replay.yaml",
         "I1_01_random020_no_replay",
         continual_train(0.20, 0.0, "static", "random"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -378,6 +391,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_02_random020_static_replay.yaml",
         "I1_02_random020_static_replay",
         continual_train(0.20, 0.25, "static", "random"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -387,6 +401,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_03_random020_dynamic_replay.yaml",
         "I1_03_random020_dynamic_replay",
         continual_train(0.20, 0.25, "dynamic_year_class", "random"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -396,6 +411,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_04_dbta020_no_replay.yaml",
         "I1_04_dbta020_no_replay",
         continual_train(0.20, 0.0, "static", "dbta"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -405,6 +421,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_05_dbta020_static_replay.yaml",
         "I1_05_dbta020_static_replay",
         continual_train(0.20, 0.25, "static", "dbta"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -414,6 +431,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_06_dbta020_dynamic_replay.yaml",
         "I1_06_dbta020_dynamic_replay",
         continual_train(0.20, 0.25, "dynamic_year_class", "dbta"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -423,6 +441,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "I1_07_dbta020_drift_matched.yaml",
         "I1_07_dbta020_drift_matched",
         continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -434,6 +453,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
             f"I1_{idx:02d}_dbta{tag}_drift_matched.yaml",
             f"I1_{idx:02d}_dbta{tag}_drift_matched",
             continual_train(ratio, 0.25, "drift_matched", "dbta"),
+            i1_warm_start(),
             alignment_off_model("concat"),
             alignment_off_loss(),
         )
