@@ -2,8 +2,8 @@
 data:
   out_dir: "experiments/i1_dbta"
 train:
-  exp_name: "I1_05_dbta005_drift_matched"
-  adaptation_ratio: 0.05
+  exp_name: "I1_11_dbta100_drift_matched"
+  adaptation_ratio: 1
 model:
   fusion_mode: "concat"
   alignment:

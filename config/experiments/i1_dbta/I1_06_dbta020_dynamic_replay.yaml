@@ -2,8 +2,8 @@
 data:
   out_dir: "experiments/i1_dbta"
 train:
-  exp_name: "I1_03_dbta020_static_replay"
-  replay_strategy: "static"
+  exp_name: "I1_06_dbta020_dynamic_replay"
+  replay_strategy: "dynamic_year_class"
 model:
   fusion_mode: "concat"
   alignment:

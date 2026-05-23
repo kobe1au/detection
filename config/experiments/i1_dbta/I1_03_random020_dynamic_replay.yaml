@@ -2,8 +2,9 @@
 data:
   out_dir: "experiments/i1_dbta"
 train:
-  exp_name: "I1_06_dbta010_drift_matched"
-  adaptation_ratio: 0.1
+  exp_name: "I1_03_random020_dynamic_replay"
+  replay_strategy: "dynamic_year_class"
+  adaptation_selection: "random"
 model:
   fusion_mode: "concat"
   alignment:

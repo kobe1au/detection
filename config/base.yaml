@@ -8,11 +8,11 @@ data:
 
   train_pt_dir: "pts/train"
   val_pt_dir: "pts/val"
-  test_pt_dir: "pts/test"
+  test_pt_dir: "/pts/test"
 
   train_csv: "results/labels/train.csv"
-  adapt_pt_dir: "pts/adapt"
-  adapt_csv: "results/labels/adapt_2023.csv"
+  adapt_pt_dir: "/pts/adapt"
+  adapt_csv: "results/labels/test_2023.csv"
   val_csv: "results/labels/val.csv"
   test_csv: "results/labels/test_2024.csv"
   extra_tests: []
