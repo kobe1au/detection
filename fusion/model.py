@@ -529,7 +529,7 @@ class MalwareModelWithXAttn(nn.Module):
                 gate_q_dim += 2
             if self.use_time_gate_inputs:
                 gate_q_dim += 4
-            gate_q_dim += 4  # disagreement, entropy, api_alive, graph_alive
+            gate_q_dim += 5  # uncertainty, disagreement, entropy, api_alive, graph_alive
             if self.confidence_inputs:
                 gate_q_dim += 3  # api, graph, joint branch confidences
             self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=gate_q_dim)
@@ -1397,7 +1397,7 @@ class MalwareModelWithXAttn(nn.Module):
         gate_inputs_parts = [gate_qs]
         if self.use_time_gate_inputs:
             gate_inputs_parts.append(time_gate_features)
-        gate_inputs_parts.extend([gate_disagreement, gate_entropy, api_alive, graph_alive])
+        gate_inputs_parts.extend([uncertainty_score, gate_disagreement, gate_entropy, api_alive, graph_alive])
         if self.confidence_inputs:
             api_conf, graph_conf, joint_conf = self._compute_branch_confidences(
                 api_logits,

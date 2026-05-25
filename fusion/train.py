@@ -220,10 +220,10 @@ def validate_full_config(cfg):
 
     replay_strategy = _canonical_replay_strategy(str(cfg["train"].get("replay_strategy", "static")))
     adaptation_selection = _canonical_adaptation_selection(cfg["train"].get("adaptation_selection", "random_class_balanced"))
-    if replay_strategy not in {"static", "dynamic_year_class", "dynamic", "drift_matched"}:
+    if replay_strategy not in {"static", "dynamic_year_class", "drift_matched"}:
         raise ValueError(
             "train.replay_strategy must be one of: "
-            "static, dynamic_year_class, dynamic, drift_matched"
+            "static, dynamic_year_class, drift_matched"
         )
     if adaptation_selection not in {"random_pure", "random_class_balanced", "dbta"}:
         raise ValueError(
@@ -282,7 +282,7 @@ def validate_full_config(cfg):
         "persistent_workers", "prefetch_factor", "lr", "weight_decay",
         "warmup_epochs", "eta_min", "label_smoothing", "patience",
         "min_delta", "warmup_stage_epochs","warm_start_historical_ckpt",
-        "historical_epochs", "adaptation_epochs", "adaptation_ratio", "replay_ratio",
+        "historical_epochs", "adaptation_epochs", "adaptation_ratio",
         "replay_budget_mode", "replay_budget_ratio",
         "replay_strategy", "adaptation_selection", "dbta_balance",
         "dbta_uncertainty_weight", "dbta_disagreement_weight",
@@ -355,7 +355,7 @@ def validate_full_config(cfg):
         cfg["train"],
         allowed_train,
         optional={
-            "historical_epochs", "adaptation_epochs","warm_start_historical_ckpt", "adaptation_ratio", "replay_ratio",
+            "historical_epochs", "adaptation_epochs","warm_start_historical_ckpt", "adaptation_ratio",
             "replay_budget_mode", "replay_budget_ratio",
             "replay_strategy", "adaptation_selection", "dbta_balance",
             "dbta_uncertainty_weight", "dbta_disagreement_weight",
@@ -480,7 +480,7 @@ _CSV_HEADER = [
     "val_uncertainty", "val_gate_disagreement", "val_gate_entropy",
     "val_gate_api", "val_gate_graph", "val_gate_joint",
     "lr", "best_score", "is_best", "no_improve",
-    "selection_score", "latest_f1", "worst_f1", "aut_f1",
+    "checkpoint_score", "latest_f1", "worst_f1", "aut_f1",
 ]
 
 
@@ -800,21 +800,11 @@ def _count_group_samples(groups, ratio: float, min_per_group: int = 1) -> int:
 
 
 def _canonical_replay_strategy(value) -> str:
-    strategy = str(value or "static").lower()
-    if strategy == "dynamic":
-        return "dynamic_year_class"
-    return strategy
+    return str(value or "static").lower()
 
 
 def _canonical_adaptation_selection(value) -> str:
-    selection = str(value or "random_class_balanced").lower()
-    if selection == "random":
-        return "random_class_balanced"
-    if selection in {"balanced_random", "random_balanced", "class_balanced_random"}:
-        return "random_class_balanced"
-    if selection in {"pure_random", "uniform_random"}:
-        return "random_pure"
-    return selection
+    return str(value or "random_class_balanced").lower()
 
 
 def _sample_random_indices(dataset, ratio: float, seed: int):
@@ -927,26 +917,13 @@ def _balanced_sample_indices_to_target(
 
 
 def _get_replay_budget_mode(train_cfg) -> str:
-    mode = str(train_cfg.get("replay_budget_mode", "selected_adapt_relative") or "selected_adapt_relative").lower()
-    if mode in {"adapt_relative", "selected_adapt_relative"}:
-        return "selected_adapt_relative"
-    return mode
+    return str(train_cfg.get("replay_budget_mode", "selected_adapt_relative") or "selected_adapt_relative").lower()
 
 
 def _get_replay_budget_ratio(train_cfg) -> float:
-    replay_budget_ratio = train_cfg.get("replay_budget_ratio", None)
-    replay_ratio = train_cfg.get("replay_ratio", None)
-    if replay_budget_ratio is not None and replay_ratio is not None:
-        if abs(float(replay_budget_ratio) - float(replay_ratio)) > 1e-8:
-            raise ValueError(
-                "train.replay_budget_ratio and train.replay_ratio disagree; "
-                "use replay_budget_ratio as the canonical field"
-            )
-    if replay_budget_ratio is not None:
-        return float(replay_budget_ratio)
-    if replay_ratio is not None:
-        return float(replay_ratio)
-    return 0.25
+    if "replay_ratio" in train_cfg:
+        raise ValueError("train.replay_ratio was removed; use train.replay_budget_ratio")
+    return float(train_cfg.get("replay_budget_ratio", 0.25))
 
 
 def _compute_replay_target_count(train_cfg, selected_adapt_count: int, historical_dataset=None) -> int:
@@ -1105,7 +1082,7 @@ def _build_continual_adaptation_loader(
     if replay_strategy != "static":
         raise ValueError(
             f"Unsupported replay_strategy={replay_strategy}; "
-            "expected static, dynamic/dynamic_year_class, or drift_matched"
+            "expected static, dynamic_year_class, or drift_matched"
         )
 
     replay_indices = _balanced_sample_indices_to_target(
@@ -1388,7 +1365,6 @@ def _budget_count(n: int, ratio: float) -> int:
 def _set_dbta_selection_diagnostics(record: dict, score: float, diversity_gain: float = 0.0):
     score = float(score)
     record["final_selection_score"] = score
-    record["selection_score"] = score
     record["diversity_gain"] = float(diversity_gain)
     return record
 
@@ -1815,7 +1791,6 @@ def _write_dbta_selection_dump(path, selected_records):
         "pred_label",
         "drift_score",
         "final_selection_score",
-        "selection_score",
         "uncertainty",
         "branch_disagreement",
         "prototype_distance",
@@ -1838,7 +1813,6 @@ def _write_dbta_selection_dump(path, selected_records):
                 "pred_label": int(record.get("pred_label", 0)),
                 "drift_score": f"{float(record.get('drift_score', 0.0)):.8f}",
                 "final_selection_score": f"{float(record.get('final_selection_score', 0.0)):.8f}",
-                "selection_score": f"{float(record.get('selection_score', record.get('final_selection_score', 0.0))):.8f}",
                 "uncertainty": f"{float(record.get('uncertainty', 0.0)):.8f}",
                 "branch_disagreement": f"{float(record.get('branch_disagreement', 0.0)):.8f}",
                 "prototype_distance": f"{float(record.get('prototype_distance', 0.0)):.8f}",
@@ -1850,11 +1824,11 @@ def _write_dbta_selection_dump(path, selected_records):
             })
 
 
-def _write_dbta_candidate_dump(path, records, selected_records):
+def _write_dbta_recent_pool_scores_dump(path, records, selected_records):
     if not path:
         return
     selected_ids = {int(record["dataset_index"]) for record in selected_records}
-    candidate_path = os.path.join(os.path.dirname(path), "dbta_candidates.csv")
+    pool_path = os.path.join(os.path.dirname(path), "dbta_recent_pool_scores.csv")
     fields = [
         "dataset_index",
         "sid",
@@ -1865,7 +1839,6 @@ def _write_dbta_candidate_dump(path, records, selected_records):
         "selected",
         "drift_score",
         "final_selection_score",
-        "selection_score",
         "uncertainty",
         "branch_disagreement",
         "prototype_distance",
@@ -1875,7 +1848,7 @@ def _write_dbta_candidate_dump(path, records, selected_records):
         "density_bucket",
         "diversity_gain",
     ]
-    with open(candidate_path, "w", newline="", encoding="utf-8") as f:
+    with open(pool_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for record in records:
@@ -1890,7 +1863,6 @@ def _write_dbta_candidate_dump(path, records, selected_records):
                 "selected": int(dataset_index in selected_ids),
                 "drift_score": f"{float(record.get('drift_score', 0.0)):.8f}",
                 "final_selection_score": f"{float(record.get('final_selection_score', 0.0)):.8f}",
-                "selection_score": f"{float(record.get('selection_score', record.get('final_selection_score', 0.0))):.8f}",
                 "uncertainty": f"{float(record.get('uncertainty', 0.0)):.8f}",
                 "branch_disagreement": f"{float(record.get('branch_disagreement', 0.0)):.8f}",
                 "prototype_distance": f"{float(record.get('prototype_distance', 0.0)):.8f}",
@@ -1977,7 +1949,7 @@ def build_adaptation_loader(
         raise ValueError("DBTA selected no adaptation samples; check adaptation_ratio and recent pool")
 
     _write_dbta_selection_dump(selection_dump_path, selected_records)
-    _write_dbta_candidate_dump(selection_dump_path, adapt_records, selected_records)
+    _write_dbta_recent_pool_scores_dump(selection_dump_path, adapt_records, selected_records)
 
     pred_counts = {}
     for record in selected_records:
@@ -2990,8 +2962,8 @@ def evaluate_temporal_windows(model, year_loaders, criterion, device, epoch,
     return metrics
 
 
-def compute_temporal_selection_score(year_metrics):
-    """Selection: 0.5*AUT(F1) + 0.3*latest_F1 + 0.2*worst_F1."""
+def compute_temporal_checkpoint_score(year_metrics):
+    """Checkpoint score: 0.5*AUT(F1) + 0.3*latest_F1 + 0.2*worst_F1."""
     if not year_metrics:
         return 0.0, 0.0, 0.0, 0.0
     years = sorted(year_metrics.keys())
@@ -3592,22 +3564,22 @@ def main():
             phase="val",
         )
 
-        # Temporal selection
-        selection_score, latest_f1, worst_f1, aut_f1 = val_f1, val_f1, val_f1, val_f1
+        # Temporal checkpoint selection
+        checkpoint_score, latest_f1, worst_f1, aut_f1 = val_f1, val_f1, val_f1, val_f1
         if val_year_loaders:
             ym = evaluate_temporal_windows(
                 model, val_year_loaders, criterion, device, epoch, epochs,
                 use_amp=use_amp, logger=logger, tag="val",strict=True)
-            selection_score, latest_f1, worst_f1, aut_f1 = compute_temporal_selection_score(ym)
-            logger.info(f"[Epoch {epoch:03d}] sel={selection_score:.4f} "
+            checkpoint_score, latest_f1, worst_f1, aut_f1 = compute_temporal_checkpoint_score(ym)
+            logger.info(f"[Epoch {epoch:03d}] ckpt={checkpoint_score:.4f} "
                         f"(AUT={aut_f1:.4f} latest={latest_f1:.4f} worst={worst_f1:.4f})")
 
         if stage_name == "warmup":
             improved = False
         else:
-            improved = selection_score > (best_score + min_delta)
+            improved = checkpoint_score > (best_score + min_delta)
         if improved:
-            best_score = selection_score
+            best_score = checkpoint_score
             no_improve = 0
         else:
             no_improve += 0 if stage_name == "warmup" else 1
@@ -3644,7 +3616,7 @@ def main():
             lr=current_lr,
             best_score=(best_score if best_score != float("-inf") else 0.0),
             is_best=int(improved), no_improve=no_improve,
-            selection_score=selection_score, latest_f1=latest_f1,
+            checkpoint_score=checkpoint_score, latest_f1=latest_f1,
             worst_f1=worst_f1, aut_f1=aut_f1))
 
         scheduler.step()
@@ -3654,7 +3626,7 @@ def main():
             f"val: loss={val_loss:.4f} f1={val_f1:.4f} "
             f"softmax_aurc={val_softmax_aurc:.4f} "
             f"softmax_eaurc={val_softmax_eaurc:.4f} | "
-            f"sel={selection_score:.4f}")
+            f"ckpt={checkpoint_score:.4f}")
         early_stop_allowed = (
             stage_name != "warmup"
             and (ds_adapt is None or continual_phase == "adaptation")

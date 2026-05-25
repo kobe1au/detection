@@ -1,9 +1,13 @@
+import csv
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 
 from fusion import train as train_mod
+from scripts import make_ablation_configs
 
 
 class TinyDataset:
@@ -25,7 +29,7 @@ def _cfg(**train_overrides):
     train = {
         "adaptation_ratio": 0.5,
         "replay_strategy": "static",
-        "replay_budget_mode": "adapt_relative",
+        "replay_budget_mode": "selected_adapt_relative",
         "replay_budget_ratio": 0.5,
         "adaptation_selection": "random_class_balanced",
         "seed": 7,
@@ -35,24 +39,29 @@ def _cfg(**train_overrides):
 
 
 class AdaptationSelectionAndReplayTest(unittest.TestCase):
-    def test_replay_budget_selected_adapt_relative_and_alias(self):
-        cfg = _cfg(replay_budget_mode="adapt_relative", replay_budget_ratio=0.5)
+    def test_replay_budget_selected_adapt_relative_official_mode(self):
+        cfg = _cfg(replay_budget_mode="selected_adapt_relative", replay_budget_ratio=0.5)
         self.assertEqual(train_mod._get_replay_budget_mode(cfg["train"]), "selected_adapt_relative")
         self.assertEqual(train_mod._compute_replay_target_count(cfg["train"], 300), 150)
 
-    def test_replay_budget_historical_relative_keeps_legacy_semantics(self):
+    def test_replay_budget_rejects_removed_adapt_relative_alias(self):
+        cfg = _cfg(replay_budget_mode="adapt_relative", replay_budget_ratio=0.5)
+        with self.assertRaises(ValueError):
+            train_mod._compute_replay_target_count(cfg["train"], 300)
+
+    def test_replay_budget_rejects_removed_replay_ratio(self):
+        cfg = _cfg(replay_budget_ratio=0.5)
+        cfg["train"]["replay_ratio"] = 0.25
+        with self.assertRaises(ValueError):
+            train_mod._get_replay_budget_ratio(cfg["train"])
+
+    def test_replay_budget_historical_relative_uses_historical_size(self):
         hist = TinyDataset([0, 1] * 50)
         cfg = _cfg(replay_budget_mode="historical_relative", replay_budget_ratio=0.25)
         self.assertEqual(
             train_mod._compute_replay_target_count(cfg["train"], 300, historical_dataset=hist),
             25,
         )
-
-    def test_replay_budget_rejects_conflicting_legacy_ratio(self):
-        cfg = _cfg(replay_budget_ratio=0.5)
-        cfg["train"]["replay_ratio"] = 0.25
-        with self.assertRaises(ValueError):
-            train_mod._get_replay_budget_ratio(cfg["train"])
 
     def test_balanced_target_sampling_returns_exact_target_for_small_budget(self):
         dataset = TinyDataset(
@@ -98,10 +107,10 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         balanced.assert_not_called()
         self.assertEqual(build.call_args.kwargs["adaptation_indices"], [1, 3])
 
-    def test_build_adaptation_loader_dispatches_random_alias_to_class_balanced(self):
+    def test_build_adaptation_loader_dispatches_random_class_balanced(self):
         hist = TinyDataset([0, 1])
         adapt = TinyDataset([0, 0, 1, 1])
-        cfg = _cfg(adaptation_selection="random")
+        cfg = _cfg(adaptation_selection="random_class_balanced")
 
         with patch.object(train_mod, "_sample_random_indices") as pure, \
              patch.object(train_mod, "_balanced_sample_indices", return_value=[0, 2]) as balanced, \
@@ -112,6 +121,14 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         pure.assert_not_called()
         balanced.assert_called_once()
         self.assertEqual(build.call_args.kwargs["adaptation_indices"], [0, 2])
+
+    def test_build_adaptation_loader_rejects_random_alias(self):
+        hist = TinyDataset([0, 1])
+        adapt = TinyDataset([0, 0, 1, 1])
+        cfg = _cfg(adaptation_selection="random")
+
+        with self.assertRaises(ValueError):
+            train_mod.build_adaptation_loader(hist, adapt, cfg, 2, {})
 
     def test_dynamic_replay_uses_full_selected_adapt_subset_and_budgeted_replay(self):
         hist = TinyDataset(
@@ -137,6 +154,21 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         self.assertEqual(n_replay, 2)
         self.assertCountEqual(adapt_positions, [0, 1, 2, 3])
         self.assertEqual(len(replay_positions), 2)
+
+    def test_dynamic_replay_rejects_removed_dynamic_alias(self):
+        hist = TinyDataset([0, 1, 0, 1])
+        adapt = TinyDataset([0, 1])
+        cfg = _cfg(replay_strategy="dynamic")
+
+        with self.assertRaises(ValueError):
+            train_mod._build_continual_adaptation_loader(
+                hist,
+                adapt,
+                cfg,
+                batch_size=2,
+                loader_kwargs={},
+                adaptation_indices=[0, 1],
+            )
 
     def test_drift_matched_replay_uses_selected_adapt_relative_target(self):
         hist = TinyDataset(
@@ -202,9 +234,75 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         self.assertNotIn(0, selected_ids)
         for record in selected:
             self.assertIn("final_selection_score", record)
-            self.assertIn("selection_score", record)
+            self.assertNotIn("selection_score", record)
             self.assertIn("representativeness_score", record)
             self.assertIn("density_bucket", record)
+
+    def test_dbta_dumps_use_final_selection_score_only(self):
+        records = [
+            {
+                "dataset_index": 0,
+                "sid": "a",
+                "year": 2023,
+                "time_id": 5,
+                "label": 1,
+                "pred_label": 1,
+                "drift_score": 0.7,
+                "final_selection_score": 0.8,
+                "uncertainty": 0.1,
+                "branch_disagreement": 0.2,
+                "prototype_distance": 0.3,
+                "predicted_prototype_distance": 0.4,
+                "nearest_prototype_distance": 0.3,
+                "representativeness_score": 0.9,
+                "density_bucket": "high",
+                "diversity_gain": 0.5,
+            },
+            {
+                "dataset_index": 1,
+                "sid": "b",
+                "year": 2023,
+                "time_id": 5,
+                "label": 0,
+                "pred_label": 0,
+                "drift_score": 0.2,
+                "final_selection_score": 0.0,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_path = os.path.join(tmpdir, "dbta_selection.csv")
+            train_mod._write_dbta_selection_dump(selection_path, [records[0]])
+            train_mod._write_dbta_recent_pool_scores_dump(selection_path, records, [records[0]])
+
+            with open(selection_path, newline="", encoding="utf-8") as f:
+                selection_fields = csv.DictReader(f).fieldnames
+            pool_path = os.path.join(tmpdir, "dbta_recent_pool_scores.csv")
+            with open(pool_path, newline="", encoding="utf-8") as f:
+                pool_reader = csv.DictReader(f)
+                pool_fields = pool_reader.fieldnames
+                pool_rows = list(pool_reader)
+
+            self.assertIn("final_selection_score", selection_fields)
+            self.assertNotIn("selection_score", selection_fields)
+            self.assertIn("final_selection_score", pool_fields)
+            self.assertNotIn("selection_score", pool_fields)
+            self.assertTrue(os.path.exists(pool_path))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "dbta_candidates.csv")))
+            self.assertEqual([row["selected"] for row in pool_rows], ["1", "0"])
+
+    def test_generator_uses_no_refinement_i1_name(self):
+        configs, groups = make_ablation_configs.build_configs()
+        i1_paths = groups["i1"]
+        no_refinement_path = "i1_dbta/I1_03_dbta_no_refinement_020_dynamic_replay.yaml"
+
+        self.assertIn(no_refinement_path, i1_paths)
+        self.assertFalse(any("dbta_drift_only" in path for path in i1_paths))
+        no_refinement = configs[no_refinement_path]["train"]
+        self.assertEqual(no_refinement["dbta_candidate_top_p"], 1.0)
+        self.assertEqual(no_refinement["dbta_representative_weight"], 0.0)
+        self.assertEqual(no_refinement["dbta_selection_mode"], "topk")
+        self.assertEqual(no_refinement["dbta_diversity_weight"], 0.0)
 
 
 if __name__ == "__main__":

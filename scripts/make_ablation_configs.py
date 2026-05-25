@@ -173,7 +173,7 @@ def continual_train(
     replay_strategy: str = "drift_matched",
     adaptation_selection: str = "dbta",
     adaptation_epochs: int = 20,
-    dbta_drift_only: bool = False,
+    dbta_no_refinement: bool = False,
 ) -> dict:
     if replay_strategy == "drift_matched" and adaptation_selection != "dbta":
         raise ValueError("drift_matched replay requires dbta adaptation_selection")
@@ -199,11 +199,11 @@ def continual_train(
             "dbta_uncertainty_weight": 1.0,
             "dbta_disagreement_weight": 1.0,
             "dbta_prototype_weight": 1.0,
-            "dbta_candidate_top_p": 1.0 if dbta_drift_only else 0.5,
+            "dbta_candidate_top_p": 1.0 if dbta_no_refinement else 0.5,
             "dbta_representative_k": 10,
-            "dbta_representative_weight": 0.0 if dbta_drift_only else 0.7,
-            "dbta_selection_mode": "topk" if dbta_drift_only else "diversity_aware",
-            "dbta_diversity_weight": 0.0 if dbta_drift_only else 0.3,
+            "dbta_representative_weight": 0.0 if dbta_no_refinement else 0.7,
+            "dbta_selection_mode": "topk" if dbta_no_refinement else "diversity_aware",
+            "dbta_diversity_weight": 0.0 if dbta_no_refinement else 0.3,
             "dbta_diversity_metric": "cosine",
             "dbta_diversity_within_balance": True,
             "dbta_drift_replay_fraction": 0.5,
@@ -415,9 +415,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_03_dbta_drift_only_020_dynamic_replay.yaml",
-        "I1_03_dbta_drift_only_020_dynamic_replay",
-        continual_train(0.20, 0.50, "dynamic_year_class", "dbta", dbta_drift_only=True),
+        "I1_03_dbta_no_refinement_020_dynamic_replay.yaml",
+        "I1_03_dbta_no_refinement_020_dynamic_replay",
+        continual_train(0.20, 0.50, "dynamic_year_class", "dbta", dbta_no_refinement=True),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
