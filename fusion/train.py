@@ -1381,7 +1381,11 @@ def _select_predicted_label_balanced(records, target: int):
     if target <= 0 or not records:
         return []
     if target >= len(records):
-        return list(records)
+        selected_all = list(records)
+        for record in selected_all:
+            record["diversity_gain"] = 0.0
+            record["selection_score"] = float(record.get("drift_score", 0.0))
+        return selected_all
 
     groups: dict[int, list[dict]] = {}
     for record in records:
@@ -1440,16 +1444,24 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
 
     diversity_weight = min(max(float(diversity_weight), 0.0), 1.0)
     if diversity_weight <= 0.0:
-        return sorted(records, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:target]
+        selected = sorted(records, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:target]
+        for record in selected:
+            record["diversity_gain"] = 0.0
+            record["selection_score"] = float(record.get("drift_score", 0.0))
+        return selected
 
     selected = []
     remaining = list(records)
     remaining.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
-    selected.append(remaining.pop(0))
+    first = remaining.pop(0)
+    first["diversity_gain"] = 0.0
+    first["selection_score"] = float(first.get("drift_score", 0.0))
+    selected.append(first)
 
     while remaining and len(selected) < target:
         best_idx = 0
         best_score = -float("inf")
+        best_diversity = 0.0
         for idx, record in enumerate(remaining):
             emb = record.get("embedding")
             if emb is None:
@@ -1465,7 +1477,11 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
             if combined > best_score:
                 best_score = combined
                 best_idx = idx
-        selected.append(remaining.pop(best_idx))
+                best_diversity = diversity
+        chosen = remaining.pop(best_idx)
+        chosen["diversity_gain"] = float(best_diversity)
+        chosen["selection_score"] = float(best_score)
+        selected.append(chosen)
 
     return selected[:target]
 
@@ -1810,6 +1826,56 @@ def _write_dbta_selection_dump(path, selected_records):
             })
 
 
+def _write_dbta_candidate_dump(path, records, selected_records):
+    if not path:
+        return
+    selected_ids = {int(record["dataset_index"]) for record in selected_records}
+    candidate_path = os.path.join(os.path.dirname(path), "dbta_candidates.csv")
+    fields = [
+        "dataset_index",
+        "sid",
+        "year",
+        "time_id",
+        "label",
+        "pred_label",
+        "selected",
+        "drift_score",
+        "selection_score",
+        "uncertainty",
+        "branch_disagreement",
+        "prototype_distance",
+        "predicted_prototype_distance",
+        "nearest_prototype_distance",
+        "representativeness_score",
+        "density_bucket",
+        "diversity_gain",
+    ]
+    with open(candidate_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for record in records:
+            dataset_index = int(record["dataset_index"])
+            writer.writerow({
+                "dataset_index": dataset_index,
+                "sid": record.get("sid", ""),
+                "year": record.get("year", ""),
+                "time_id": record.get("time_id", ""),
+                "label": "" if record.get("label") is None else int(record.get("label", 0)),
+                "pred_label": int(record.get("pred_label", 0)),
+                "selected": int(dataset_index in selected_ids),
+                "drift_score": f"{float(record.get('drift_score', 0.0)):.8f}",
+                "selection_score": f"{float(record.get('selection_score', 0.0)):.8f}",
+                "uncertainty": f"{float(record.get('uncertainty', 0.0)):.8f}",
+                "branch_disagreement": f"{float(record.get('branch_disagreement', 0.0)):.8f}",
+                "prototype_distance": f"{float(record.get('prototype_distance', 0.0)):.8f}",
+                "predicted_prototype_distance": f"{float(record.get('predicted_prototype_distance', 0.0)):.8f}",
+                "nearest_prototype_distance": f"{float(record.get('nearest_prototype_distance', 0.0)):.8f}",
+                "representativeness_score": f"{float(record.get('representativeness_score', 0.0)):.8f}",
+                "density_bucket": record.get("density_bucket", ""),
+                "diversity_gain": f"{float(record.get('diversity_gain', 0.0)):.8f}",
+            })
+
+
 def build_adaptation_loader(
     historical_dataset,
     adapt_dataset,
@@ -1885,6 +1951,7 @@ def build_adaptation_loader(
         raise ValueError("DBTA selected no adaptation samples; check adaptation_ratio and recent pool")
 
     _write_dbta_selection_dump(selection_dump_path, selected_records)
+    _write_dbta_candidate_dump(selection_dump_path, adapt_records, selected_records)
 
     pred_counts = {}
     for record in selected_records:

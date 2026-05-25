@@ -213,8 +213,9 @@ class MultiBranchTemperatureScaling(nn.Module):
         model.eval()
         self.to(device)
         self.train()
-        all_labels = []
         branch_logits = {name: [] for name in self.branch_names}
+        branch_labels = {name: [] for name in self.branch_names}
+        missing_counts = {name: 0 for name in self.branch_names}
         failed_batches = 0
         logger.info("Collecting validation branch logits for calibration...")
         with torch.no_grad():
@@ -252,13 +253,15 @@ class MultiBranchTemperatureScaling(nn.Module):
                             time_ids=time_ids,
                             masks=masks,
                         )
-                    all_labels.append(y.detach().cpu())
                     branch_logits["fused"].append(logits.detach().cpu())
+                    branch_labels["fused"].append(y.detach().cpu())
                     for name, key in (("api", "api_logits_aux"), ("graph", "graph_logits_aux"), ("joint", "joint_logits_aux")):
                         value = extra.get(key)
                         if not isinstance(value, torch.Tensor):
-                            raise RuntimeError(f"[calibration] missing branch logits: {key}")
+                            missing_counts[name] += 1
+                            continue
                         branch_logits[name].append(value.detach().cpu())
+                        branch_labels[name].append(y.detach().cpu())
                 except Exception as e:
                     if strict:
                         raise RuntimeError(f"[calibration] batch failed under strict mode: {e}") from e
@@ -266,14 +269,24 @@ class MultiBranchTemperatureScaling(nn.Module):
                     failed_batches += 1
                     continue
 
-        if not all_labels or not branch_logits["fused"]:
+        if not branch_labels["fused"] or not branch_logits["fused"]:
             raise RuntimeError("Calibration failed: no valid data collected")
         if failed_batches > 0:
             logger.warning(f"Calibration: {failed_batches} batches failed")
 
-        labels = torch.cat(all_labels, dim=0)
         for name in self.branch_names:
+            if not branch_logits[name]:
+                if missing_counts.get(name, 0) > 0:
+                    logger.info(
+                        "Skipping temperature calibration for branch=%s; "
+                        "no %s logits were emitted by fusion_mode=%s.",
+                        name,
+                        name,
+                        getattr(model, "fusion_mode", "unknown"),
+                    )
+                continue
             logits = torch.cat(branch_logits[name], dim=0)
+            labels = torch.cat(branch_labels[name], dim=0)
             self.calibrators[name].fit_logits(logits, labels, device=device, max_iter=max_iter, lr=lr)
 
         logger.info(

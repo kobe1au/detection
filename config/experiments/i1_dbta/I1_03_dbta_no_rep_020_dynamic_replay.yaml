@@ -2,7 +2,7 @@
 data:
   out_dir: "experiments/i1_dbta"
 train:
-  exp_name: "I1_03_dbta_v1_020_dynamic_replay"
+  exp_name: "I1_03_dbta_no_rep_020_dynamic_replay"
   replay_strategy: "dynamic_year_class"
   dbta_candidate_top_p: 1
   dbta_representative_weight: 0
