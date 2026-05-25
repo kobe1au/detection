@@ -201,6 +201,7 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         self.assertTrue(selected_ids.issubset({0, 1, 2}))
         self.assertNotIn(0, selected_ids)
         for record in selected:
+            self.assertIn("final_selection_score", record)
             self.assertIn("selection_score", record)
             self.assertIn("representativeness_score", record)
             self.assertIn("density_bucket", record)

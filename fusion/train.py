@@ -928,7 +928,7 @@ def _balanced_sample_indices_to_target(
 
 def _get_replay_budget_mode(train_cfg) -> str:
     mode = str(train_cfg.get("replay_budget_mode", "selected_adapt_relative") or "selected_adapt_relative").lower()
-    if mode == "adapt_relative":
+    if mode in {"adapt_relative", "selected_adapt_relative"}:
         return "selected_adapt_relative"
     return mode
 
@@ -1385,14 +1385,21 @@ def _budget_count(n: int, ratio: float) -> int:
     return min(n, max(1, int(round(n * ratio))))
 
 
+def _set_dbta_selection_diagnostics(record: dict, score: float, diversity_gain: float = 0.0):
+    score = float(score)
+    record["final_selection_score"] = score
+    record["selection_score"] = score
+    record["diversity_gain"] = float(diversity_gain)
+    return record
+
+
 def _select_predicted_label_balanced(records, target: int):
     if target <= 0 or not records:
         return []
     if target >= len(records):
         selected_all = list(records)
         for record in selected_all:
-            record["diversity_gain"] = 0.0
-            record["selection_score"] = float(record.get("drift_score", 0.0))
+            _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
         return selected_all
 
     groups: dict[int, list[dict]] = {}
@@ -1429,7 +1436,10 @@ def _select_predicted_label_balanced(records, target: int):
         selected.extend(leftovers[: target - len(selected)])
 
     selected.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
-    return selected[:target]
+    selected = selected[:target]
+    for record in selected:
+        _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
+    return selected
 
 
 def _embedding_cosine_distance(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
@@ -1448,8 +1458,7 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
     if target >= len(records):
         selected_all = list(records)
         for record in selected_all:
-            record["diversity_gain"] = 0.0
-            record["selection_score"] = float(record.get("drift_score", 0.0))
+            _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
         return selected_all
     if str(metric).lower() != "cosine":
         raise ValueError(f"Unsupported train.dbta_diversity_metric={metric}; expected cosine")
@@ -1458,16 +1467,14 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
     if diversity_weight <= 0.0:
         selected = sorted(records, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:target]
         for record in selected:
-            record["diversity_gain"] = 0.0
-            record["selection_score"] = float(record.get("drift_score", 0.0))
+            _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
         return selected
 
     selected = []
     remaining = list(records)
     remaining.sort(key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)
     first = remaining.pop(0)
-    first["diversity_gain"] = 0.0
-    first["selection_score"] = float(first.get("drift_score", 0.0))
+    _set_dbta_selection_diagnostics(first, first.get("drift_score", 0.0))
     selected.append(first)
 
     while remaining and len(selected) < target:
@@ -1491,8 +1498,7 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
                 best_idx = idx
                 best_diversity = diversity
         chosen = remaining.pop(best_idx)
-        chosen["diversity_gain"] = float(best_diversity)
-        chosen["selection_score"] = float(best_score)
+        _set_dbta_selection_diagnostics(chosen, best_score, best_diversity)
         selected.append(chosen)
 
     return selected[:target]
@@ -1510,8 +1516,7 @@ def _greedy_representative_diverse_select(
     if target >= len(records):
         selected_all = list(records)
         for record in selected_all:
-            record["diversity_gain"] = 0.0
-            record["selection_score"] = float(record.get("representativeness_score", 0.0))
+            _set_dbta_selection_diagnostics(record, record.get("representativeness_score", 0.0))
         return selected_all
     if str(metric).lower() != "cosine":
         raise ValueError(f"Unsupported train.dbta_diversity_metric={metric}; expected cosine")
@@ -1551,8 +1556,7 @@ def _greedy_representative_diverse_select(
                 best_idx = idx
                 best_diversity = diversity
         chosen = remaining.pop(best_idx)
-        chosen["diversity_gain"] = float(best_diversity)
-        chosen["selection_score"] = float(best_score)
+        _set_dbta_selection_diagnostics(chosen, best_score, best_diversity)
         selected.append(chosen)
 
     return selected[:target]
@@ -1592,8 +1596,7 @@ def _select_dbta_records(records, target: int, cfg):
         if selection_mode == "topk":
             selected = sorted(pool, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
             for record in selected:
-                record["diversity_gain"] = 0.0
-                record["selection_score"] = float(record.get("drift_score", 0.0))
+                _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
             return selected
         candidates = _candidate_pool(pool, budget)
         if not candidates:
@@ -1609,8 +1612,7 @@ def _select_dbta_records(records, target: int, cfg):
         if diversity_weight <= 0.0:
             selected = sorted(candidates, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
             for record in selected:
-                record["diversity_gain"] = 0.0
-                record["selection_score"] = float(record.get("drift_score", 0.0))
+                _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
             return selected
         return _greedy_diversity_select(
             candidates,
@@ -1658,7 +1660,7 @@ def _select_dbta_records(records, target: int, cfg):
 
         selected.sort(
             key=lambda r: (
-                float(r.get("selection_score", 0.0)),
+                float(r.get("final_selection_score", 0.0)),
                 float(r.get("drift_score", 0.0)),
             ),
             reverse=True,
@@ -1669,7 +1671,7 @@ def _select_dbta_records(records, target: int, cfg):
         selected = _select_subset(records, target)
         selected.sort(
             key=lambda r: (
-                float(r.get("selection_score", 0.0)),
+                float(r.get("final_selection_score", 0.0)),
                 float(r.get("drift_score", 0.0)),
             ),
             reverse=True,
@@ -1812,6 +1814,7 @@ def _write_dbta_selection_dump(path, selected_records):
         "label",
         "pred_label",
         "drift_score",
+        "final_selection_score",
         "selection_score",
         "uncertainty",
         "branch_disagreement",
@@ -1834,7 +1837,8 @@ def _write_dbta_selection_dump(path, selected_records):
                 "label": "" if record.get("label") is None else int(record.get("label", 0)),
                 "pred_label": int(record.get("pred_label", 0)),
                 "drift_score": f"{float(record.get('drift_score', 0.0)):.8f}",
-                "selection_score": f"{float(record.get('selection_score', 0.0)):.8f}",
+                "final_selection_score": f"{float(record.get('final_selection_score', 0.0)):.8f}",
+                "selection_score": f"{float(record.get('selection_score', record.get('final_selection_score', 0.0))):.8f}",
                 "uncertainty": f"{float(record.get('uncertainty', 0.0)):.8f}",
                 "branch_disagreement": f"{float(record.get('branch_disagreement', 0.0)):.8f}",
                 "prototype_distance": f"{float(record.get('prototype_distance', 0.0)):.8f}",
@@ -1860,6 +1864,7 @@ def _write_dbta_candidate_dump(path, records, selected_records):
         "pred_label",
         "selected",
         "drift_score",
+        "final_selection_score",
         "selection_score",
         "uncertainty",
         "branch_disagreement",
@@ -1884,7 +1889,8 @@ def _write_dbta_candidate_dump(path, records, selected_records):
                 "pred_label": int(record.get("pred_label", 0)),
                 "selected": int(dataset_index in selected_ids),
                 "drift_score": f"{float(record.get('drift_score', 0.0)):.8f}",
-                "selection_score": f"{float(record.get('selection_score', 0.0)):.8f}",
+                "final_selection_score": f"{float(record.get('final_selection_score', 0.0)):.8f}",
+                "selection_score": f"{float(record.get('selection_score', record.get('final_selection_score', 0.0))):.8f}",
                 "uncertainty": f"{float(record.get('uncertainty', 0.0)):.8f}",
                 "branch_disagreement": f"{float(record.get('branch_disagreement', 0.0)):.8f}",
                 "prototype_distance": f"{float(record.get('prototype_distance', 0.0)):.8f}",

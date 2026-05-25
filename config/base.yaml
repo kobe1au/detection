@@ -88,7 +88,7 @@ train:
   historical_epochs: 60
   adaptation_epochs: 20
   adaptation_ratio: 0.20
-  replay_budget_mode: adapt_relative
+  replay_budget_mode: selected_adapt_relative
   replay_budget_ratio: 0.50
   replay_strategy: drift_matched
   adaptation_selection: dbta

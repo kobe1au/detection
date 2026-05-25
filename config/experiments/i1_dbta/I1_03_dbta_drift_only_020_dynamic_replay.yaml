@@ -6,6 +6,8 @@ train:
   replay_strategy: "dynamic_year_class"
   dbta_candidate_top_p: 1
   dbta_representative_weight: 0
+  dbta_selection_mode: "topk"
+  dbta_diversity_weight: 0
   warm_start_historical_ckpt: "experiments/i1_dbta/I1_00_historical_concat/42/best_I1_00_historical_concat.pt"
 model:
   fusion_mode: "concat"
