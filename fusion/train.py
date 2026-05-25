@@ -1438,7 +1438,11 @@ def _greedy_diversity_select(records, target: int, diversity_weight: float, metr
     if target <= 0 or not records:
         return []
     if target >= len(records):
-        return list(records)
+        selected_all = list(records)
+        for record in selected_all:
+            record["diversity_gain"] = 0.0
+            record["selection_score"] = float(record.get("drift_score", 0.0))
+        return selected_all
     if str(metric).lower() != "cosine":
         raise ValueError(f"Unsupported train.dbta_diversity_metric={metric}; expected cosine")
 
