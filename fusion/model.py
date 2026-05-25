@@ -1302,6 +1302,7 @@ class MalwareModelWithXAttn(nn.Module):
         if self.fusion_mode == "cross_attention":
             joint = torch.cat([api_emb, graph_emb, xattn_pooled], dim=-1)
             logits = self.joint_head(joint)
+            extra["joint_logits_aux"] = logits
             if return_features:
                 extra["api_emb"] = api_emb
                 extra["graph_emb"] = graph_emb
@@ -1311,6 +1312,7 @@ class MalwareModelWithXAttn(nn.Module):
         if self.fusion_mode == "concat":
             joint = torch.cat([api_emb, graph_emb], dim=-1)
             logits = self.joint_head(joint)
+            extra["joint_logits_aux"] = logits
             if return_features:
                 extra["api_emb"] = api_emb
                 extra["graph_emb"] = graph_emb

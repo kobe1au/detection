@@ -2,5 +2,5 @@
 data:
   out_dir: "experiments/ratio_sweep"
 train:
-  exp_name: "R5_full_dbta100"
-  adaptation_ratio: 1
+  exp_name: "R2_full_dbta_v2_010"
+  adaptation_ratio: 0.1

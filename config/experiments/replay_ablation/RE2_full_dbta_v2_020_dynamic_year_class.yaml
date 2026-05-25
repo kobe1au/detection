@@ -2,5 +2,5 @@
 data:
   out_dir: "experiments/replay_ablation"
 train:
-  exp_name: "RE2_full_dbta020_dynamic_year_class"
+  exp_name: "RE2_full_dbta_v2_020_dynamic_year_class"
   replay_strategy: "dynamic_year_class"

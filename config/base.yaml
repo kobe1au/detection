@@ -65,7 +65,7 @@ model:
     detach: true
 
 train:
-  exp_name: base_full_dbta020
+  exp_name: base_full_dbta_v2_020
   warm_start_historical_ckpt: ""
   seed: 42
   device: auto
@@ -88,13 +88,17 @@ train:
   historical_epochs: 60
   adaptation_epochs: 20
   adaptation_ratio: 0.20
-  replay_ratio: 0.25
+  replay_budget_mode: adapt_relative
+  replay_budget_ratio: 0.50
   replay_strategy: drift_matched
   adaptation_selection: dbta
   dbta_balance: predicted_label
   dbta_uncertainty_weight: 1.0
   dbta_disagreement_weight: 1.0
   dbta_prototype_weight: 1.0
+  dbta_candidate_top_p: 0.5
+  dbta_representative_k: 10
+  dbta_representative_weight: 0.7
   dbta_selection_mode: diversity_aware
   dbta_diversity_weight: 0.3
   dbta_diversity_metric: cosine

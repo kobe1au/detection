@@ -52,13 +52,21 @@ BASE_DEFAULTS = {
         "historical_epochs": 60,
         "adaptation_epochs": 20,
         "adaptation_ratio": 0.20,
-        "replay_ratio": 0.25,
+        "replay_budget_mode": "adapt_relative",
+        "replay_budget_ratio": 0.50,
         "replay_strategy": "drift_matched",
         "adaptation_selection": "dbta",
         "dbta_balance": "predicted_label",
         "dbta_uncertainty_weight": 1.0,
         "dbta_disagreement_weight": 1.0,
         "dbta_prototype_weight": 1.0,
+        "dbta_candidate_top_p": 0.5,
+        "dbta_representative_k": 10,
+        "dbta_representative_weight": 0.7,
+        "dbta_selection_mode": "diversity_aware",
+        "dbta_diversity_weight": 0.3,
+        "dbta_diversity_metric": "cosine",
+        "dbta_diversity_within_balance": True,
         "dbta_drift_replay_fraction": 0.5,
         "warmup_stage_epochs": 3,
     },
@@ -151,9 +159,9 @@ def historical_train() -> dict:
             "historical_epochs": 60,
             "adaptation_epochs": 0,
             "adaptation_ratio": 0.0,
-            "replay_ratio": 0.0,
+            "replay_budget_ratio": 0.0,
             "replay_strategy": "static",
-            "adaptation_selection": "random",
+            "adaptation_selection": "random_pure",
             "warmup_stage_epochs": 0,
         },
     }
@@ -161,10 +169,11 @@ def historical_train() -> dict:
 
 def continual_train(
     ratio: float = 0.20,
-    replay_ratio: float = 0.25,
+    replay_budget_ratio: float = 0.50,
     replay_strategy: str = "drift_matched",
     adaptation_selection: str = "dbta",
     adaptation_epochs: int = 20,
+    dbta_v1: bool = False,
 ) -> dict:
     if replay_strategy == "drift_matched" and adaptation_selection != "dbta":
         raise ValueError("drift_matched replay requires dbta adaptation_selection")
@@ -182,13 +191,21 @@ def continual_train(
             "historical_epochs": historical_epochs,
             "adaptation_epochs": adaptation_epochs,
             "adaptation_ratio": round(float(ratio), 4),
-            "replay_ratio": round(float(replay_ratio), 4),
+            "replay_budget_mode": "adapt_relative",
+            "replay_budget_ratio": round(float(replay_budget_ratio), 4),
             "replay_strategy": replay_strategy,
             "adaptation_selection": adaptation_selection,
             "dbta_balance": "predicted_label",
             "dbta_uncertainty_weight": 1.0,
             "dbta_disagreement_weight": 1.0,
             "dbta_prototype_weight": 1.0,
+            "dbta_candidate_top_p": 1.0 if dbta_v1 else 0.5,
+            "dbta_representative_k": 10,
+            "dbta_representative_weight": 0.0 if dbta_v1 else 0.7,
+            "dbta_selection_mode": "diversity_aware",
+            "dbta_diversity_weight": 0.3,
+            "dbta_diversity_metric": "cosine",
+            "dbta_diversity_within_balance": True,
             "dbta_drift_replay_fraction": 0.5,
         },
     }
@@ -364,7 +381,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         )
 
     # I1: adaptation selection and replay are isolated on concat, so architecture
-    # changes cannot explain DBTA/replay gains.
+    # changes cannot explain budgeted adaptation/replay gains.
     i1_group = "i1_dbta"
     add(
         configs,
@@ -378,9 +395,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_01_random020_no_replay.yaml",
-        "I1_01_random020_no_replay",
-        continual_train(0.20, 0.0, "static", "random"),
+        "I1_01_random_pure020_dynamic_replay.yaml",
+        "I1_01_random_pure020_dynamic_replay",
+        continual_train(0.20, 0.50, "dynamic_year_class", "random_pure"),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -388,9 +405,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_02_random020_static_replay.yaml",
-        "I1_02_random020_static_replay",
-        continual_train(0.20, 0.25, "static", "random"),
+        "I1_02_random_class_balanced020_dynamic_replay.yaml",
+        "I1_02_random_class_balanced020_dynamic_replay",
+        continual_train(0.20, 0.50, "dynamic_year_class", "random_class_balanced"),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -398,9 +415,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_03_random020_dynamic_replay.yaml",
-        "I1_03_random020_dynamic_replay",
-        continual_train(0.20, 0.25, "dynamic_year_class", "random"),
+        "I1_03_dbta_v1_020_dynamic_replay.yaml",
+        "I1_03_dbta_v1_020_dynamic_replay",
+        continual_train(0.20, 0.50, "dynamic_year_class", "dbta", dbta_v1=True),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -408,8 +425,8 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_04_dbta020_no_replay.yaml",
-        "I1_04_dbta020_no_replay",
+        "I1_04_dbta_v2_020_no_replay.yaml",
+        "I1_04_dbta_v2_020_no_replay",
         continual_train(0.20, 0.0, "static", "dbta"),
         i1_warm_start(),
         alignment_off_model("concat"),
@@ -418,9 +435,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_05_dbta020_static_replay.yaml",
-        "I1_05_dbta020_static_replay",
-        continual_train(0.20, 0.25, "static", "dbta"),
+        "I1_05_dbta_v2_020_static_replay.yaml",
+        "I1_05_dbta_v2_020_static_replay",
+        continual_train(0.20, 0.50, "static", "dbta"),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -428,9 +445,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_06_dbta020_dynamic_replay.yaml",
-        "I1_06_dbta020_dynamic_replay",
-        continual_train(0.20, 0.25, "dynamic_year_class", "dbta"),
+        "I1_06_dbta_v2_020_dynamic_replay.yaml",
+        "I1_06_dbta_v2_020_dynamic_replay",
+        continual_train(0.20, 0.50, "dynamic_year_class", "dbta"),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -438,9 +455,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         i1_group,
-        "I1_07_dbta020_drift_matched.yaml",
-        "I1_07_dbta020_drift_matched",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        "I1_07_dbta_v2_020_drift_matched.yaml",
+        "I1_07_dbta_v2_020_drift_matched",
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         i1_warm_start(),
         alignment_off_model("concat"),
         alignment_off_loss(),
@@ -450,9 +467,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         add(
             configs,
             i1_group,
-            f"I1_{idx:02d}_dbta{tag}_drift_matched.yaml",
-            f"I1_{idx:02d}_dbta{tag}_drift_matched",
-            continual_train(ratio, 0.25, "drift_matched", "dbta"),
+            f"I1_{idx:02d}_dbta_v2_{tag}_drift_matched.yaml",
+            f"I1_{idx:02d}_dbta_v2_{tag}_drift_matched",
+            continual_train(ratio, 0.50, "drift_matched", "dbta"),
             i1_warm_start(),
             alignment_off_model("concat"),
             alignment_off_loss(),
@@ -460,31 +477,31 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
 
     # Replay ablation: same full model, same selected 20% recent pool.
     replay_group = "replay_ablation"
-    for idx, (strategy, replay_ratio, label) in enumerate(
+    for idx, (strategy, replay_budget_ratio, label) in enumerate(
         [
             ("static", 0.0, "no_replay"),
-            ("static", 0.25, "static_replay"),
-            ("dynamic_year_class", 0.25, "dynamic_year_class"),
-            ("drift_matched", 0.25, "drift_matched"),
+            ("static", 0.50, "static_replay"),
+            ("dynamic_year_class", 0.50, "dynamic_year_class"),
+            ("drift_matched", 0.50, "drift_matched"),
         ]
     ):
         add(
             configs,
             replay_group,
-            f"RE{idx}_full_dbta020_{label}.yaml",
-            f"RE{idx}_full_dbta020_{label}",
-            continual_train(0.20, replay_ratio, strategy, "dbta"),
+            f"RE{idx}_full_dbta_v2_020_{label}.yaml",
+            f"RE{idx}_full_dbta_v2_020_{label}",
+            continual_train(0.20, replay_budget_ratio, strategy, "dbta"),
             full_model(),
         )
 
-    # I2: alignment hierarchy, with I1 fixed to DBTA 20% + drift-matched replay.
+    # I2: alignment hierarchy, with I1 fixed to DBTA v2 20% + budget-normalized drift-matched replay.
     i2_group = "i2_alignment"
     add(
         configs,
         i2_group,
         "I2_00_no_alignment_fixed_gate.yaml",
         "I2_00_no_alignment_fixed_gate",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         method_alignment(False),
         fixed_gate(),
         {"loss": {"semantic_alignment_weight": 0.0, "local_alignment_weight": 0.0}},
@@ -494,7 +511,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         i2_group,
         "I2_01_semantic_only_fixed_gate.yaml",
         "I2_01_semantic_only_fixed_gate",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         method_alignment(False),
         fixed_gate(),
         semantic_alignment_loss(semantic=0.05, class_aware=0.00, local=0.0),
@@ -504,7 +521,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         i2_group,
         "I2_02_class_aware_semantic_fixed_gate.yaml",
         "I2_02_class_aware_semantic_fixed_gate",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         method_alignment(False),
         fixed_gate(),
         semantic_alignment_loss(semantic=0.05, class_aware=0.20, local=0.0),
@@ -514,7 +531,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         i2_group,
         "I2_03_method_bias_only_fixed_gate.yaml",
         "I2_03_method_bias_only_fixed_gate",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         fixed_gate(),
         {"loss": {"semantic_alignment_weight": 0.0, "local_alignment_weight": 0.0}},
         {"train": {"warmup_stage_epochs": 3}},
@@ -524,7 +541,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         i2_group,
         "I2_04_hierarchical_full_fixed_gate.yaml",
         "I2_04_hierarchical_full_fixed_gate",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         full_alignment(fixed=True),
     )
 
@@ -546,7 +563,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
             i3_group,
             filename,
             exp_name,
-            continual_train(0.20, 0.25, "drift_matched", "dbta"),
+            continual_train(0.20, 0.50, "drift_matched", "dbta"),
             full_alignment(fixed=True),
             gate_patch,
         )
@@ -566,9 +583,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         add(
             configs,
             ratio_group,
-            f"R{idx}_full_dbta{tag}.yaml",
-            f"R{idx}_full_dbta{tag}",
-            continual_train(ratio, 0.25, "drift_matched", "dbta"),
+            f"R{idx}_full_dbta_v2_{tag}.yaml",
+            f"R{idx}_full_dbta_v2_{tag}",
+            continual_train(ratio, 0.50, "drift_matched", "dbta"),
             full_model(),
         )
 
@@ -586,9 +603,9 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     add(
         configs,
         main_group,
-        "M1_i1_dbta_concat020.yaml",
-        "M1_i1_dbta_concat020",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        "M1_i1_dbta_v2_concat020.yaml",
+        "M1_i1_dbta_v2_concat020",
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         alignment_off_model("concat"),
         alignment_off_loss(),
     )
@@ -597,23 +614,23 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         main_group,
         "M2_i1_i2_alignment_fixed_gate020.yaml",
         "M2_i1_i2_alignment_fixed_gate020",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         full_alignment(fixed=True),
     )
     add(
         configs,
         main_group,
-        "M3_full_dbta020.yaml",
-        "M3_full_dbta020",
-        continual_train(0.20, 0.25, "drift_matched", "dbta"),
+        "M3_full_dbta_v2_020.yaml",
+        "M3_full_dbta_v2_020",
+        continual_train(0.20, 0.50, "drift_matched", "dbta"),
         full_model(),
     )
     add(
         configs,
         main_group,
-        "M4_full_random100_static.yaml",
-        "M4_full_random100_static",
-        continual_train(1.00, 0.25, "static", "random"),
+        "M4_full_random_class_balanced100_static.yaml",
+        "M4_full_random_class_balanced100_static",
+        continual_train(1.00, 0.50, "static", "random_class_balanced"),
         full_model(),
     )
 
@@ -627,7 +644,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "main": sorted(k for k in configs if k.startswith("main_chain/")),
     }
     groups["full"] = groups["ratio"]
-    groups["final"] = ["main_chain/M3_full_dbta020.yaml"]
+    groups["final"] = ["main_chain/M3_full_dbta_v2_020.yaml"]
     groups["all"] = (
         groups["baselines"]
         + groups["i1"]

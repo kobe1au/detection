@@ -2,7 +2,7 @@
 data:
   out_dir: "experiments/main_chain"
 train:
-  exp_name: "M4_full_random100_static"
+  exp_name: "M4_full_random_class_balanced100_static"
   adaptation_ratio: 1
   replay_strategy: "static"
-  adaptation_selection: "random"
+  adaptation_selection: "random_class_balanced"

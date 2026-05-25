@@ -2,9 +2,9 @@
 data:
   out_dir: "experiments/i1_dbta"
 train:
-  exp_name: "I1_09_dbta010_drift_matched"
+  exp_name: "I1_05_dbta_v2_020_static_replay"
+  replay_strategy: "static"
   warm_start_historical_ckpt: "experiments/i1_dbta/I1_00_historical_concat/42/best_I1_00_historical_concat.pt"
-  adaptation_ratio: 0.1
 model:
   fusion_mode: "concat"
   alignment:

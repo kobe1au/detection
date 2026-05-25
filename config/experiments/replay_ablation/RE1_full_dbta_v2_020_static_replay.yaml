@@ -2,6 +2,5 @@
 data:
   out_dir: "experiments/replay_ablation"
 train:
-  exp_name: "RE0_full_dbta020_no_replay"
-  replay_ratio: 0
+  exp_name: "RE1_full_dbta_v2_020_static_replay"
   replay_strategy: "static"

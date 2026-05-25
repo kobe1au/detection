@@ -8,9 +8,9 @@ train:
   epochs: 60
   adaptation_epochs: 0
   adaptation_ratio: 0
-  replay_ratio: 0
+  replay_budget_ratio: 0
   replay_strategy: "static"
-  adaptation_selection: "random"
+  adaptation_selection: "random_pure"
   warmup_stage_epochs: 0
 model:
   fusion_mode: "late_fusion"
