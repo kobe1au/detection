@@ -860,39 +860,54 @@ def _balanced_sample_indices_to_target(
         return []
     target_count = min(target_count, total_labeled)
 
-    quotas = {}
-    remainders = []
-    for group, indices in shuffled_groups.items():
-        raw = target_count * (len(indices) / total_labeled)
-        quota = min(len(indices), int(np.floor(raw)))
-        if min_per_group > 0:
-            quota = min(len(indices), max(min_per_group, quota))
-        quotas[group] = quota
-        remainders.append((raw - int(np.floor(raw)), group))
+    quotas = {group: 0 for group in shuffled_groups}
+    group_order = list(shuffled_groups)
+    rng.shuffle(group_order)
+
+    if min_per_group > 0:
+        min_needs = {
+            group: min(int(min_per_group), len(shuffled_groups[group]))
+            for group in group_order
+        }
+        min_total = sum(min_needs.values())
+        if target_count >= min_total:
+            quotas.update(min_needs)
+        else:
+            remaining_min_budget = target_count
+            for group in group_order:
+                if remaining_min_budget <= 0:
+                    break
+                take = min(min_needs[group], remaining_min_budget)
+                quotas[group] = take
+                remaining_min_budget -= take
 
     selected_total = sum(quotas.values())
-    if selected_total > target_count:
-        overflow = selected_total - target_count
-        for _, group in sorted(remainders):
-            if overflow <= 0:
-                break
-            removable = max(0, quotas[group] - min(min_per_group, len(shuffled_groups[group])))
-            if removable <= 0:
+    remaining = target_count - selected_total
+    if remaining > 0:
+        capacities = {
+            group: len(indices) - quotas[group]
+            for group, indices in shuffled_groups.items()
+        }
+        total_capacity = sum(max(0, capacity) for capacity in capacities.values())
+        remainders = []
+        for group, capacity in capacities.items():
+            if capacity <= 0 or total_capacity <= 0:
+                remainders.append((0.0, rng.random(), group))
                 continue
-            drop = min(removable, overflow)
-            quotas[group] -= drop
-            overflow -= drop
-    elif selected_total < target_count:
-        remaining = target_count - selected_total
-        for _, group in sorted(remainders, reverse=True):
+            raw = remaining * (capacity / total_capacity)
+            add = min(capacity, int(np.floor(raw)))
+            quotas[group] += add
+            remainders.append((raw - int(np.floor(raw)), rng.random(), group))
+
+        remaining = target_count - sum(quotas.values())
+        for _, _, group in sorted(remainders, reverse=True):
             if remaining <= 0:
                 break
             capacity = len(shuffled_groups[group]) - quotas[group]
             if capacity <= 0:
                 continue
-            take = min(capacity, remaining)
-            quotas[group] += take
-            remaining -= take
+            quotas[group] += 1
+            remaining -= 1
 
     selected = []
     for group, quota in quotas.items():
@@ -961,8 +976,8 @@ class YearClassBalancedReplaySampler(Sampler[int]):
     Dataset layout must be:
       ConcatDataset([adapt_dataset, historical_dataset])
 
-    Each epoch samples:
-      - adaptation samples balanced by class
+    Each epoch uses the fixed selected adaptation subset and samples:
+      - all selected adaptation samples
       - replay samples balanced by year x class
     """
 
@@ -985,16 +1000,12 @@ class YearClassBalancedReplaySampler(Sampler[int]):
 
         self.hist_offset = len(adapt_dataset)
 
-        self.adapt_groups = _dataset_label_year_groups(
-            adapt_dataset,
-            group_by_year=False,
-        )
         self.replay_groups = _dataset_label_year_groups(
             historical_dataset,
             group_by_year=True,
         )
 
-        self.num_adapt_samples = min(self.adapt_target_count, sum(len(v) for v in self.adapt_groups.values()))
+        self.num_adapt_samples = len(adapt_dataset)
         self.num_replay_samples = min(self.replay_target_count, sum(len(v) for v in self.replay_groups.values()))
 
         if self.num_adapt_samples <= 0:
@@ -1025,11 +1036,8 @@ class YearClassBalancedReplaySampler(Sampler[int]):
     def __iter__(self):
         rng = random.Random(self.seed + 1000003 * self.epoch)
 
-        adapt_indices = self._sample_groups(
-            self.num_adapt_samples,
-            rng,
-            offset=0,
-        )
+        adapt_indices = list(range(self.num_adapt_samples))
+        rng.shuffle(adapt_indices)
         replay_indices = self._sample_groups(
             self.num_replay_samples,
             rng,
@@ -1582,7 +1590,11 @@ def _select_dbta_records(records, target: int, cfg):
         if budget <= 0:
             return []
         if selection_mode == "topk":
-            return sorted(pool, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
+            selected = sorted(pool, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
+            for record in selected:
+                record["diversity_gain"] = 0.0
+                record["selection_score"] = float(record.get("drift_score", 0.0))
+            return selected
         candidates = _candidate_pool(pool, budget)
         if not candidates:
             return []
@@ -1595,7 +1607,11 @@ def _select_dbta_records(records, target: int, cfg):
                 metric=diversity_metric,
             )
         if diversity_weight <= 0.0:
-            return sorted(candidates, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
+            selected = sorted(candidates, key=lambda r: float(r.get("drift_score", 0.0)), reverse=True)[:budget]
+            for record in selected:
+                record["diversity_gain"] = 0.0
+                record["selection_score"] = float(record.get("drift_score", 0.0))
+            return selected
         return _greedy_diversity_select(
             candidates,
             budget,
