@@ -32,11 +32,10 @@ class TriBranchGate(nn.Module):
     """
     Three-branch softmax gate for API + Graph fusion.
 
-    Minimal q_dim=9:
-      [q_api, q_graph, q_align, pert_api, pert_graph,
-       branch_disagreement, entropy, api_alive, graph_alive]
-    Optional gate features can append temporal reliability and explicit
-    time-position features.
+    Minimal q_dim=5:
+      [q_api, q_graph, q_align, pert_api, pert_graph]
+    Optional gate features can append temporal reliability, explicit
+    time-position features, uncertainty, availability, and confidences.
 
     Output:
       [w_api, w_graph, w_joint]
@@ -46,7 +45,7 @@ class TriBranchGate(nn.Module):
         self,
         api_dim: int,
         graph_dim: int,
-        q_dim: int = 9,
+        q_dim: int = 5,
         hidden: int | None = None,
     ):
         super().__init__()

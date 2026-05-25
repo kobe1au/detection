@@ -19,6 +19,14 @@ DEFAULT_OUT_DIR = Path("config/experiments")
 ADAPT_PT_DIR = "/pts/adapt"
 ADAPT_CSV = "results/labels/test_2023.csv"
 DROP = object()
+DBTA_V2_REPRESENTATIVE_SCOPE = "recent_pool"
+DBTA_V2_FINAL_DRIFT_WEIGHT = 0.0
+TUNED_DBTA_VARIANTS = [
+    ("TP0_full_dbta_v2_020_recent_pool", DBTA_V2_REPRESENTATIVE_SCOPE, DBTA_V2_FINAL_DRIFT_WEIGHT),
+    ("TP1_full_dbta_v2_020_candidate_pool", "candidate_pool", DBTA_V2_FINAL_DRIFT_WEIGHT),
+    ("TP2_full_dbta_v2_020_candidate_pool_drift020", "candidate_pool", 0.20),
+    ("TP3_full_dbta_v2_020_candidate_pool_drift050", "candidate_pool", 0.50),
+]
 
 BASE_DEFAULTS = {
     "data": {
@@ -40,6 +48,7 @@ BASE_DEFAULTS = {
             "quality_inputs": True,
             "temporal_reliability_inputs": True,
             "uncertainty_inputs": True,
+            "availability_inputs": True,
             "time_inputs": True,
             "confidence_inputs": True,
             "confidence_source": "raw",
@@ -62,7 +71,9 @@ BASE_DEFAULTS = {
         "dbta_prototype_weight": 1.0,
         "dbta_candidate_top_p": 0.5,
         "dbta_representative_k": 10,
+        "dbta_representative_scope": DBTA_V2_REPRESENTATIVE_SCOPE,
         "dbta_representative_weight": 0.7,
+        "dbta_final_drift_weight": DBTA_V2_FINAL_DRIFT_WEIGHT,
         "dbta_selection_mode": "diversity_aware",
         "dbta_diversity_weight": 0.3,
         "dbta_diversity_metric": "cosine",
@@ -77,7 +88,6 @@ BASE_DEFAULTS = {
         "local_alignment_weight": 0.02,
         "max_local_align_nodes": 128,
         "max_local_align_tokens": 256,
-        "alignment_use_temporal_soft_weight": False,
         "alignment_use_temporal_reliability": True,
         "alignment_use_drift_reliability": True,
         "stage1_branch_aux_weight": 0.10,
@@ -174,6 +184,8 @@ def continual_train(
     adaptation_selection: str = "dbta",
     adaptation_epochs: int = 20,
     dbta_no_refinement: bool = False,
+    dbta_representative_scope: str = "recent_pool",
+    dbta_final_drift_weight: float = 0.0,
 ) -> dict:
     if replay_strategy == "drift_matched" and adaptation_selection != "dbta":
         raise ValueError("drift_matched replay requires dbta adaptation_selection")
@@ -201,7 +213,9 @@ def continual_train(
             "dbta_prototype_weight": 1.0,
             "dbta_candidate_top_p": 1.0 if dbta_no_refinement else 0.5,
             "dbta_representative_k": 10,
+            "dbta_representative_scope": dbta_representative_scope,
             "dbta_representative_weight": 0.0 if dbta_no_refinement else 0.7,
+            "dbta_final_drift_weight": round(float(dbta_final_drift_weight), 4),
             "dbta_selection_mode": "topk" if dbta_no_refinement else "diversity_aware",
             "dbta_diversity_weight": 0.0 if dbta_no_refinement else 0.3,
             "dbta_diversity_metric": "cosine",
@@ -209,6 +223,21 @@ def continual_train(
             "dbta_drift_replay_fraction": 0.5,
         },
     }
+
+
+def tuned_dbta_train(
+    representative_scope: str,
+    final_drift_weight: float,
+    ratio: float = 0.20,
+) -> dict:
+    return continual_train(
+        ratio,
+        0.50,
+        "drift_matched",
+        "dbta",
+        dbta_representative_scope=representative_scope,
+        dbta_final_drift_weight=final_drift_weight,
+    )
 
 
 def alignment_off_loss() -> dict:
@@ -251,6 +280,7 @@ def learned_gate(
     quality: bool,
     temporal_reliability: bool,
     uncertainty: bool,
+    availability: bool,
     time: bool,
     confidence: bool,
 ) -> dict:
@@ -261,6 +291,7 @@ def learned_gate(
                 "quality_inputs": quality,
                 "temporal_reliability_inputs": temporal_reliability,
                 "uncertainty_inputs": uncertainty,
+                "availability_inputs": availability,
                 "time_inputs": time,
                 "confidence_inputs": confidence,
                 "confidence_source": "raw",
@@ -311,7 +342,6 @@ def semantic_alignment_loss(
             "local_alignment_weight": float(local),
             "max_local_align_nodes": 128,
             "max_local_align_tokens": 256,
-            "alignment_use_temporal_soft_weight": False,
             "alignment_use_temporal_reliability": temporal_reliability,
             "alignment_use_drift_reliability": drift_reliability,
             "stage1_branch_aux_weight": float(stage1_aux),
@@ -325,6 +355,7 @@ def full_alignment(fixed: bool = True) -> dict:
         quality=True,
         temporal_reliability=True,
         uncertainty=True,
+        availability=True,
         time=True,
         confidence=True,
     )
@@ -549,13 +580,13 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
     i3_group = "i3_gate"
     gate_variants = [
         ("I3_00_fixed_gate.yaml", "I3_00_fixed_gate", fixed_gate()),
-        ("I3_01_learned_emb_only.yaml", "I3_01_learned_emb_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=False, confidence=False)),
-        ("I3_02_quality_only.yaml", "I3_02_quality_only", learned_gate(quality=True, temporal_reliability=False, uncertainty=False, time=False, confidence=False)),
-        ("I3_03_temporal_reliability_only.yaml", "I3_03_temporal_reliability_only", learned_gate(quality=False, temporal_reliability=True, uncertainty=False, time=False, confidence=False)),
-        ("I3_04_time_features_only.yaml", "I3_04_time_features_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=True, confidence=False)),
-        ("I3_05_uncertainty_only.yaml", "I3_05_uncertainty_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=True, time=False, confidence=False)),
-        ("I3_06_confidence_only.yaml", "I3_06_confidence_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, time=False, confidence=True)),
-        ("I3_07_full_gate.yaml", "I3_07_full_gate", learned_gate(quality=True, temporal_reliability=True, uncertainty=True, time=True, confidence=True)),
+        ("I3_01_learned_emb_only.yaml", "I3_01_learned_emb_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, availability=False, time=False, confidence=False)),
+        ("I3_02_quality_only.yaml", "I3_02_quality_only", learned_gate(quality=True, temporal_reliability=False, uncertainty=False, availability=False, time=False, confidence=False)),
+        ("I3_03_temporal_reliability_only.yaml", "I3_03_temporal_reliability_only", learned_gate(quality=False, temporal_reliability=True, uncertainty=False, availability=False, time=False, confidence=False)),
+        ("I3_04_time_features_only.yaml", "I3_04_time_features_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, availability=False, time=True, confidence=False)),
+        ("I3_05_uncertainty_only.yaml", "I3_05_uncertainty_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=True, availability=True, time=False, confidence=False)),
+        ("I3_06_confidence_only.yaml", "I3_06_confidence_only", learned_gate(quality=False, temporal_reliability=False, uncertainty=False, availability=False, time=False, confidence=True)),
+        ("I3_07_full_gate.yaml", "I3_07_full_gate", learned_gate(quality=True, temporal_reliability=True, uncertainty=True, availability=True, time=True, confidence=True)),
     ]
     for filename, exp_name, gate_patch in gate_variants:
         add(
@@ -634,6 +665,22 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         full_model(),
     )
 
+    # Tuned-performance probes: keep the main chain stable and isolate DBTA
+    # selector knobs that may improve performance after the core ablations.
+    tuned_group = "tuned_performance"
+    for exp_name, representative_scope, final_drift_weight in TUNED_DBTA_VARIANTS:
+        add(
+            configs,
+            tuned_group,
+            f"{exp_name}.yaml",
+            exp_name,
+            tuned_dbta_train(
+                representative_scope=representative_scope,
+                final_drift_weight=final_drift_weight,
+            ),
+            full_model(),
+        )
+
     groups = {
         "baselines": sorted(k for k in configs if k.startswith("baselines/")),
         "i1": sorted(k for k in configs if k.startswith("i1_dbta/")),
@@ -642,6 +689,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         "i3": sorted(k for k in configs if k.startswith("i3_gate/")),
         "ratio": sorted(k for k in configs if k.startswith("ratio_sweep/")),
         "main": sorted(k for k in configs if k.startswith("main_chain/")),
+        "tuned": sorted(k for k in configs if k.startswith("tuned_performance/")),
     }
     groups["full"] = groups["ratio"]
     groups["final"] = ["main_chain/M3_full_dbta_v2_020.yaml"]
@@ -652,6 +700,7 @@ def build_configs() -> tuple[dict[str, dict], dict[str, list[str]]]:
         + groups["i2"]
         + groups["i3"]
         + groups["ratio"]
+        + groups["tuned"]
     )
     return configs, groups
 
@@ -670,6 +719,7 @@ def build_i3_gate_signal_manifest(configs: dict[str, dict], groups: dict[str, li
             "temporal_reliability_inputs": gate_uses_inputs and bool(gate.get("temporal_reliability_inputs", False)),
             "time_inputs": gate_uses_inputs and bool(gate.get("time_inputs", False)),
             "uncertainty_inputs": gate_uses_inputs and bool(gate.get("uncertainty_inputs", False)),
+            "availability_inputs": gate_uses_inputs and bool(gate.get("availability_inputs", False)),
             "confidence_inputs": gate_uses_inputs and bool(gate.get("confidence_inputs", False)),
         }
     return signals
@@ -752,7 +802,7 @@ def main() -> None:
             for key, paths in groups.items()
         },
         "i3_gate_signals": build_i3_gate_signal_manifest(configs, groups),
-        "recommended_order": ["baselines", "i1", "replay", "i2", "i3", "ratio", "main"],
+        "recommended_order": ["baselines", "i1", "replay", "i2", "i3", "ratio", "main", "tuned"],
     }
     write_yaml(out_dir / "_manifest.yaml", manifest)
 

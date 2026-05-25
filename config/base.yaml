@@ -57,6 +57,7 @@ model:
     quality_inputs: true
     temporal_reliability_inputs: true
     uncertainty_inputs: true
+    availability_inputs: true
     time_inputs: true
     time_feature_set: basic
     confidence_inputs: true
@@ -98,7 +99,9 @@ train:
   dbta_prototype_weight: 1.0
   dbta_candidate_top_p: 0.5
   dbta_representative_k: 10
+  dbta_representative_scope: recent_pool
   dbta_representative_weight: 0.7
+  dbta_final_drift_weight: 0.0
   dbta_selection_mode: diversity_aware
   dbta_diversity_weight: 0.3
   dbta_diversity_metric: cosine
@@ -120,7 +123,6 @@ loss:
   local_alignment_margin: 0.35
   max_local_align_nodes: 128
   max_local_align_tokens: 256
-  alignment_use_temporal_soft_weight: false
   alignment_use_temporal_reliability: true
   alignment_use_drift_reliability: true
 

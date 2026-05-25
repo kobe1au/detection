@@ -235,9 +235,9 @@ def validate_full_config(cfg):
             "train.adaptation_selection=dbta"
         )
     replay_budget_mode = _get_replay_budget_mode(cfg["train"])
-    if replay_budget_mode not in {"selected_adapt_relative", "historical_relative"}:
+    if replay_budget_mode != "selected_adapt_relative":
         raise ValueError(
-            "train.replay_budget_mode must be one of: selected_adapt_relative, historical_relative"
+            "train.replay_budget_mode must be selected_adapt_relative"
         )
     replay_budget_ratio = _get_replay_budget_ratio(cfg["train"])
     if replay_budget_ratio < 0.0:
@@ -245,6 +245,12 @@ def validate_full_config(cfg):
     dbta_balance = str(cfg["train"].get("dbta_balance", "predicted_label")).lower()
     if dbta_balance not in {"predicted_label", "none"}:
         raise ValueError("train.dbta_balance must be predicted_label or none")
+    dbta_final_drift_weight = float(cfg["train"].get("dbta_final_drift_weight", 0.0))
+    if dbta_final_drift_weight < 0.0:
+        raise ValueError("train.dbta_final_drift_weight must be >= 0")
+    dbta_representative_scope = str(cfg["train"].get("dbta_representative_scope", "recent_pool")).lower()
+    if dbta_representative_scope not in {"recent_pool", "candidate_pool"}:
+        raise ValueError("train.dbta_representative_scope must be recent_pool or candidate_pool")
 
     allowed_top = {"data", "model", "train", "loss"}
     allowed_data = {
@@ -269,6 +275,7 @@ def validate_full_config(cfg):
         "quality_inputs",
         "temporal_reliability_inputs",
         "uncertainty_inputs",
+        "availability_inputs",
         "detach",
         "time_inputs",
         "time_feature_set",
@@ -290,6 +297,7 @@ def validate_full_config(cfg):
         "dbta_selection_mode", "dbta_diversity_weight",
         "dbta_diversity_metric", "dbta_diversity_within_balance",
         "dbta_candidate_top_p", "dbta_representative_k", "dbta_representative_weight",
+        "dbta_final_drift_weight", "dbta_representative_scope",
     }
     allowed_loss = {
         "semantic_alignment_weight",
@@ -300,7 +308,6 @@ def validate_full_config(cfg):
         "local_alignment_weight",
         "max_local_align_nodes",
         "max_local_align_tokens",
-        "alignment_use_temporal_soft_weight",
         "alignment_use_temporal_reliability",
         "alignment_use_drift_reliability",
         "local_alignment_positive_weight",
@@ -363,6 +370,7 @@ def validate_full_config(cfg):
             "dbta_selection_mode", "dbta_diversity_weight",
             "dbta_diversity_metric", "dbta_diversity_within_balance",
             "dbta_candidate_top_p", "dbta_representative_k", "dbta_representative_weight",
+            "dbta_final_drift_weight", "dbta_representative_scope",
         },
     )
     _require_keys(
@@ -921,12 +929,10 @@ def _get_replay_budget_mode(train_cfg) -> str:
 
 
 def _get_replay_budget_ratio(train_cfg) -> float:
-    if "replay_ratio" in train_cfg:
-        raise ValueError("train.replay_ratio was removed; use train.replay_budget_ratio")
     return float(train_cfg.get("replay_budget_ratio", 0.25))
 
 
-def _compute_replay_target_count(train_cfg, selected_adapt_count: int, historical_dataset=None) -> int:
+def _compute_replay_target_count(train_cfg, selected_adapt_count: int) -> int:
     selected_adapt_count = int(selected_adapt_count)
     if selected_adapt_count <= 0:
         return 0
@@ -936,13 +942,7 @@ def _compute_replay_target_count(train_cfg, selected_adapt_count: int, historica
 
     if mode == "selected_adapt_relative":
         return max(0, int(round(selected_adapt_count * ratio)))
-    if mode == "historical_relative":
-        if historical_dataset is None:
-            raise ValueError("historical_relative replay budget requires historical_dataset")
-        return _budget_count(len(historical_dataset), ratio)
-    raise ValueError(
-        "train.replay_budget_mode must be one of: selected_adapt_relative, historical_relative"
-    )
+    raise ValueError("train.replay_budget_mode must be selected_adapt_relative")
 
 
 class YearClassBalancedReplaySampler(Sampler[int]):
@@ -1053,7 +1053,6 @@ def _build_continual_adaptation_loader(
     replay_target_count = _compute_replay_target_count(
         train_cfg,
         selected_adapt_count=len(adapt_indices),
-        historical_dataset=historical_dataset,
     )
 
     if replay_strategy == "dynamic_year_class":
@@ -1311,7 +1310,7 @@ def _attach_representativeness(records, k: int = 10):
         for record in records:
             record["representativeness_score"] = 1.0
             record["density_bucket"] = "high"
-        return
+        return records
 
     vectors = np.stack([r["embedding"] for r in records], axis=0).astype(np.float32)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
@@ -1350,6 +1349,7 @@ def _attach_representativeness(records, k: int = 10):
         else:
             bucket = "high"
         record["density_bucket"] = bucket
+    return records
 
 
 def _budget_count(n: int, ratio: float) -> int:
@@ -1485,6 +1485,7 @@ def _greedy_representative_diverse_select(
     target: int,
     representative_weight: float,
     diversity_weight: float,
+    drift_weight: float,
     metric: str = "cosine",
 ):
     if target <= 0 or not records:
@@ -1499,9 +1500,11 @@ def _greedy_representative_diverse_select(
 
     representative_weight = max(float(representative_weight), 0.0)
     diversity_weight = max(float(diversity_weight), 0.0)
-    weight_sum = max(representative_weight + diversity_weight, 1e-8)
+    drift_weight = max(float(drift_weight), 0.0)
+    weight_sum = max(representative_weight + diversity_weight + drift_weight, 1e-8)
     rep_w = representative_weight / weight_sum
     div_w = diversity_weight / weight_sum
+    drift_w = drift_weight / weight_sum
 
     selected = []
     remaining = list(records)
@@ -1525,7 +1528,7 @@ def _greedy_representative_diverse_select(
             score = (
                 rep_w * rep
                 + div_w * diversity
-                + 1e-6 * float(record.get("drift_score", 0.0))
+                + drift_w * float(record.get("drift_score", 0.0))
             )
             if score > best_score:
                 best_score = score
@@ -1546,14 +1549,21 @@ def _select_dbta_records(records, target: int, cfg):
     diversity_metric = str(train_cfg.get("dbta_diversity_metric", "cosine")).lower()
     diversity_within_balance = bool(train_cfg.get("dbta_diversity_within_balance", True))
     candidate_top_p = float(train_cfg.get("dbta_candidate_top_p", 0.5))
+    representative_scope = str(train_cfg.get("dbta_representative_scope", "recent_pool")).lower()
+    representative_k = int(train_cfg.get("dbta_representative_k", 10))
     representative_weight = float(train_cfg.get("dbta_representative_weight", 0.7))
+    final_drift_weight = float(train_cfg.get("dbta_final_drift_weight", 0.0))
 
     if selection_mode not in {"topk", "diversity_aware"}:
         raise ValueError(
             f"Unsupported train.dbta_selection_mode={selection_mode}; expected topk or diversity_aware"
         )
+    if representative_scope not in {"recent_pool", "candidate_pool"}:
+        raise ValueError(
+            "train.dbta_representative_scope must be recent_pool or candidate_pool"
+        )
 
-    def _candidate_pool(pool, budget):
+    def _drift_shortlist(pool, budget):
         if not pool or budget <= 0:
             return []
         candidate_top = min(max(candidate_top_p, 0.0), 1.0)
@@ -1574,15 +1584,18 @@ def _select_dbta_records(records, target: int, cfg):
             for record in selected:
                 _set_dbta_selection_diagnostics(record, record.get("drift_score", 0.0))
             return selected
-        candidates = _candidate_pool(pool, budget)
+        candidates = _drift_shortlist(pool, budget)
         if not candidates:
             return []
+        if representative_weight > 0.0 and representative_scope == "candidate_pool":
+            _attach_representativeness(candidates, k=representative_k)
         if representative_weight > 0.0:
             return _greedy_representative_diverse_select(
                 candidates,
                 budget,
                 representative_weight=representative_weight,
                 diversity_weight=diversity_weight,
+                drift_weight=final_drift_weight,
                 metric=diversity_metric,
             )
         if diversity_weight <= 0.0:
@@ -1681,10 +1694,20 @@ def _score_and_select_dbta_records(records, cfg):
             score += max(weight, 0.0) * float(normalized[key][i])
         record["drift_score"] = score / weight_sum
 
-    _attach_representativeness(
-        records,
-        k=int(train_cfg.get("dbta_representative_k", 10)),
-    )
+    representative_scope = str(train_cfg.get("dbta_representative_scope", "recent_pool")).lower()
+    if representative_scope == "recent_pool":
+        _attach_representativeness(
+            records,
+            k=int(train_cfg.get("dbta_representative_k", 10)),
+        )
+    elif representative_scope == "candidate_pool":
+        for record in records:
+            record["representativeness_score"] = 0.0
+            record["density_bucket"] = "not_candidate"
+    else:
+        raise ValueError(
+            "train.dbta_representative_scope must be recent_pool or candidate_pool"
+        )
 
     return _select_dbta_records(records, target, cfg)
 
@@ -1735,7 +1758,6 @@ def _build_drift_matched_replay_indices(
     target = _compute_replay_target_count(
         train_cfg,
         selected_adapt_count=len(selected_adapt_records),
-        historical_dataset=historical_dataset,
     )
     if target <= 0:
         return []
@@ -3112,9 +3134,8 @@ def main():
     c_graph = c_model["graph_encoder"]
     c_alignment = c_model["alignment"]
     c_gate = c_model["gate"]
-    legacy_temporal = bool(c_loss.get("alignment_use_temporal_soft_weight", False))
-    use_temporal_reliability = bool(c_loss.get("alignment_use_temporal_reliability", legacy_temporal))
-    use_drift_reliability = bool(c_loss.get("alignment_use_drift_reliability", legacy_temporal))
+    use_temporal_reliability = bool(c_loss["alignment_use_temporal_reliability"])
+    use_drift_reliability = bool(c_loss["alignment_use_drift_reliability"])
 
     need_alignment_mask = _fm == "ours" and bool(c_alignment["enabled"])
 
@@ -3322,6 +3343,7 @@ def main():
         drift_evidence_disagreement_weight=float(c_model.get("drift_evidence_disagreement_weight", 1.0)),
         drift_evidence_alignment_weight=float(c_model.get("drift_evidence_alignment_weight", 1.0)),
         confidence_inputs=bool(c_gate.get("confidence_inputs", True)),
+        availability_inputs=bool(c_gate["availability_inputs"]),
         confidence_source=str(c_gate.get("confidence_source", "raw")),
         confidence_detach=bool(c_gate.get("confidence_detach", True)),
         gate_mode=str(c_gate["mode"]),

@@ -16,6 +16,7 @@
 | `ratio` / `full` | 6 | full model 的 0%、5%、10%、20%、50%、100% recent adaptation budget |
 | `final` | 1 | 单个最终模型 `M3_full_dbta_v2_020`，避免误跑完整 ratio sweep |
 | `main` | 5 | 最短论文主线：concat ERM -> I1 -> I1+I2 -> full -> oracle class-balanced random100 static stress test |
+| `tuned` | 4 | 不污染主线的 DBTA 性能探索：candidate-pool representativeness 与 positive final drift weight |
 
 ## 主线
 
@@ -24,7 +25,7 @@
 | M0 | `config/experiments/main_chain/M0_concat_erm.yaml` | historical concat ERM |
 | M1 | `config/experiments/main_chain/M1_i1_dbta_v2_concat020.yaml` | concat + DBTA v2 20% + selected-adapt-relative drift-matched replay |
 | M2 | `config/experiments/main_chain/M2_i1_i2_alignment_fixed_gate020.yaml` | M1 + hierarchical alignment，gate 固定 |
-| M3 | `config/experiments/main_chain/M3_full_dbta_v2_020.yaml` | M2 + learned quality/q_time-q_drift/time-feature/uncertainty/confidence gate |
+| M3 | `config/experiments/main_chain/M3_full_dbta_v2_020.yaml` | M2 + learned quality/q_time-q_drift/time-feature/uncertainty/availability/confidence gate |
 | M4 | `config/experiments/main_chain/M4_full_random_class_balanced100_static.yaml` | full model + oracle class-balanced random 100% + static replay，用来压力测试 DBTA v2 20% 的效率叙事 |
 
 ## 运行
@@ -52,8 +53,9 @@ python run.py i2
 python run.py i3
 python run.py final
 python run.py full
+python run.py tuned
 ```
 
 严苛判断标准：如果 `M3_full_dbta_v2_020` 不能稳定超过 `M4_full_random_class_balanced100_static` 或至少在显著更低 adaptation budget 下接近它，那么“少量 recent adaptation + DBTA”的贡献只能写成效率/成本优势，不能写成绝对性能优势。
 
-写作边界：I1 只验证 budgeted adaptation / replay，因为 I1 配置固定 `fusion_mode=concat`、关闭 alignment、固定 gate；I2/I3 分别验证 drift/reliability signal 在 alignment 与 fusion 中的作用。
+写作边界：I1 只验证 budgeted adaptation / replay，因为 I1 配置固定 `fusion_mode=concat`、关闭 alignment、固定 gate；I2/I3 分别验证 drift/reliability signal 在 alignment 与 fusion 中的作用。`tuned` 组是性能探索，不自动替代主线 M3。

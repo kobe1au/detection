@@ -351,6 +351,7 @@ class MalwareModelWithXAttn(nn.Module):
         drift_evidence_uncertainty_weight: float = 1.0,
         drift_evidence_disagreement_weight: float = 1.0,
         drift_evidence_alignment_weight: float = 1.0,
+        availability_inputs: bool = True,
         confidence_inputs: bool = True,
         confidence_source: str = "raw",
         confidence_detach: bool = True,
@@ -428,6 +429,7 @@ class MalwareModelWithXAttn(nn.Module):
         self.drift_evidence_uncertainty_weight = max(float(drift_evidence_uncertainty_weight), 0.0)
         self.drift_evidence_disagreement_weight = max(float(drift_evidence_disagreement_weight), 0.0)
         self.drift_evidence_alignment_weight = max(float(drift_evidence_alignment_weight), 0.0)
+        self.availability_inputs = bool(availability_inputs)
         self.confidence_inputs = bool(confidence_inputs)
         self.confidence_source = str(confidence_source or "raw").lower()
         self.confidence_detach = bool(confidence_detach)
@@ -522,14 +524,17 @@ class MalwareModelWithXAttn(nn.Module):
 
         if self._need_gates:
             # Gate input dimensions must exactly match forward() concatenation.
-            # Composition: 5 explicit quality features + optional
-            # q_time/q_drift + optional time features + uncertainty/alive + optional confidences.
+            # Composition: 5 explicit quality features + optional q_time/q_drift,
+            # time features, uncertainty evidence, availability, and confidences.
             gate_q_dim = 5
             if self.use_gate_temporal_reliability_inputs:
                 gate_q_dim += 2
             if self.use_time_gate_inputs:
                 gate_q_dim += 4
-            gate_q_dim += 5  # uncertainty, disagreement, entropy, api_alive, graph_alive
+            if self.use_uncertainty_gate:
+                gate_q_dim += 3  # uncertainty, disagreement, entropy
+            if self.availability_inputs:
+                gate_q_dim += 2  # api_alive, graph_alive
             if self.confidence_inputs:
                 gate_q_dim += 3  # api, graph, joint branch confidences
             self.gate_net = TriBranchGate(api_emb_dim, graph_emb_dim, q_dim=gate_q_dim)
@@ -1384,11 +1389,6 @@ class MalwareModelWithXAttn(nn.Module):
                 local_alignment_context["density"],
             ))
 
-        if not self.use_uncertainty_gate:
-            uncertainty_score = torch.zeros_like(uncertainty_score)
-            gate_disagreement = torch.zeros_like(gate_disagreement)
-            gate_entropy = torch.zeros_like(gate_entropy)
-
         gate_q_parts = [gate_quality_qs]
         if self.use_gate_temporal_reliability_inputs:
             gate_q_parts.extend([q_time, q_drift])
@@ -1397,7 +1397,14 @@ class MalwareModelWithXAttn(nn.Module):
         gate_inputs_parts = [gate_qs]
         if self.use_time_gate_inputs:
             gate_inputs_parts.append(time_gate_features)
-        gate_inputs_parts.extend([uncertainty_score, gate_disagreement, gate_entropy, api_alive, graph_alive])
+        if self.use_uncertainty_gate:
+            gate_inputs_parts.extend([uncertainty_score, gate_disagreement, gate_entropy])
+        else:
+            uncertainty_score = torch.zeros_like(uncertainty_score)
+            gate_disagreement = torch.zeros_like(gate_disagreement)
+            gate_entropy = torch.zeros_like(gate_entropy)
+        if self.availability_inputs:
+            gate_inputs_parts.extend([api_alive, graph_alive])
         if self.confidence_inputs:
             api_conf, graph_conf, joint_conf = self._compute_branch_confidences(
                 api_logits,

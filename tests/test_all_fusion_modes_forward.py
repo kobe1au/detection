@@ -102,7 +102,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
             historical_time_id_max=1,
         )
         model.eval()
-        self.assertEqual(model.gate_net.q_dim, 12)
+        self.assertEqual(model.gate_net.q_dim, 9)
         logits, extra = model(
             graph_data=make_graph_batch(),
             explicit_qs=make_explicit_qs(),
@@ -131,7 +131,7 @@ class AllFusionModesForwardTest(unittest.TestCase):
             historical_time_id_max=1,
         )
         model.eval()
-        self.assertEqual(model.gate_net.q_dim, 10)
+        self.assertEqual(model.gate_net.q_dim, 7)
         logits, extra = model(
             graph_data=make_graph_batch(),
             explicit_qs=make_explicit_qs(),
@@ -156,7 +156,19 @@ class AllFusionModesForwardTest(unittest.TestCase):
             num_time_domains=4,
             historical_time_id_max=1,
         )
-        self.assertEqual(model.gate_net.q_dim, 15)
+        self.assertEqual(model.gate_net.q_dim, 12)
+
+    def test_learned_embedding_only_gate_has_no_evidence_inputs(self):
+        model = make_model(
+            "ours",
+            use_quality_gate_inputs=False,
+            use_uncertainty_gate=False,
+            use_time_gate_inputs=False,
+            use_gate_temporal_reliability_inputs=False,
+            availability_inputs=False,
+            confidence_inputs=False,
+        )
+        self.assertEqual(model.gate_net.q_dim, 5)
 
     def test_gate_confidence_source_raw_ignores_temperatures(self):
         model = make_model(

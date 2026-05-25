@@ -49,19 +49,46 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             train_mod._compute_replay_target_count(cfg["train"], 300)
 
-    def test_replay_budget_rejects_removed_replay_ratio(self):
-        cfg = _cfg(replay_budget_ratio=0.5)
-        cfg["train"]["replay_ratio"] = 0.25
-        with self.assertRaises(ValueError):
-            train_mod._get_replay_budget_ratio(cfg["train"])
-
-    def test_replay_budget_historical_relative_uses_historical_size(self):
-        hist = TinyDataset([0, 1] * 50)
-        cfg = _cfg(replay_budget_mode="historical_relative", replay_budget_ratio=0.25)
-        self.assertEqual(
-            train_mod._compute_replay_target_count(cfg["train"], 300, historical_dataset=hist),
-            25,
+    def test_config_schema_rejects_removed_replay_ratio(self):
+        cfg = train_mod.deep_update(
+            train_mod.load_yaml_file("config/base.yaml"),
+            {"train": {"replay_ratio": 0.25}},
         )
+
+        with self.assertRaises(ValueError):
+            train_mod.validate_full_config(cfg)
+
+    def test_config_schema_accepts_representative_scope_values(self):
+        cfg = train_mod.deep_update(
+            train_mod.load_yaml_file("config/base.yaml"),
+            {"train": {"dbta_representative_scope": "candidate_pool"}},
+        )
+        train_mod.validate_full_config(cfg)
+
+        cfg["train"]["dbta_representative_scope"] = "recent_pool"
+        train_mod.validate_full_config(cfg)
+
+    def test_config_schema_rejects_invalid_representative_scope(self):
+        cfg = train_mod.deep_update(
+            train_mod.load_yaml_file("config/base.yaml"),
+            {"train": {"dbta_representative_scope": "batch"}},
+        )
+        with self.assertRaises(ValueError):
+            train_mod.validate_full_config(cfg)
+
+    def test_replay_budget_allows_only_selected_adapt_relative_mode(self):
+        cfg = _cfg(replay_budget_mode="historical_relative", replay_budget_ratio=0.25)
+        with self.assertRaises(ValueError):
+            train_mod._compute_replay_target_count(cfg["train"], 300)
+
+    def test_config_schema_rejects_removed_temporal_soft_weight(self):
+        cfg = train_mod.deep_update(
+            train_mod.load_yaml_file("config/base.yaml"),
+            {"loss": {"alignment_use_temporal_soft_weight": False}},
+        )
+
+        with self.assertRaises(ValueError):
+            train_mod.validate_full_config(cfg)
 
     def test_balanced_target_sampling_returns_exact_target_for_small_budget(self):
         dataset = TinyDataset(
@@ -238,6 +265,49 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
             self.assertIn("representativeness_score", record)
             self.assertIn("density_bucket", record)
 
+    def test_dbta_candidate_pool_representativeness_scores_only_shortlist(self):
+        embeddings = [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.99],
+            [0.0, 1.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+        uncertainty = [1.0, 0.9, 0.8, 0.1, 0.1, 0.1]
+        records = [
+            {
+                "dataset_index": i,
+                "pred_label": 0,
+                "embedding": np.asarray(emb, dtype=np.float32),
+                "uncertainty": uncertainty[i],
+                "branch_disagreement": 0.0,
+                "prototype_distance": 0.0,
+            }
+            for i, emb in enumerate(embeddings)
+        ]
+        cfg = _cfg(
+            adaptation_ratio=0.34,
+            dbta_balance="none",
+            dbta_candidate_top_p=0.5,
+            dbta_representative_k=2,
+            dbta_representative_scope="candidate_pool",
+            dbta_representative_weight=1.0,
+            dbta_diversity_weight=0.0,
+            dbta_selection_mode="diversity_aware",
+        )
+
+        selected = train_mod._score_and_select_dbta_records(records, cfg)
+        selected_ids = {int(record["dataset_index"]) for record in selected}
+
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(selected_ids.issubset({0, 1, 2}))
+        for record in records[3:]:
+            self.assertEqual(record["density_bucket"], "not_candidate")
+            self.assertEqual(record["representativeness_score"], 0.0)
+        for record in selected:
+            self.assertNotEqual(record["density_bucket"], "not_candidate")
+
     def test_dbta_dumps_use_final_selection_score_only(self):
         records = [
             {
@@ -303,6 +373,26 @@ class AdaptationSelectionAndReplayTest(unittest.TestCase):
         self.assertEqual(no_refinement["dbta_representative_weight"], 0.0)
         self.assertEqual(no_refinement["dbta_selection_mode"], "topk")
         self.assertEqual(no_refinement["dbta_diversity_weight"], 0.0)
+        self.assertEqual(make_ablation_configs.BASE_DEFAULTS["train"]["dbta_representative_scope"], "recent_pool")
+
+    def test_generator_adds_tuned_performance_group(self):
+        configs, groups = make_ablation_configs.build_configs()
+        tuned_path = "tuned_performance/TP2_full_dbta_v2_020_candidate_pool_drift020.yaml"
+
+        self.assertIn("tuned", groups)
+        self.assertIn(tuned_path, groups["tuned"])
+        tuned_train = configs[tuned_path]["train"]
+        self.assertEqual(tuned_train["dbta_representative_scope"], "candidate_pool")
+        self.assertEqual(tuned_train["dbta_final_drift_weight"], 0.2)
+
+    def test_i3_manifest_tracks_availability_inputs(self):
+        configs, groups = make_ablation_configs.build_configs()
+        signals = make_ablation_configs.build_i3_gate_signal_manifest(configs, groups)
+
+        self.assertFalse(signals["I3_01_learned_emb_only"]["availability_inputs"])
+        self.assertFalse(signals["I3_02_quality_only"]["availability_inputs"])
+        self.assertTrue(signals["I3_05_uncertainty_only"]["availability_inputs"])
+        self.assertTrue(signals["I3_07_full_gate"]["availability_inputs"])
 
 
 if __name__ == "__main__":

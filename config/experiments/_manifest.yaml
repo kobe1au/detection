@@ -54,6 +54,11 @@ groups:
     - "config/experiments/main_chain/M2_i1_i2_alignment_fixed_gate020.yaml"
     - "config/experiments/main_chain/M3_full_dbta_v2_020.yaml"
     - "config/experiments/main_chain/M4_full_random_class_balanced100_static.yaml"
+  tuned:
+    - "config/experiments/tuned_performance/TP0_full_dbta_v2_020_recent_pool.yaml"
+    - "config/experiments/tuned_performance/TP1_full_dbta_v2_020_candidate_pool.yaml"
+    - "config/experiments/tuned_performance/TP2_full_dbta_v2_020_candidate_pool_drift020.yaml"
+    - "config/experiments/tuned_performance/TP3_full_dbta_v2_020_candidate_pool_drift050.yaml"
   full:
     - "config/experiments/ratio_sweep/R0_full_no_adapt.yaml"
     - "config/experiments/ratio_sweep/R1_full_dbta_v2_005.yaml"
@@ -104,6 +109,10 @@ groups:
     - "config/experiments/ratio_sweep/R3_full_dbta_v2_020.yaml"
     - "config/experiments/ratio_sweep/R4_full_dbta_v2_050.yaml"
     - "config/experiments/ratio_sweep/R5_full_dbta_v2_100.yaml"
+    - "config/experiments/tuned_performance/TP0_full_dbta_v2_020_recent_pool.yaml"
+    - "config/experiments/tuned_performance/TP1_full_dbta_v2_020_candidate_pool.yaml"
+    - "config/experiments/tuned_performance/TP2_full_dbta_v2_020_candidate_pool_drift020.yaml"
+    - "config/experiments/tuned_performance/TP3_full_dbta_v2_020_candidate_pool_drift050.yaml"
 i3_gate_signals:
   I3_00_fixed_gate:
     mode: "fixed"
@@ -111,6 +120,7 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    availability_inputs: false
     confidence_inputs: false
   I3_01_learned_emb_only:
     mode: "learned"
@@ -118,6 +128,7 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    availability_inputs: false
     confidence_inputs: false
   I3_02_quality_only:
     mode: "learned"
@@ -125,6 +136,7 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    availability_inputs: false
     confidence_inputs: false
   I3_03_temporal_reliability_only:
     mode: "learned"
@@ -132,6 +144,7 @@ i3_gate_signals:
     temporal_reliability_inputs: true
     time_inputs: false
     uncertainty_inputs: false
+    availability_inputs: false
     confidence_inputs: false
   I3_04_time_features_only:
     mode: "learned"
@@ -139,6 +152,7 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: true
     uncertainty_inputs: false
+    availability_inputs: false
     confidence_inputs: false
   I3_05_uncertainty_only:
     mode: "learned"
@@ -146,6 +160,7 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: true
+    availability_inputs: true
     confidence_inputs: false
   I3_06_confidence_only:
     mode: "learned"
@@ -153,6 +168,7 @@ i3_gate_signals:
     temporal_reliability_inputs: false
     time_inputs: false
     uncertainty_inputs: false
+    availability_inputs: false
     confidence_inputs: true
   I3_07_full_gate:
     mode: "learned"
@@ -160,6 +176,7 @@ i3_gate_signals:
     temporal_reliability_inputs: true
     time_inputs: true
     uncertainty_inputs: true
+    availability_inputs: true
     confidence_inputs: true
 recommended_order:
   - "baselines"
@@ -169,3 +186,4 @@ recommended_order:
   - "i3"
   - "ratio"
   - "main"
+  - "tuned"

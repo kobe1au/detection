@@ -38,9 +38,13 @@ Stage 1: drift-first candidate generation
   + gamma * prototype_distance
 
 Stage 2: representative/diverse final selection within drift candidates
-  final_selection_score mainly uses representativeness + diversity
-  drift_score is retained as candidate filter and weak tie-break
+  final_selection_score uses representativeness + diversity by default
+  drift_score controls candidate generation, not the default final objective
 ```
+
+`representativeness_score` 默认相对于整个 2023 recent pool 计算，主线使用 `dbta_representative_scope=recent_pool`。tuned-performance 组额外测试 `candidate_pool`，即只在 drift shortlist 内计算局部代表性，用来探索性能上限；论文主线不要把 tuned 配置和默认 DBTA v2 混写。
+
+`dbta_final_drift_weight` 默认是 `0.0`，所以主线 DBTA v2 仍然是 drift-first shortlist + representative/diverse final selection。tuned-performance 组会测试 positive final drift weight。
 
 `prototype_distance` 默认使用 nearest historical class prototype distance，同时 dump 里保留 `predicted_prototype_distance` 和 `nearest_prototype_distance`。不要再写成“只到 predicted class prototype 的距离”。
 
@@ -58,7 +62,7 @@ DBTA dump 语义：
 
 - `dbta_selection.csv`：最终 selected recent samples。
 - `dbta_recent_pool_scores.csv`：整个 recent pool 的 scoring dump，不是 top-p candidate pool。
-- 论文和分析脚本统一使用 `drift_score`、`representativeness_score`、`diversity_gain`、`final_selection_score`。当前第一版代码不再输出旧 `selection_score` 字段。
+- 论文和分析脚本统一使用 `drift_score`、`representativeness_score`、`diversity_gain`、`final_selection_score`。
 
 ## I2: Temporal Reliability-weighted Hierarchical API-Graph Alignment
 
@@ -111,7 +115,9 @@ I3 消融由 `config/experiments/_manifest.yaml` 的 `i3_gate_signals` 记录每
 - `quality_only` 不包含 `q_time/q_drift`；
 - `temporal_reliability_only` 只打开 `q_time/q_drift`；
 - `time_features_only` 只打开 basic time features；
-- `full_gate` 打开 quality、temporal reliability、time features、uncertainty、confidence。
+- `learned_emb_only` 不再接收 availability signals，只依赖 API/Graph embeddings 和 neutral quality slots；
+- `uncertainty_only` 打开 uncertainty + availability；
+- `full_gate` 打开 quality、temporal reliability、time features、uncertainty、availability、confidence。
 
 ## 主实验矩阵
 
@@ -143,6 +149,7 @@ python run.py i3
 python run.py ratio
 python run.py main
 python run.py final
+python run.py tuned
 ```
 
 `python run.py final` 只跑 `config/experiments/main_chain/M3_full_dbta_v2_020.yaml`，不会展开完整 ratio sweep。
@@ -153,5 +160,6 @@ python run.py final
 - 不要把 `random_class_balanced` 写成普通 random；它是 oracle class-balanced random。
 - 不要把 I1 写成已验证完整 unified framework；I1 只验证 budgeted adaptation / replay。
 - 不要把 `dbta_recent_pool_scores.csv` 写成只包含 top-p candidates；它是 recent-pool scoring dump。
-- 不要把旧 `selection_score` 写成论文概念；当前 DBTA dump 只保留 `final_selection_score`。
+- 不要额外引入未在 dump 中定义的 DBTA 选择分数字段；当前 DBTA dump 只保留 `final_selection_score`。
+- 不要把 tuned-performance 的 `candidate_pool` / positive final drift weight 写成默认 DBTA v2，除非最终主实验改用 tuned 配置并重新训练。
 - 旧 pseudo-oracle gate / KL oracle supervision 不在当前主线中，不能写成已启用机制。

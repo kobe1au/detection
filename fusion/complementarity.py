@@ -138,9 +138,8 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device, data_root: s
     c_alignment = c_model["alignment"]
     c_gate = c_model["gate"]
     fusion_mode = str(c_model["fusion_mode"])
-    legacy_temporal = bool(cfg["loss"].get("alignment_use_temporal_soft_weight", False))
-    use_temporal_reliability = bool(cfg["loss"].get("alignment_use_temporal_reliability", legacy_temporal))
-    use_drift_reliability = bool(cfg["loss"].get("alignment_use_drift_reliability", legacy_temporal))
+    use_temporal_reliability = bool(cfg["loss"]["alignment_use_temporal_reliability"])
+    use_drift_reliability = bool(cfg["loss"]["alignment_use_drift_reliability"])
     domain_years, historical_time_id_max = _temporal_context_from_cfg(cfg, data_root)
     model = MalwareModelWithXAttn(
         num_classes=int(c_model["num_classes"]),
@@ -182,6 +181,7 @@ def build_model_from_cfg(cfg: dict[str, Any], device: torch.device, data_root: s
         time_feature_set=str(c_gate.get("time_feature_set", "basic")),
         use_temporal_reliability=use_temporal_reliability,
         use_drift_reliability=use_drift_reliability,
+        availability_inputs=bool(c_gate["availability_inputs"]),
         confidence_inputs=bool(c_gate.get("confidence_inputs", True)),
         confidence_source=str(c_gate.get("confidence_source", "raw")),
         confidence_detach=bool(c_gate.get("confidence_detach", True)),
@@ -227,11 +227,7 @@ def make_loader(
     if pt_key not in c_data or csv_key not in c_data:
         raise KeyError(f"Config has no data.{pt_key} / data.{csv_key}")
 
-    domain_years = build_global_domain_years(
-        resolve_path(data_root, c_data["train_csv"]),
-        resolve_path(data_root, c_data["val_csv"]),
-        resolve_path(data_root, c_data["test_csv"]),
-    )
+    domain_years, _ = _temporal_context_from_cfg(cfg, data_root)
 
     ds = MultiModalMalwareDataset(
         pt_dir=resolve_path(data_root, c_data[pt_key]),
