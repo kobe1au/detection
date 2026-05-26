@@ -17,8 +17,32 @@ Manifest is not a hard anchor and does not replace API or Graph. It only contrib
 ## Innovations
 
 1. Heterogeneous tri-modal reliability modeling for code common-mode failure.
-2. Manifest-guided cross-source soft consistency in functional category space.
+2. Manifest-guided cross-source soft consistency in a shared 12-D functional category space.
 3. Conflict-aware asymmetric four-branch adaptive fusion.
+
+## Semantic Category Space
+
+API, Graph, and Manifest category counts must all use the same 12-D taxonomy:
+
+```text
+network, sms, location, contacts, storage, telephony,
+camera_media, receiver, component_exposure, dynamic_loading,
+crypto, system_settings
+```
+
+The robust model no longer compares raw API type-id histograms with Manifest categories. API type ids are mapped into this taxonomy, Graph counts are accepted only when already provided in this taxonomy, and Manifest counts are produced from the same category list.
+
+`T7_tri_modal_full_soft_consistency.yaml` enables the trainable soft consistency loss. This loss uses lightweight semantic projection heads over API, Graph, and Manifest embeddings, then applies reliability-weighted cosine direction losses against category-count soft targets. It is category-level soft supervision, not Manifest hard-anchor embedding alignment.
+
+## Manifest Vocabulary
+
+Build Manifest vocabularies from train Manifest JSONL only:
+
+```bash
+python scripts/build_manifest_vocab_from_train.py --train-manifest-jsonl path/to/train_manifest.jsonl --vocab config/manifest_vocab.yaml
+```
+
+`scripts/augment_pts_with_manifest.py --build-vocab` is guarded so it only runs with `--split train`; val/test augmentation must load an existing train-built vocab.
 
 ## Robust Fusion
 

@@ -29,8 +29,10 @@ def test_robust_model_forward_and_loss():
     batch.api_sensitive_mask = torch.zeros(12)
     batch.api_batch = torch.cat([torch.full((6,), i, dtype=torch.long) for i in range(2)])
     batch.method_api_edge_index = torch.empty((2, 0), dtype=torch.long)
-    batch.api_category_counts = torch.rand(2, 12)
-    batch.graph_category_counts = torch.rand(2, 12)
+    batch.api_semantic_category_counts = torch.rand(2, 12)
+    batch.graph_semantic_category_counts = torch.rand(2, 12)
+    batch.api_category_counts = batch.api_semantic_category_counts
+    batch.graph_category_counts = batch.graph_semantic_category_counts
     batch.manifest_x = torch.rand(2, 32)
     batch.manifest_category_counts = torch.rand(2, 12)
     batch.manifest_stats = torch.rand(2, 11)
@@ -63,11 +65,19 @@ def test_robust_model_forward_and_loss():
         joint_emb_dim=32,
     )
     logits, extra = model(batch, return_features=True)
-    loss, parts = compute_robust_loss(logits, torch.tensor([0, 1]), extra, {"branch_aux_weight": 0.05})
+    loss, parts = compute_robust_loss(
+        logits,
+        torch.tensor([0, 1]),
+        extra,
+        {"branch_aux_weight": 0.05, "soft_consistency_weight": 0.05},
+    )
     assert logits.shape == (2, 2)
     assert extra["gate_weights"].shape == (2, 4)
+    assert extra["api_semantic_category_counts"].shape == (2, 12)
+    assert extra["api_semantic_logits"].shape == (2, 12)
     assert torch.isfinite(loss)
     assert parts["branch_aux_weight"] == 0.05
+    assert parts["soft_consistency_weight"] == 0.05
 
 
 def test_robust_dataset_collate(tmp_path: Path):
@@ -114,3 +124,22 @@ def test_robust_dataset_collate(tmp_path: Path):
     assert graph.manifest_x.shape == (1, 16)
     assert graph.q_manifest.shape == (1, 1)
     assert graph.api_ids.numel() == 3
+    assert graph.api_semantic_category_counts.shape == (1, 12)
+    assert graph.graph_semantic_category_counts.shape == (1, 12)
+    assert graph.api_category_counts.shape == (1, 12)
+
+
+def test_heuristic_joint_gate_uses_manifest_reliability():
+    evidence = torch.zeros(2, 20)
+    evidence[:, 7] = 1.0
+    evidence[:, 8] = 1.0
+    evidence[:, 15] = 1.0
+    evidence[:, 16] = 1.0
+    evidence[:, 17] = 1.0
+    evidence[:, 18] = 1.0
+    evidence[:, 19] = 1.0
+    evidence[0, 9] = 1.0
+    evidence[1, 9] = 0.0
+
+    weights = TriModalRobustModel._heuristic_reliability_gate(evidence)
+    assert weights[0, 3] > weights[1, 3]

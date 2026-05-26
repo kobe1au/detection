@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from fusion.robust.manifest_features import (
     build_manifest_vocab,
@@ -52,6 +57,7 @@ def main() -> None:
     parser.add_argument("--manifest-jsonl", required=True, help="Manifest raw JSONL produced by extract_manifest_features.py.")
     parser.add_argument("--out-dir", required=True, help="Output .pt directory.")
     parser.add_argument("--vocab", required=True, help="Manifest vocab YAML. Build it only on train set.")
+    parser.add_argument("--split", required=True, choices=["train", "val", "test", "extra"], help="Dataset split being augmented.")
     parser.add_argument("--build-vocab", action="store_true", help="Build vocab from this JSONL before vectorizing.")
     parser.add_argument("--max-permissions", type=int, default=128)
     parser.add_argument("--max-intents", type=int, default=64)
@@ -65,14 +71,23 @@ def main() -> None:
     records = read_manifest_jsonl(args.manifest_jsonl)
 
     if args.build_vocab:
+        if args.split != "train":
+            raise SystemExit("--build-vocab is only allowed with --split train to prevent val/test vocabulary leakage.")
         vocab = build_manifest_vocab(
             records.values(),
             max_permissions=args.max_permissions,
             max_intents=args.max_intents,
             max_features=args.max_features,
         )
+        vocab["metadata"] = {
+            "source_split": "train",
+            "source_manifest_jsonl": str(Path(args.manifest_jsonl)),
+            "leakage_guard": "train_only",
+        }
         save_manifest_vocab(vocab, args.vocab)
     else:
+        if not Path(args.vocab).exists():
+            raise SystemExit("Manifest vocab does not exist. Build it once from --split train before augmenting val/test.")
         vocab = load_manifest_vocab(args.vocab)
 
     category_dim = len(vocab.get("categories") or [])

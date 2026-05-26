@@ -5,6 +5,8 @@ from typing import Iterable
 
 import torch
 
+from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM, api_semantic_counts_from_type_ids
+
 
 API_PERTURBATIONS = {
     "api_event_dropout",
@@ -74,15 +76,13 @@ def _zero_tensor_like(value):
     return value
 
 
-def recompute_api_category_counts(data: dict, vocab_size: int = 16) -> None:
+def recompute_api_category_counts(data: dict) -> None:
     ids = data.get("api_type_ids")
-    counts = torch.zeros((vocab_size,), dtype=torch.float32)
-    if isinstance(ids, torch.Tensor) and ids.numel() > 0:
-        flat = ids.long().view(-1).clamp(0, vocab_size - 1).cpu()
-        counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
-        counts[0] = 0.0
+    counts = api_semantic_counts_from_type_ids(ids)
     device = ids.device if isinstance(ids, torch.Tensor) else None
-    data["api_category_counts"] = counts.to(device=device) if device is not None else counts
+    counts = counts.to(device=device) if device is not None else counts
+    data["api_semantic_category_counts"] = counts
+    data["api_category_counts"] = counts
 
 
 def apply_api_event_dropout(data: dict, strength: float, sensitive_only: bool = False) -> dict:
@@ -194,7 +194,14 @@ def apply_api_missing(data: dict) -> dict:
     mask = data.get("mask")
     if isinstance(mask, torch.Tensor) and mask.ndim == 2:
         data["mask"] = mask.new_empty((mask.size(0), 0), dtype=torch.float32)
-    data["api_category_counts"] = torch.zeros_like(data.get("api_category_counts", torch.zeros(16)))
+    template = data.get("api_semantic_category_counts", data.get("api_category_counts"))
+    if isinstance(template, torch.Tensor) and template.numel() == SEMANTIC_CATEGORY_DIM:
+        counts = torch.zeros_like(template)
+    else:
+        device = template.device if isinstance(template, torch.Tensor) else None
+        counts = torch.zeros((SEMANTIC_CATEGORY_DIM,), dtype=torch.float32, device=device)
+    data["api_semantic_category_counts"] = counts
+    data["api_category_counts"] = counts
     data["q_api"] = 0.0
     data["pert_api"] = 1.0
     data["api_aug_type"] = "modality_dropout_api"
@@ -293,6 +300,9 @@ def apply_graph_missing(data: dict) -> dict:
     graph_counts = data.get("graph_category_counts")
     if isinstance(graph_counts, torch.Tensor):
         data["graph_category_counts"] = torch.zeros_like(graph_counts)
+    graph_semantic_counts = data.get("graph_semantic_category_counts")
+    if isinstance(graph_semantic_counts, torch.Tensor):
+        data["graph_semantic_category_counts"] = torch.zeros_like(graph_semantic_counts)
     data["q_graph"] = 0.0
     data["pert_graph"] = 1.0
     data["graph_aug_type"] = "modality_dropout_graph"

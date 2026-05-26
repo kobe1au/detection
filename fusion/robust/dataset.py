@@ -15,6 +15,11 @@ from fusion.robust.perturbations import (
     apply_perturbation,
     sample_training_perturbation,
 )
+from fusion.robust.semantic_categories import (
+    SEMANTIC_CATEGORY_DIM,
+    api_semantic_counts_from_type_ids,
+    sanitize_semantic_counts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +111,12 @@ class RobustTriModalDataset(Dataset):
             int(max_api_events_per_sample) if max_api_events_per_sample is not None else None
         )
         self.manifest_dim = int(manifest_dim)
-        self.manifest_category_dim = int(manifest_category_dim)
+        if int(manifest_category_dim) != SEMANTIC_CATEGORY_DIM:
+            raise ValueError(
+                f"Robust semantic category space must be {SEMANTIC_CATEGORY_DIM}-D; "
+                f"got manifest_category_dim={manifest_category_dim}"
+            )
+        self.manifest_category_dim = SEMANTIC_CATEGORY_DIM
         self.manifest_stats_dim = int(manifest_stats_dim)
         self.manifest_permission_dim = int(manifest_permission_dim)
         self.manifest_intent_dim = int(manifest_intent_dim)
@@ -172,8 +182,10 @@ class RobustTriModalDataset(Dataset):
         data.api_method_index = torch.empty((0,), dtype=torch.long)
         data.api_in_graph_mask = torch.empty((0,), dtype=torch.float32)
         data.method_api_edge_index = torch.empty((2, 0), dtype=torch.long)
-        data.api_category_counts = torch.zeros((16,), dtype=torch.float32)
-        data.graph_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
+        data.api_semantic_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
+        data.graph_semantic_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
+        data.api_category_counts = data.api_semantic_category_counts.clone()
+        data.graph_category_counts = data.graph_semantic_category_counts.clone()
         data.manifest_x = torch.zeros((1, self.manifest_dim), dtype=torch.float32)
         data.manifest_permission_ids = torch.empty((0,), dtype=torch.long)
         data.manifest_intent_ids = torch.empty((0,), dtype=torch.long)
@@ -246,13 +258,8 @@ class RobustTriModalDataset(Dataset):
         return parts
 
     @staticmethod
-    def _api_category_counts(api_type_ids: torch.Tensor, vocab_size: int = 16) -> torch.Tensor:
-        counts = torch.zeros((vocab_size,), dtype=torch.float32)
-        if api_type_ids.numel() > 0:
-            ids = api_type_ids.long().clamp(0, vocab_size - 1).cpu()
-            counts.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float32))
-            counts[0] = 0.0
-        return counts
+    def _api_semantic_category_counts(api_type_ids: torch.Tensor) -> torch.Tensor:
+        return api_semantic_counts_from_type_ids(api_type_ids)
 
     @staticmethod
     def _api_quality(api_ids, api_type_ids, api_sensitive, api_in_graph) -> float:
@@ -375,6 +382,7 @@ class RobustTriModalDataset(Dataset):
         q_api = self._api_quality(final_api_ids, final_api_types, final_api_sensitive, final_api_in_graph)
         q_graph = self._graph_quality(edge_index, int(x.size(0)), sensitive_mask)
         q_align = self._align_quality(q_api, q_graph, final_method_edges, int(x.size(0)), int(final_api_ids.numel()))
+        api_semantic_counts = self._api_semantic_category_counts(final_api_types)
         return {
             "x": x,
             "edge_index": edge_index,
@@ -385,7 +393,8 @@ class RobustTriModalDataset(Dataset):
             "api_method_index": final_api_methods,
             "api_in_graph_mask": final_api_in_graph,
             "method_api_edge_index": final_method_edges,
-            "api_category_counts": self._api_category_counts(final_api_types),
+            "api_semantic_category_counts": api_semantic_counts,
+            "api_category_counts": api_semantic_counts,
             "q_api": q_api,
             "q_graph": q_graph,
             "q_align": q_align,
@@ -400,8 +409,11 @@ class RobustTriModalDataset(Dataset):
         manifest_x_raw = _first_present(sources, "manifest_x")
         has_manifest = manifest_x_raw is not None or _first_present(sources, "manifest_category_counts") is not None
         manifest_x = _as_float_tensor(manifest_x_raw, self.manifest_dim)
-        manifest_counts = _as_float_tensor(_first_present(sources, "manifest_category_counts"), self.manifest_category_dim)
-        graph_counts = _as_float_tensor(_first_present(sources, "graph_category_counts"), self.manifest_category_dim)
+        manifest_counts = sanitize_semantic_counts(_first_present(sources, "manifest_category_counts"))
+        graph_raw = _first_present(sources, "graph_semantic_category_counts")
+        if graph_raw is None:
+            graph_raw = _first_present(sources, "graph_category_counts")
+        graph_counts = sanitize_semantic_counts(graph_raw, require_exact=True)
         manifest_stats = _as_float_tensor(_first_present(sources, "manifest_stats"), self.manifest_stats_dim)
 
         q_raw = _first_present(sources, "q_manifest")
@@ -423,6 +435,7 @@ class RobustTriModalDataset(Dataset):
             "manifest_category_counts": manifest_counts,
             "manifest_stats": manifest_stats,
             "manifest_meta": meta if isinstance(meta, dict) else {},
+            "graph_semantic_category_counts": graph_counts,
             "graph_category_counts": graph_counts,
             "q_manifest": max(0.0, min(1.0, q_manifest)),
             "pert_manifest": max(0.0, min(1.0, pert_manifest)),
@@ -440,8 +453,10 @@ class RobustTriModalDataset(Dataset):
         obj.api_method_index = data["api_method_index"]
         obj.api_in_graph_mask = data["api_in_graph_mask"]
         obj.method_api_edge_index = data["method_api_edge_index"]
-        obj.api_category_counts = data["api_category_counts"].float()
-        obj.graph_category_counts = data["graph_category_counts"].float()
+        obj.api_semantic_category_counts = data["api_semantic_category_counts"].float()
+        obj.graph_semantic_category_counts = data["graph_semantic_category_counts"].float()
+        obj.api_category_counts = obj.api_semantic_category_counts
+        obj.graph_category_counts = obj.graph_semantic_category_counts
         obj.manifest_x = data["manifest_x"].float().view(1, -1)
         obj.manifest_permission_ids = data["manifest_permission_ids"].long().view(-1)
         obj.manifest_intent_ids = data["manifest_intent_ids"].long().view(-1)
@@ -542,8 +557,8 @@ def robust_collate_fn(data_list):
                 edge[1] += api_offset
                 method_edges_all.append(edge)
 
-        api_counts.append(d.api_category_counts.float())
-        graph_counts.append(d.graph_category_counts.float())
+        api_counts.append(getattr(d, "api_semantic_category_counts", d.api_category_counts).float())
+        graph_counts.append(getattr(d, "graph_semantic_category_counts", d.graph_category_counts).float())
         manifest_counts.append(d.manifest_category_counts.float())
         manifest_xs.append(d.manifest_x.float().view(1, -1))
         manifest_stats.append(d.manifest_stats.float().view(-1))
@@ -567,8 +582,10 @@ def robust_collate_fn(data_list):
     graph_batch.api_method_index = torch.cat(api_method_all).long() if api_method_all else torch.empty((0,), dtype=torch.long, device=device)
     graph_batch.api_in_graph_mask = torch.cat(api_in_graph_all).float() if api_in_graph_all else torch.empty((0,), dtype=torch.float32, device=device)
     graph_batch.method_api_edge_index = torch.cat(method_edges_all, dim=1).long() if method_edges_all else torch.empty((2, 0), dtype=torch.long, device=device)
-    graph_batch.api_category_counts = torch.stack(api_counts).float()
-    graph_batch.graph_category_counts = torch.stack(graph_counts).float()
+    graph_batch.api_semantic_category_counts = torch.stack(api_counts).float()
+    graph_batch.graph_semantic_category_counts = torch.stack(graph_counts).float()
+    graph_batch.api_category_counts = graph_batch.api_semantic_category_counts
+    graph_batch.graph_category_counts = graph_batch.graph_semantic_category_counts
     graph_batch.manifest_x = torch.cat(manifest_xs, dim=0).float()
     graph_batch.manifest_category_counts = torch.stack(manifest_counts).float()
     graph_batch.manifest_stats = torch.stack(manifest_stats).float()

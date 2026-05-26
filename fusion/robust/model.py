@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from fusion.robust.constants import ArchitectureConstants
 from fusion.robust.graph_encoders import GraphEncoderGAT, GraphEncoderGCN, GraphEncoderGPS
+from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM
 
 
 TRI_MODAL_FUSION_MODES = {
@@ -336,6 +337,9 @@ class TriModalRobustModel(nn.Module):
         self.graph_head = build_main_head(graph_emb_dim, num_classes)
         self.manifest_head = build_main_head(manifest_emb_dim, num_classes)
         self.joint_head = build_main_head(joint_emb_dim, num_classes)
+        self.api_semantic_head = nn.Linear(api_emb_dim, SEMANTIC_CATEGORY_DIM)
+        self.graph_semantic_head = nn.Linear(graph_emb_dim, SEMANTIC_CATEGORY_DIM)
+        self.manifest_semantic_head = nn.Linear(manifest_emb_dim, SEMANTIC_CATEGORY_DIM)
         self.api_graph_concat_head = build_main_head(api_emb_dim + graph_emb_dim, num_classes)
         self.tri_concat_head = build_main_head(api_emb_dim + graph_emb_dim + manifest_emb_dim, num_classes)
         self.gate_net = FourBranchEvidenceGate(evidence_dim=20, hidden_dim=gate_hidden_dim)
@@ -368,6 +372,20 @@ class TriModalRobustModel(nn.Module):
         elif out.size(1) > width:
             out = out[:, :width]
         return out
+
+    @staticmethod
+    def _semantic_counts_attr(graph_data, name: str, batch_size: int, device, dtype) -> torch.Tensor:
+        value = getattr(graph_data, name, None)
+        if not isinstance(value, torch.Tensor):
+            return torch.zeros((batch_size, SEMANTIC_CATEGORY_DIM), device=device, dtype=dtype)
+        out = value.to(device=device, dtype=dtype)
+        if out.ndim == 1:
+            out = out.view(1, -1).expand(batch_size, -1)
+        else:
+            out = out.view(batch_size, -1)
+        if out.size(1) != SEMANTIC_CATEGORY_DIM:
+            return torch.zeros((batch_size, SEMANTIC_CATEGORY_DIM), device=device, dtype=dtype)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _manifest_input(self, graph_data, batch_size: int, device, dtype) -> torch.Tensor:
         x = getattr(graph_data, "manifest_x", None)
@@ -444,11 +462,13 @@ class TriModalRobustModel(nn.Module):
         manifest_conf = self._confidence(manifest_logits).to(dtype=dtype)
         joint_conf = self._confidence(joint_logits).to(dtype=dtype)
 
-        api_counts = self._matrix_attr(graph_data, "api_category_counts", batch_size, device, dtype)
-        graph_counts = self._matrix_attr(graph_data, "graph_category_counts", batch_size, device, dtype, api_counts.size(1))
-        manifest_counts = self._matrix_attr(graph_data, "manifest_category_counts", batch_size, device, dtype, max(api_counts.size(1), graph_counts.size(1)))
-        api_counts = self._matrix_attr(graph_data, "api_category_counts", batch_size, device, dtype, manifest_counts.size(1))
-        graph_counts = self._matrix_attr(graph_data, "graph_category_counts", batch_size, device, dtype, manifest_counts.size(1))
+        api_counts = self._semantic_counts_attr(graph_data, "api_semantic_category_counts", batch_size, device, dtype)
+        if float(api_counts.detach().abs().sum().item()) <= 0.0:
+            api_counts = self._semantic_counts_attr(graph_data, "api_category_counts", batch_size, device, dtype)
+        graph_counts = self._semantic_counts_attr(graph_data, "graph_semantic_category_counts", batch_size, device, dtype)
+        if float(graph_counts.detach().abs().sum().item()) <= 0.0:
+            graph_counts = self._semantic_counts_attr(graph_data, "graph_category_counts", batch_size, device, dtype)
+        manifest_counts = self._semantic_counts_attr(graph_data, "manifest_category_counts", batch_size, device, dtype)
 
         api_graph_consistency = self._cosine_counts(api_counts, graph_counts)
         graph_missing_counts = graph_counts.abs().sum(dim=-1, keepdim=True) <= 0
@@ -508,6 +528,11 @@ class TriModalRobustModel(nn.Module):
             "api_graph_consistency": api_graph_consistency.detach().view(batch_size),
             "api_manifest_consistency": api_manifest_consistency.detach().view(batch_size),
             "graph_manifest_consistency": graph_manifest_consistency.detach().view(batch_size),
+            "api_semantic_category_counts": api_counts.detach(),
+            "graph_semantic_category_counts": graph_counts.detach(),
+            "manifest_category_counts": manifest_counts.detach(),
+            "api_category_counts": api_counts.detach(),
+            "graph_category_counts": graph_counts.detach(),
             "api_alive": api_alive.detach().view(batch_size),
             "graph_alive": graph_alive.detach().view(batch_size),
             "manifest_alive": manifest_alive.detach().view(batch_size),
@@ -524,9 +549,11 @@ class TriModalRobustModel(nn.Module):
         api_alive = evidence[:, 17:18]
         graph_alive = evidence[:, 18:19]
         manifest_alive = evidence[:, 19:20]
+        manifest_joint_factor = 0.5 + 0.5 * r_manifest
         joint_score = (
             (r_api * r_graph).sqrt()
             * (0.5 + 0.25 * api_manifest + 0.25 * graph_manifest)
+            * manifest_joint_factor
         ).clamp(0.0, 1.0)
         scores = torch.cat(
             [
@@ -569,6 +596,9 @@ class TriModalRobustModel(nn.Module):
             "graph_logits_aux": graph_logits,
             "manifest_logits_aux": manifest_logits,
             "joint_logits_aux": joint_logits,
+            "api_semantic_logits": self.api_semantic_head(api_emb),
+            "graph_semantic_logits": self.graph_semantic_head(graph_emb),
+            "manifest_semantic_logits": self.manifest_semantic_head(manifest_emb),
         }
 
         if self.fusion_mode in {"api", "api_only"}:
