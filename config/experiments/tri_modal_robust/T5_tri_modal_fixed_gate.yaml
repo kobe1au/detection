@@ -1,0 +1,8 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+train:
+  exp_name: "T5_tri_modal_fixed_gate"
+
+model:
+  fusion_mode: "tri_modal_fixed_gate"

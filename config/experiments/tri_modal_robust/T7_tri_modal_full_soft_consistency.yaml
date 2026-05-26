@@ -1,0 +1,13 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+train:
+  exp_name: "T7_tri_modal_full_soft_consistency"
+
+model:
+  fusion_mode: "tri_modal_ours"
+
+loss:
+  branch_aux_weight: 0.05
+  soft_consistency_weight: 0.0
+  clean_corrupted_kl_weight: 0.0

@@ -8,8 +8,5 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-STAGE="${1:-all}"
-if [[ "${STAGE}" == "i1_dbta" ]]; then
-  STAGE="i1"
-fi
-"${PYTHON_BIN:-python}" run.py "${STAGE}"
+TARGET="${1:-final}"
+"${PYTHON_BIN:-python}" run.py "${TARGET}"

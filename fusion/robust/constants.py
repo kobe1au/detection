@@ -1,0 +1,9 @@
+class ArchitectureConstants:
+    HEAD_HIDDEN_DIMS = [256, 128]
+    HEAD_DROPOUT_RATES = [0.3, 0.2]
+    HEAD_DROPOUT = 0.2
+
+    GATE_HIDDEN_DIM = 128
+    GATE_INIT_BIAS = 0.0
+
+    MODALITY_ALIVE_THRESHOLD = 0.01

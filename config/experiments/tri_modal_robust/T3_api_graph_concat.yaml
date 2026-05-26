@@ -1,0 +1,11 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+train:
+  exp_name: "T3_api_graph_concat"
+
+model:
+  fusion_mode: "api_graph_concat"
+
+robust:
+  train_aug: false

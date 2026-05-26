@@ -1,125 +1,78 @@
+from __future__ import annotations
+
 import argparse
 import os
 import subprocess
 from pathlib import Path
 
-from scripts.make_ablation_configs import DEFAULT_OUT_DIR, build_configs
-
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    def load_dotenv() -> None:
-        env_path = Path(".env")
-        if not env_path.exists():
-            return
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
-load_dotenv()
 
 PYTHON_BIN = os.getenv("PYTHON_BIN", "python")
-BASE_CONFIG = os.getenv("BASE_CONFIG", "config/base.yaml")
-EXPERIMENT_CONFIG_DIR = Path(os.getenv("EXPERIMENT_CONFIG_DIR", str(DEFAULT_OUT_DIR)))
+CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
 ALIASES = {
-    "baseline": "baselines",
-    "base": "baselines",
-    "cmp": "baselines",
-    "adaptation": "i1",
-    "dbta": "i1",
-    "i1_dbta": "i1",
-    "memory": "replay",
-    "align": "i2",
-    "alignment": "i2",
-    "gate": "i3",
-    "fusion": "i3",
-    "sweep": "ratio",
-    "ratios": "ratio",
-    "tune": "tuned",
-    "tuning": "tuned",
-    "final": "final",
-    "chain": "main",
+    "api": "T0_api_only.yaml",
+    "graph": "T1_graph_only.yaml",
+    "manifest": "T2_manifest_only.yaml",
+    "api_graph": "T3_api_graph_concat.yaml",
+    "concat": "T4_api_graph_manifest_concat.yaml",
+    "fixed": "T5_tri_modal_fixed_gate.yaml",
+    "reliability": "T6_tri_modal_reliability_gate.yaml",
+    "full": "T7_tri_modal_full_soft_consistency.yaml",
+    "ours": "T7_tri_modal_full_soft_consistency.yaml",
+    "final": "T7_tri_modal_full_soft_consistency.yaml",
 }
 
 
-def load_groups() -> dict[str, list[str]]:
-    _, groups = build_configs()
-    return {
-        name: [str(EXPERIMENT_CONFIG_DIR / rel_path).replace("\\", "/") for rel_path in rel_paths]
-        for name, rel_paths in groups.items()
-    }
+def available_configs() -> dict[str, Path]:
+    return {path.stem: path for path in sorted(CONFIG_DIR.glob("T*.yaml"))}
 
 
-def resolve_overrides(target: str, groups: dict[str, list[str]]) -> list[str]:
-    target = ALIASES.get(target, target)
+def resolve_targets(target: str) -> list[Path]:
+    if target == "all":
+        return list(available_configs().values())
     if target.endswith((".yaml", ".yml")):
-        return [target]
-
-    if target not in groups:
-        known = ", ".join(sorted(groups))
-        raise ValueError(f"Unknown experiment group '{target}'. Known groups: {known}")
-    return list(groups[target])
-
-
-def require_generated(overrides: list[str]) -> None:
-    missing = [path for path in overrides if not Path(path).exists()]
-    if missing:
-        preview = ", ".join(missing[:3])
-        raise FileNotFoundError(
-            f"Missing generated experiment YAMLs: {preview}. "
-            "Run `python scripts/make_ablation_configs.py` first."
-        )
+        return [Path(target)]
+    target = ALIASES.get(target, target)
+    path = CONFIG_DIR / target
+    if path.exists():
+        return [path]
+    configs = available_configs()
+    if target in configs:
+        return [configs[target]]
+    known = ", ".join(["all", *sorted(ALIASES), *sorted(configs)])
+    raise ValueError(f"Unknown robust experiment target '{target}'. Known: {known}")
 
 
-def run_override(override: str) -> None:
-    print(f"==> Running {override}", flush=True)
+def run_config(config_path: Path) -> None:
+    print(f"==> Running {config_path}", flush=True)
     subprocess.run(
-        [
-            PYTHON_BIN,
-            "-m",
-            "fusion.train",
-            f"--base={BASE_CONFIG}",
-            f"--override={override}",
-        ],
+        [PYTHON_BIN, "-m", "fusion.robust.train", "--config", str(config_path)],
         check=True,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "target",
-        nargs="?",
-        default="all",
-        help="Experiment group, or a single YAML path.",
-    )
-    parser.add_argument("--list", action="store_true", help="List available experiment groups and exit.")
+    parser = argparse.ArgumentParser(description="Run robust tri-modal fusion experiments.")
+    parser.add_argument("target", nargs="?", default="final", help="all, final, api, graph, manifest, concat, fixed, reliability, or YAML path")
+    parser.add_argument("--list", action="store_true", help="List robust experiment configs and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Print selected configs without launching training.")
     args = parser.parse_args()
 
-    groups = load_groups()
     if args.list:
-        for name in sorted(groups):
-            print(f"{name}: {len(groups[name])}")
+        for name, path in available_configs().items():
+            print(f"{name}: {path}")
         return
 
-    overrides = resolve_overrides(args.target, groups)
-    require_generated(overrides)
-    print(f"Base config: {BASE_CONFIG}", flush=True)
-    print(f"Target: {args.target} ({len(overrides)} configs)", flush=True)
+    targets = resolve_targets(args.target)
     if args.dry_run:
-        for override in overrides:
-            print(override)
+        for path in targets:
+            print(path)
         return
-    for override in overrides:
-        run_override(override)
+    for path in targets:
+        run_config(path)
 
 
 if __name__ == "__main__":

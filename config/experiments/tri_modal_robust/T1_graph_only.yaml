@@ -1,0 +1,11 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+train:
+  exp_name: "T1_graph_only"
+
+model:
+  fusion_mode: "graph_only"
+
+robust:
+  train_aug: false

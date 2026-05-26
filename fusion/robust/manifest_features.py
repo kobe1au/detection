@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import json
+import math
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+import torch
+import yaml
+
+
+ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+
+DEFAULT_CATEGORIES = [
+    "network",
+    "sms",
+    "location",
+    "contacts",
+    "storage",
+    "telephony",
+    "camera_media",
+    "receiver",
+    "component_exposure",
+    "dynamic_loading",
+    "crypto",
+    "system_settings",
+]
+
+CATEGORY_KEYWORDS = {
+    "network": ["internet", "network", "wifi", "connectivity", "http", "socket"],
+    "sms": ["sms", "mms", "wap_push"],
+    "location": ["location", "gps"],
+    "contacts": ["contacts", "accounts", "profile", "calendar"],
+    "storage": ["storage", "external_storage", "media", "download"],
+    "telephony": ["phone", "call", "telephony", "read_phone_state", "imei"],
+    "camera_media": ["camera", "record_audio", "microphone", "audio", "video", "image"],
+    "receiver": ["boot_completed", "package_added", "package_removed", "sms_received", "battery", "receiver"],
+    "component_exposure": ["exported", "browsable", "launcher", "main"],
+    "dynamic_loading": ["query_all_packages", "request_install_packages", "dex", "package"],
+    "crypto": ["keystore", "credential", "biometric", "fingerprint"],
+    "system_settings": ["settings", "system_alert", "write_settings", "notification", "admin"],
+}
+
+
+@dataclass
+class ManifestRecord:
+    sid: str
+    apk_name: str = ""
+    sha256: str = ""
+    permissions: list[str] = field(default_factory=list)
+    activities: list[str] = field(default_factory=list)
+    services: list[str] = field(default_factory=list)
+    receivers: list[str] = field(default_factory=list)
+    providers: list[str] = field(default_factory=list)
+    intent_actions: list[str] = field(default_factory=list)
+    intent_categories: list[str] = field(default_factory=list)
+    uses_features: list[str] = field(default_factory=list)
+    min_sdk: int = 0
+    target_sdk: int = 0
+    debuggable: bool = False
+    exported_component_count: int = 0
+    component_count: int = 0
+    parse_error: str = ""
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "sid": self.sid,
+            "apk_name": self.apk_name,
+            "sha256": self.sha256,
+            "permissions": sorted(set(self.permissions)),
+            "activities": sorted(set(self.activities)),
+            "services": sorted(set(self.services)),
+            "receivers": sorted(set(self.receivers)),
+            "providers": sorted(set(self.providers)),
+            "intent_actions": sorted(set(self.intent_actions)),
+            "intent_categories": sorted(set(self.intent_categories)),
+            "uses_features": sorted(set(self.uses_features)),
+            "min_sdk": int(self.min_sdk or 0),
+            "target_sdk": int(self.target_sdk or 0),
+            "debuggable": bool(self.debuggable),
+            "exported_component_count": int(self.exported_component_count or 0),
+            "component_count": int(self.component_count or 0),
+            "parse_error": self.parse_error,
+        }
+
+
+def _lower_tokens(values: Iterable[Any]) -> list[str]:
+    out = []
+    for value in values or []:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            out.append(text.lower())
+    return out
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _android_attr(elem, name: str, default: str | None = None):
+    if elem is None:
+        return default
+    return elem.attrib.get(ANDROID_NS + name, elem.attrib.get(name, default))
+
+
+def _xml_components_and_intents(manifest_xml) -> tuple[dict[str, list[str]], list[str], list[str], int]:
+    components = {"activity": [], "service": [], "receiver": [], "provider": []}
+    actions: list[str] = []
+    categories: list[str] = []
+    exported_count = 0
+    if manifest_xml is None:
+        return components, actions, categories, exported_count
+
+    app = manifest_xml.find("application")
+    if app is None:
+        return components, actions, categories, exported_count
+
+    for tag in components:
+        for elem in app.findall(tag):
+            name = _android_attr(elem, "name")
+            if name:
+                components[tag].append(str(name))
+            intent_filters = elem.findall("intent-filter")
+            exported_raw = _android_attr(elem, "exported")
+            exported = str(exported_raw).lower() == "true" if exported_raw is not None else bool(intent_filters)
+            if exported:
+                exported_count += 1
+            for intent_filter in intent_filters:
+                for action in intent_filter.findall("action"):
+                    action_name = _android_attr(action, "name")
+                    if action_name:
+                        actions.append(str(action_name))
+                for category in intent_filter.findall("category"):
+                    category_name = _android_attr(category, "name")
+                    if category_name:
+                        categories.append(str(category_name))
+    return components, actions, categories, exported_count
+
+
+def extract_manifest_record(apk_path: str | Path, sid: str | None = None) -> ManifestRecord:
+    apk_path = Path(apk_path)
+    rec = ManifestRecord(sid=(sid or apk_path.stem).lower(), apk_name=apk_path.name)
+    try:
+        from androguard.core.apk import APK
+
+        apk = APK(str(apk_path))
+        rec.permissions = _lower_tokens(apk.get_permissions() or [])
+        rec.activities = _lower_tokens(apk.get_activities() or [])
+        rec.services = _lower_tokens(apk.get_services() or [])
+        rec.receivers = _lower_tokens(apk.get_receivers() or [])
+        rec.providers = _lower_tokens(apk.get_providers() or [])
+        rec.uses_features = _lower_tokens(apk.get_features() or [])
+        rec.min_sdk = _safe_int(apk.get_min_sdk_version())
+        rec.target_sdk = _safe_int(apk.get_target_sdk_version())
+        try:
+            rec.debuggable = bool(apk.is_debuggable())
+        except Exception:
+            rec.debuggable = False
+
+        manifest_xml = None
+        try:
+            manifest_xml = apk.get_android_manifest_xml()
+        except Exception:
+            manifest_xml = None
+        xml_components, actions, categories, exported_count = _xml_components_and_intents(manifest_xml)
+        rec.intent_actions = _lower_tokens(actions)
+        rec.intent_categories = _lower_tokens(categories)
+        rec.exported_component_count = int(exported_count)
+
+        if not rec.activities:
+            rec.activities = _lower_tokens(xml_components["activity"])
+        if not rec.services:
+            rec.services = _lower_tokens(xml_components["service"])
+        if not rec.receivers:
+            rec.receivers = _lower_tokens(xml_components["receiver"])
+        if not rec.providers:
+            rec.providers = _lower_tokens(xml_components["provider"])
+        rec.component_count = len(rec.activities) + len(rec.services) + len(rec.receivers) + len(rec.providers)
+    except Exception as exc:
+        rec.parse_error = f"{type(exc).__name__}: {exc}"
+    return rec
+
+
+def category_counts_from_strings(values: Iterable[str], categories: list[str] | None = None) -> torch.Tensor:
+    categories = categories or DEFAULT_CATEGORIES
+    counts = torch.zeros((len(categories),), dtype=torch.float32)
+    lowered = [str(v).lower() for v in values or []]
+    for idx, category in enumerate(categories):
+        keywords = CATEGORY_KEYWORDS.get(category, [category])
+        for value in lowered:
+            if any(k in value for k in keywords):
+                counts[idx] += 1.0
+    return counts
+
+
+def category_counts_from_record(record: dict[str, Any], categories: list[str] | None = None) -> torch.Tensor:
+    categories = categories or DEFAULT_CATEGORIES
+    values: list[str] = []
+    for key in (
+        "permissions",
+        "intent_actions",
+        "intent_categories",
+        "uses_features",
+        "activities",
+        "services",
+        "receivers",
+        "providers",
+    ):
+        values.extend(record.get(key) or [])
+    counts = category_counts_from_strings(values, categories)
+    if "component_exposure" in categories:
+        counts[categories.index("component_exposure")] += float(record.get("exported_component_count", 0) or 0)
+    if "receiver" in categories:
+        counts[categories.index("receiver")] += float(len(record.get("receivers") or []))
+    return counts
+
+
+def manifest_stats_from_record(record: dict[str, Any]) -> torch.Tensor:
+    component_count = float(record.get("component_count", 0) or 0)
+    exported_count = float(record.get("exported_component_count", 0) or 0)
+    stats = torch.tensor(
+        [
+            math.log1p(len(record.get("permissions") or [])) / 6.0,
+            math.log1p(len(record.get("activities") or [])) / 5.0,
+            math.log1p(len(record.get("services") or [])) / 5.0,
+            math.log1p(len(record.get("receivers") or [])) / 5.0,
+            math.log1p(len(record.get("providers") or [])) / 5.0,
+            math.log1p(len(record.get("uses_features") or [])) / 5.0,
+            min(float(record.get("min_sdk", 0) or 0) / 35.0, 1.0),
+            min(float(record.get("target_sdk", 0) or 0) / 35.0, 1.0),
+            1.0 if record.get("debuggable") else 0.0,
+            min(exported_count / max(component_count, 1.0), 1.0),
+            min(component_count / 80.0, 1.0),
+        ],
+        dtype=torch.float32,
+    )
+    return torch.nan_to_num(stats, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+
+def build_manifest_vocab(
+    records: Iterable[dict[str, Any]],
+    max_permissions: int = 128,
+    max_intents: int = 64,
+    max_features: int = 32,
+    categories: list[str] | None = None,
+) -> dict[str, Any]:
+    perm_counter: Counter[str] = Counter()
+    intent_counter: Counter[str] = Counter()
+    feature_counter: Counter[str] = Counter()
+    for rec in records:
+        perm_counter.update(_lower_tokens(rec.get("permissions") or []))
+        intent_counter.update(_lower_tokens(rec.get("intent_actions") or []))
+        intent_counter.update(_lower_tokens(rec.get("intent_categories") or []))
+        feature_counter.update(_lower_tokens(rec.get("uses_features") or []))
+    return {
+        "categories": list(categories or DEFAULT_CATEGORIES),
+        "permission_vocab": [k for k, _ in perm_counter.most_common(max_permissions)],
+        "intent_vocab": [k for k, _ in intent_counter.most_common(max_intents)],
+        "feature_vocab": [k for k, _ in feature_counter.most_common(max_features)],
+    }
+
+
+def load_manifest_vocab(path: str | Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        vocab = yaml.safe_load(f) or {}
+    vocab.setdefault("categories", list(DEFAULT_CATEGORIES))
+    vocab.setdefault("permission_vocab", [])
+    vocab.setdefault("intent_vocab", [])
+    vocab.setdefault("feature_vocab", [])
+    return vocab
+
+
+def save_manifest_vocab(vocab: dict[str, Any], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(vocab, f, sort_keys=False, allow_unicode=False)
+
+
+def vectorize_manifest_record(
+    record: dict[str, Any],
+    vocab: dict[str, Any],
+    manifest_dim: int = 256,
+) -> dict[str, Any]:
+    categories = list(vocab.get("categories") or DEFAULT_CATEGORIES)
+    permission_vocab = list(vocab.get("permission_vocab") or [])
+    intent_vocab = list(vocab.get("intent_vocab") or [])
+    feature_vocab = list(vocab.get("feature_vocab") or [])
+
+    perm_index = {v: i for i, v in enumerate(permission_vocab)}
+    intent_index = {v: i for i, v in enumerate(intent_vocab)}
+    feature_index = {v: i for i, v in enumerate(feature_vocab)}
+
+    permissions = _lower_tokens(record.get("permissions") or [])
+    intents = _lower_tokens(record.get("intent_actions") or []) + _lower_tokens(record.get("intent_categories") or [])
+    features = _lower_tokens(record.get("uses_features") or [])
+
+    perm_vec = torch.zeros((len(permission_vocab),), dtype=torch.float32)
+    perm_ids = []
+    for item in permissions:
+        idx = perm_index.get(item)
+        if idx is not None:
+            perm_vec[idx] = 1.0
+            perm_ids.append(idx + 1)
+
+    intent_vec = torch.zeros((len(intent_vocab),), dtype=torch.float32)
+    intent_ids = []
+    for item in intents:
+        idx = intent_index.get(item)
+        if idx is not None:
+            intent_vec[idx] = 1.0
+            intent_ids.append(idx + 1)
+
+    feature_vec = torch.zeros((len(feature_vocab),), dtype=torch.float32)
+    for item in features:
+        idx = feature_index.get(item)
+        if idx is not None:
+            feature_vec[idx] = 1.0
+
+    category_counts = category_counts_from_record(record, categories)
+    category_norm = category_counts / category_counts.sum().clamp_min(1.0)
+    stats = manifest_stats_from_record(record)
+    parts = [perm_vec, intent_vec, feature_vec, category_norm, stats]
+    manifest_x = torch.cat([p.float().view(-1) for p in parts], dim=0)
+    if manifest_x.numel() < manifest_dim:
+        manifest_x = torch.cat([manifest_x, torch.zeros((manifest_dim - manifest_x.numel(),), dtype=torch.float32)])
+    elif manifest_x.numel() > manifest_dim:
+        manifest_x = manifest_x[:manifest_dim]
+
+    has_manifest = not bool(record.get("parse_error")) and (
+        len(permissions) + len(intents) + len(features) + int(record.get("component_count", 0) or 0) > 0
+    )
+    q_manifest = 0.0 if not has_manifest else min(1.0, 0.35 + 0.65 * float((manifest_x > 0).float().mean().sqrt().item()))
+
+    return {
+        "manifest_x": manifest_x,
+        "manifest_permission_ids": torch.tensor(sorted(set(perm_ids)), dtype=torch.long),
+        "manifest_intent_ids": torch.tensor(sorted(set(intent_ids)), dtype=torch.long),
+        "manifest_category_counts": category_counts.float(),
+        "manifest_stats": stats.float(),
+        "q_manifest": torch.tensor([q_manifest], dtype=torch.float32),
+        "pert_manifest": torch.tensor([0.0 if has_manifest else 1.0], dtype=torch.float32),
+        "manifest_meta": {
+            "apk_name": record.get("apk_name", ""),
+            "sha256": record.get("sha256", ""),
+            "permissions": permissions,
+            "intent_actions": _lower_tokens(record.get("intent_actions") or []),
+            "intent_categories": _lower_tokens(record.get("intent_categories") or []),
+            "uses_features": features,
+            "component_count": int(record.get("component_count", 0) or 0),
+            "exported_component_count": int(record.get("exported_component_count", 0) or 0),
+            "min_sdk": int(record.get("min_sdk", 0) or 0),
+            "target_sdk": int(record.get("target_sdk", 0) or 0),
+            "debuggable": bool(record.get("debuggable")),
+            "parse_error": record.get("parse_error", ""),
+        },
+        "manifest_permission_dim": len(permission_vocab),
+        "manifest_intent_dim": len(intent_vocab),
+    }
+
+
+def read_manifest_jsonl(path: str | Path) -> dict[str, dict[str, Any]]:
+    records = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            sid = str(rec.get("sid") or rec.get("sha256") or "").lower()
+            if sid:
+                records[sid] = rec
+    return records

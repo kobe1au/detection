@@ -1,0 +1,11 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+train:
+  exp_name: "T2_manifest_only"
+
+model:
+  fusion_mode: "manifest_only"
+
+robust:
+  train_aug: false
