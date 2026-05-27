@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from fusion.robust.constants import ArchitectureConstants
 from fusion.robust.graph_encoders import GraphEncoderGAT, GraphEncoderGCN, GraphEncoderGPS
-from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM
+from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM, validate_api_type_mapping
 
 
 TRI_MODAL_FUSION_MODES = {
@@ -261,6 +261,9 @@ class TriModalRobustModel(nn.Module):
         gate_detach: bool = True,
     ):
         super().__init__()
+        # Defensive check: ensure DEFAULT_API_TYPE_ID_TO_CATEGORY stays
+        # consistent with the extractor taxonomy and the 12-D shared space.
+        validate_api_type_mapping()
         fusion_mode = str(fusion_mode or "tri_modal_ours")
         if fusion_mode not in TRI_MODAL_FUSION_MODES:
             raise ValueError(f"Unsupported tri-modal fusion_mode: {fusion_mode}")

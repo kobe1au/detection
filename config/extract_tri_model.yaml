@@ -1,6 +1,6 @@
 data:
   # APK root must contain split subdirectories such as train/val/test.
-  apk_root: "D:/src"
+  apk_root: "D:/resource"
   # Final API+Graph+Manifest .pt files are written to out_root/<split>/<sha256>.pt.
   out_root: "C:/pts_tri"
   splits: ["train", "val", "test"]
@@ -28,6 +28,7 @@ manifest:
   # Built from train split only when rebuild_vocab=true or the file does not exist.
   vocab_path: "config/manifest_vocab.yaml"
   rebuild_vocab: false
+  allow_empty_vocab: false
   manifest_dim: 256
   max_permissions: 128
   max_intents: 64

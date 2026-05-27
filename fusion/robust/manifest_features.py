@@ -267,13 +267,51 @@ def build_manifest_vocab(
     }
 
 
-def load_manifest_vocab(path: str | Path) -> dict[str, Any]:
+def validate_manifest_vocab(
+    vocab: dict[str, Any],
+    *,
+    require_train_metadata: bool = False,
+    allow_empty: bool = False,
+) -> None:
+    categories = list(vocab.get("categories") or [])
+    if categories != list(DEFAULT_CATEGORIES):
+        raise ValueError("Manifest vocab categories must match the fixed robust semantic taxonomy")
+
+    if require_train_metadata:
+        metadata = vocab.get("metadata") or {}
+        if metadata.get("source_split") != "train" or metadata.get("leakage_guard") != "train_only":
+            raise ValueError("Manifest vocab must be built from the train split with leakage_guard=train_only")
+
+    if allow_empty:
+        return
+
+    has_vocab = any(
+        bool(vocab.get(key))
+        for key in ("permission_vocab", "intent_vocab", "feature_vocab")
+    )
+    if not has_vocab:
+        raise ValueError(
+            "Manifest vocab is empty. Build it from the train split, or set allow_empty_vocab=true only for debugging."
+        )
+
+
+def load_manifest_vocab(
+    path: str | Path,
+    *,
+    require_train_metadata: bool = False,
+    allow_empty: bool = False,
+) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         vocab = yaml.safe_load(f) or {}
     vocab.setdefault("categories", list(DEFAULT_CATEGORIES))
     vocab.setdefault("permission_vocab", [])
     vocab.setdefault("intent_vocab", [])
     vocab.setdefault("feature_vocab", [])
+    validate_manifest_vocab(
+        vocab,
+        require_train_metadata=require_train_metadata,
+        allow_empty=allow_empty,
+    )
     return vocab
 
 
@@ -328,11 +366,17 @@ def vectorize_manifest_record(
     category_norm = category_counts / category_counts.sum().clamp_min(1.0)
     stats = manifest_stats_from_record(record)
     parts = [perm_vec, intent_vec, feature_vec, category_norm, stats]
+    raw_dim = sum(int(p.numel()) for p in parts)
+    if raw_dim > manifest_dim:
+        raise ValueError(
+            "manifest_dim is too small for the selected Manifest vocab layout: "
+            f"manifest_dim={manifest_dim}, required={raw_dim} "
+            f"(permissions={len(permission_vocab)}, intents={len(intent_vocab)}, "
+            f"features={len(feature_vocab)}, categories={len(categories)}, stats={int(stats.numel())})"
+        )
     manifest_x = torch.cat([p.float().view(-1) for p in parts], dim=0)
     if manifest_x.numel() < manifest_dim:
         manifest_x = torch.cat([manifest_x, torch.zeros((manifest_dim - manifest_x.numel(),), dtype=torch.float32)])
-    elif manifest_x.numel() > manifest_dim:
-        manifest_x = manifest_x[:manifest_dim]
 
     has_manifest = not bool(record.get("parse_error")) and (
         len(permissions) + len(intents) + len(features) + int(record.get("component_count", 0) or 0) > 0
@@ -363,6 +407,7 @@ def vectorize_manifest_record(
         },
         "manifest_permission_dim": len(permission_vocab),
         "manifest_intent_dim": len(intent_vocab),
+        "manifest_feature_dim": len(feature_vocab),
     }
 
 

@@ -5,7 +5,11 @@ from typing import Iterable
 
 import torch
 
-from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM, api_semantic_counts_from_type_ids
+from fusion.robust.semantic_categories import (
+    SEMANTIC_CATEGORY_DIM,
+    api_semantic_counts_from_type_ids,
+    graph_semantic_counts_from_method_api_edges,
+)
 
 
 API_PERTURBATIONS = {
@@ -60,6 +64,14 @@ def _clamp_strength(strength: float) -> float:
     return max(0.0, min(1.0, float(strength)))
 
 
+def _num_to_perturb(total: int, strength: float) -> int:
+    total = max(0, int(total))
+    strength = _clamp_strength(strength)
+    if total <= 0 or strength <= 0.0:
+        return 0
+    return min(total, max(1, int(round(total * strength))))
+
+
 def _scalar_float(value, default: float = 0.0) -> float:
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:
@@ -107,7 +119,9 @@ def degrade_category_counts(data: dict, key: str, strength: float, mode: str) ->
         return
     out = counts.clone()
     flat = out.view(-1)
-    n = min(flat.numel(), max(1, int(round(flat.numel() * strength))))
+    n = _num_to_perturb(flat.numel(), strength)
+    if n <= 0:
+        return
     if mode == "mask":
         idx = torch.randperm(flat.numel(), device=flat.device)[:n]
         flat[idx] = 0.0
@@ -151,6 +165,64 @@ def recompute_api_category_counts(data: dict) -> None:
     data["api_category_counts"] = counts
 
 
+def recompute_graph_category_counts_from_api_edges(data: dict) -> None:
+    ids = data.get("api_type_ids")
+    edge = data.get("method_api_edge_index")
+    counts = graph_semantic_counts_from_method_api_edges(ids, edge)
+    device = None
+    if isinstance(ids, torch.Tensor):
+        device = ids.device
+    elif isinstance(edge, torch.Tensor):
+        device = edge.device
+    counts = counts.to(device=device) if device is not None else counts
+    data["graph_semantic_category_counts"] = counts
+    data["graph_category_counts"] = counts
+
+
+def _select_api_events(data: dict, keep: torch.Tensor) -> None:
+    keep = keep.bool().view(-1)
+    n_api = int(keep.numel())
+    if n_api <= 0:
+        return
+    keep_idx = torch.where(keep)[0]
+
+    for key in (
+        "api_ids",
+        "api_type_ids",
+        "api_sensitive_mask",
+        "api_method_index",
+        "api_in_graph_mask",
+    ):
+        value = data.get(key)
+        if isinstance(value, torch.Tensor) and value.numel() == n_api:
+            data[key] = value[keep_idx.to(value.device)].clone()
+
+    mask = data.get("mask")
+    if isinstance(mask, torch.Tensor) and mask.ndim == 2 and mask.size(1) == n_api:
+        data["mask"] = mask[:, keep_idx.to(mask.device)].clone()
+
+    edge = data.get("method_api_edge_index")
+    if not (
+        isinstance(edge, torch.Tensor)
+        and edge.ndim == 2
+        and edge.size(0) == 2
+        and edge.numel() > 0
+    ):
+        return
+
+    mapping = torch.full((n_api,), -1, dtype=torch.long, device=edge.device)
+    keep_edge = keep_idx.to(edge.device)
+    mapping[keep_edge] = torch.arange(keep_edge.numel(), dtype=torch.long, device=edge.device)
+    dst = edge[1].long()
+    valid = (dst >= 0) & (dst < n_api)
+    if valid.any():
+        valid = valid & (mapping[dst.clamp(0, max(n_api - 1, 0))] >= 0)
+    edge = edge[:, valid].clone()
+    if edge.numel() > 0:
+        edge[1] = mapping[edge[1].long()]
+    data["method_api_edge_index"] = edge
+
+
 def apply_api_event_dropout(data: dict, strength: float, sensitive_only: bool = False) -> dict:
     strength = _clamp_strength(strength)
     api_ids = data.get("api_ids")
@@ -166,55 +238,37 @@ def apply_api_event_dropout(data: dict, strength: float, sensitive_only: bool = 
     else:
         candidate = torch.arange(n_api, device=device)
 
-    n_drop = min(candidate.numel(), max(1, int(round(candidate.numel() * strength))))
+    n_drop = _num_to_perturb(candidate.numel(), strength)
+    if n_drop <= 0:
+        return data
     drop_idx = candidate[torch.randperm(candidate.numel(), device=device)[:n_drop]]
     keep = torch.ones((n_api,), dtype=torch.bool, device=device)
     keep[drop_idx] = False
 
-    data["api_ids"] = api_ids.clone()
-    data["api_ids"][drop_idx] = 0
-    for key, fill in (
-        ("api_type_ids", 0),
-        ("api_sensitive_mask", 0.0),
-        ("api_in_graph_mask", 0.0),
-    ):
-        value = data.get(key)
-        if isinstance(value, torch.Tensor) and value.numel() == n_api:
-            data[key] = value.clone()
-            data[key][drop_idx] = fill
-
-    method_index = data.get("api_method_index")
-    if isinstance(method_index, torch.Tensor) and method_index.numel() == n_api:
-        data["api_method_index"] = method_index.clone()
-        data["api_method_index"][drop_idx] = -1
-
-    mask = data.get("mask")
-    if isinstance(mask, torch.Tensor) and mask.ndim == 2 and mask.size(1) == n_api:
-        data["mask"] = mask.clone()
-        data["mask"][:, drop_idx] = 0.0
-
-    edge = data.get("method_api_edge_index")
-    if isinstance(edge, torch.Tensor) and edge.ndim == 2 and edge.size(0) == 2 and edge.numel() > 0:
-        safe_dst = edge[1].long().clamp(0, n_api - 1)
-        data["method_api_edge_index"] = edge[:, keep[safe_dst]]
-
     actual = float(drop_idx.numel()) / max(n_api, 1)
+    _select_api_events(data, keep)
     _degrade_quality(data, "q_api", actual)
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_sensitive_event_dropout" if sensitive_only else "api_event_dropout"
     recompute_api_category_counts(data)
+    recompute_graph_category_counts_from_api_edges(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
 
 def apply_api_category_dropout(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     ids = data.get("api_type_ids")
     if not isinstance(ids, torch.Tensor) or ids.numel() == 0:
         return data
     non_other = torch.where(ids.long().view(-1) > 0)[0]
     if non_other.numel() == 0:
         return apply_api_event_dropout(data, strength, sensitive_only=False)
-    n_drop = min(non_other.numel(), max(1, int(round(non_other.numel() * _clamp_strength(strength)))))
+    n_drop = _num_to_perturb(non_other.numel(), strength)
+    if n_drop <= 0:
+        return data
     chosen = non_other[torch.randperm(non_other.numel(), device=ids.device)[:n_drop]]
     ids_new = ids.clone()
     ids_new[chosen] = 0
@@ -224,17 +278,22 @@ def apply_api_category_dropout(data: dict, strength: float) -> dict:
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_category_dropout"
     recompute_api_category_counts(data)
+    recompute_graph_category_counts_from_api_edges(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
 
 def apply_api_feature_noise(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     ids = data.get("api_ids")
     if not isinstance(ids, torch.Tensor) or ids.numel() == 0:
         return data
-    strength = _clamp_strength(strength)
     n = int(ids.numel())
-    n_noise = min(n, max(1, int(round(n * strength))))
+    n_noise = _num_to_perturb(n, strength)
+    if n_noise <= 0:
+        return data
     idx = torch.randperm(n, device=ids.device)[:n_noise]
     ids_new = ids.clone()
     ids_new[idx] = torch.randint(1, int(ids.max().item()) + 2, (n_noise,), device=ids.device)
@@ -271,6 +330,8 @@ def apply_api_missing(data: dict) -> dict:
         counts = torch.zeros((SEMANTIC_CATEGORY_DIM,), dtype=torch.float32, device=device)
     data["api_semantic_category_counts"] = counts
     data["api_category_counts"] = counts
+    data["graph_semantic_category_counts"] = counts.clone()
+    data["graph_category_counts"] = counts.clone()
     data["q_api"] = 0.0
     data["pert_api"] = 1.0
     data["api_aug_type"] = "modality_dropout_api"
@@ -279,14 +340,17 @@ def apply_api_missing(data: dict) -> dict:
 
 
 def apply_graph_sparsify(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     edge = data.get("edge_index")
     if not isinstance(edge, torch.Tensor) or edge.ndim != 2 or edge.size(1) == 0:
         _degrade_quality(data, "q_graph", 1.0)
         _set_min_pert(data, "pert_graph", 1.0)
         degrade_graph_counts(data, 1.0)
+        data["graph_aug_type"] = "graph_sparsify"
         refresh_align_quality_after_code_perturb(data)
         return data
-    strength = _clamp_strength(strength)
     keep = torch.rand(edge.size(1), device=edge.device) > strength
     if keep.sum() == 0:
         keep[random.randrange(edge.size(1))] = True
@@ -301,10 +365,12 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
 
 
 def apply_graph_local_break(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     edge = data.get("edge_index")
     if not isinstance(edge, torch.Tensor) or edge.ndim != 2 or edge.size(1) == 0:
         return apply_graph_sparsify(data, 1.0)
-    strength = _clamp_strength(strength)
     num_nodes = int(data.get("x").size(0)) if isinstance(data.get("x"), torch.Tensor) else int(edge.max().item()) + 1
     sensitive = data.get("sensitive_mask")
     if isinstance(sensitive, torch.Tensor) and sensitive.numel() > 0 and sensitive.bool().any():
@@ -328,12 +394,16 @@ def apply_graph_local_break(data: dict, strength: float) -> dict:
 
 
 def apply_graph_feature_obfuscation(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     x = data.get("x")
     if not isinstance(x, torch.Tensor) or x.ndim != 2 or x.size(0) == 0:
         return data
-    strength = _clamp_strength(strength)
     n = int(x.size(0))
-    n_mask = min(n, max(1, int(round(n * strength))))
+    n_mask = _num_to_perturb(n, strength)
+    if n_mask <= 0:
+        return data
     idx = torch.randperm(n, device=x.device)[:n_mask]
     x_new = x.clone()
     x_new[idx] = 0.15 * x_new[idx] + 0.03 * torch.randn_like(x_new[idx])
@@ -348,12 +418,16 @@ def apply_graph_feature_obfuscation(data: dict, strength: float) -> dict:
 
 
 def apply_graph_node_feature_mask(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     x = data.get("x")
     if not isinstance(x, torch.Tensor) or x.ndim != 2 or x.size(0) == 0:
         return data
-    strength = _clamp_strength(strength)
     n = int(x.size(0))
-    n_mask = min(n, max(1, int(round(n * strength))))
+    n_mask = _num_to_perturb(n, strength)
+    if n_mask <= 0:
+        return data
     idx = torch.randperm(n, device=x.device)[:n_mask]
     x_new = x.clone()
     x_new[idx] = 0.0
@@ -413,13 +487,19 @@ def _choose_vector_positions(vec: torch.Tensor, strength: float, start: int = 0,
     start = max(0, min(int(start), width))
     end = width if end is None else max(start, min(int(end), width))
     span = end - start
-    if span <= 0:
+    strength = _clamp_strength(strength)
+    if span <= 0 or strength <= 0.0:
         return torch.empty((0,), dtype=torch.long, device=vec.device)
-    n = min(span, max(1, int(round(span * _clamp_strength(strength)))))
+    n = _num_to_perturb(span, strength)
+    if n <= 0:
+        return torch.empty((0,), dtype=torch.long, device=vec.device)
     return start + torch.randperm(span, device=vec.device)[:n]
 
 
 def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     vec = data.get("manifest_x")
     if isinstance(vec, torch.Tensor) and vec.numel() > 0:
         perm_dim = int(data.get("manifest_permission_dim", max(1, vec.size(-1) // 2)))
@@ -428,11 +508,12 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
     ids = data.get("manifest_permission_ids")
     if isinstance(ids, torch.Tensor) and ids.numel() > 0:
-        n = min(ids.numel(), max(1, int(round(ids.numel() * _clamp_strength(strength)))))
-        idx = torch.randperm(ids.numel(), device=ids.device)[:n]
-        ids_new = ids.clone()
-        ids_new[idx] = 0
-        data["manifest_permission_ids"] = ids_new
+        n = _num_to_perturb(ids.numel(), strength)
+        if n > 0:
+            idx = torch.randperm(ids.numel(), device=ids.device)[:n]
+            ids_new = ids.clone()
+            ids_new[idx] = 0
+            data["manifest_permission_ids"] = ids_new
     degrade_manifest_counts(data, strength, "mask")
     _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
@@ -441,6 +522,9 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
 
 
 def apply_manifest_permission_injection(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     vec = data.get("manifest_x")
     if isinstance(vec, torch.Tensor) and vec.numel() > 0:
         perm_dim = int(data.get("manifest_permission_dim", max(1, vec.size(-1) // 2)))
@@ -455,6 +539,9 @@ def apply_manifest_permission_injection(data: dict, strength: float) -> dict:
 
 
 def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     vec = data.get("manifest_x")
     if isinstance(vec, torch.Tensor) and vec.numel() > 0:
         perm_dim = int(data.get("manifest_permission_dim", max(1, vec.size(-1) // 2)))
@@ -464,11 +551,12 @@ def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
     ids = data.get("manifest_intent_ids")
     if isinstance(ids, torch.Tensor) and ids.numel() > 0:
-        n = min(ids.numel(), max(1, int(round(ids.numel() * _clamp_strength(strength)))))
-        idx = torch.randperm(ids.numel(), device=ids.device)[:n]
-        ids_new = ids.clone()
-        ids_new[idx] = 0
-        data["manifest_intent_ids"] = ids_new
+        n = _num_to_perturb(ids.numel(), strength)
+        if n > 0:
+            idx = torch.randperm(ids.numel(), device=ids.device)[:n]
+            ids_new = ids.clone()
+            ids_new[idx] = 0
+            data["manifest_intent_ids"] = ids_new
     degrade_manifest_counts(data, strength, "mask")
     _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
@@ -477,18 +565,28 @@ def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
 
 
 def apply_manifest_component_mask(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     stats = data.get("manifest_stats")
     if isinstance(stats, torch.Tensor) and stats.numel() > 0:
-        stats_new = stats.clone()
-        n = min(stats.numel(), max(1, int(round(stats.numel() * _clamp_strength(strength)))))
-        idx = torch.randperm(stats.numel(), device=stats.device)[:n]
-        stats_new.view(-1)[idx] = 0.0
-        data["manifest_stats"] = stats_new
+        n = _num_to_perturb(stats.numel(), strength)
+        if n > 0:
+            stats_new = stats.clone()
+            idx = torch.randperm(stats.numel(), device=stats.device)[:n]
+            stats_new.view(-1)[idx] = 0.0
+            data["manifest_stats"] = stats_new
     vec = data.get("manifest_x")
     if isinstance(vec, torch.Tensor) and vec.numel() > 0:
+        perm_dim = int(data.get("manifest_permission_dim", 0))
+        intent_dim = int(data.get("manifest_intent_dim", 0))
+        feature_dim = int(data.get("manifest_feature_dim", 0))
         stats_dim = int(stats.numel()) if isinstance(stats, torch.Tensor) else max(1, vec.size(-1) // 8)
-        start = max(0, vec.size(-1) - stats_dim)
-        pos = _choose_vector_positions(vec, strength, start, vec.size(-1))
+        start = perm_dim + intent_dim + feature_dim + SEMANTIC_CATEGORY_DIM
+        if start >= vec.size(-1):
+            start = max(0, vec.size(-1) - stats_dim)
+        end = min(vec.size(-1), start + stats_dim)
+        pos = _choose_vector_positions(vec, strength, start, end)
         if pos.numel() > 0:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
     degrade_manifest_counts(data, strength, "mask")
@@ -499,6 +597,9 @@ def apply_manifest_component_mask(data: dict, strength: float) -> dict:
 
 
 def apply_manifest_feature_noise(data: dict, strength: float) -> dict:
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return data
     vec = data.get("manifest_x")
     if isinstance(vec, torch.Tensor) and vec.numel() > 0:
         noise = torch.randn_like(vec.float()) * (0.05 + 0.20 * _clamp_strength(strength))
@@ -528,6 +629,8 @@ def apply_manifest_missing(data: dict) -> dict:
 
 
 def apply_manifest_degraded(data: dict, strength: float) -> dict:
+    if _clamp_strength(strength) <= 0.0:
+        return data
     op = random.choice(
         [
             apply_manifest_permission_mask,

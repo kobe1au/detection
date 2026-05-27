@@ -1,6 +1,11 @@
+# Ablation: graph_semantic_source = full_api
+# Graph semantic counts are copied verbatim from the API histogram instead
+# of being derived via method_api_edge_index alignment. Use this config to
+# isolate the contribution of the structural-context category alignment
+# innovation (vs. the full-API surrogate).
 data:
   root: ""
-  out_dir: "experiments/tri_modal_robust"
+  out_dir: "experiments/tri_modal_robust_graph_full_api"
   train_pt_dir: "C:/pts_tri/train"
   val_pt_dir: "C:/pts_tri/val"
   test_pt_dir: "C:/pts_tri/test"
@@ -9,6 +14,7 @@ data:
   test_csv: "results/labels/test.csv"
   max_api_events_per_sample: 1024
   max_failed_ratio: 0.0
+  graph_semantic_source: "full_api"
 
 model:
   num_classes: 2
@@ -53,7 +59,7 @@ model:
     detach: true
 
 train:
-  exp_name: "tri_modal_robust"
+  exp_name: "tri_modal_robust_graph_full_api"
   seed: 42
   device: "auto"
   use_amp: true

@@ -143,9 +143,11 @@ def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | Non
         manifest_stats_dim=int(manifest_cfg.get("stats_dim", 11)),
         manifest_permission_dim=int(manifest_cfg.get("permission_dim", 128)),
         manifest_intent_dim=int(manifest_cfg.get("intent_dim", 64)),
+        manifest_feature_dim=int(manifest_cfg.get("feature_dim", 32)),
         max_api_events_per_sample=data_cfg.get("max_api_events_per_sample"),
         drop_graph_behavior_hints=bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
         degrade_category_counts=bool(robust_cfg.get("degrade_category_counts", True)),
+        graph_semantic_source=str(data_cfg.get("graph_semantic_source", "alignment")),
     )
 
 
@@ -161,6 +163,19 @@ def build_loader(cfg: dict, dataset, is_train: bool):
         persistent_workers=bool(train_cfg.get("persistent_workers", False)) and workers > 0,
         collate_fn=robust_collate_fn,
     )
+
+
+def enforce_failed_ratio(metrics: dict[str, Any], cfg: dict, split_name: str) -> None:
+    total = int(metrics.get("num_eval", 0)) + int(metrics.get("num_failed", 0))
+    if total <= 0:
+        raise RuntimeError(f"{split_name}: no valid or failed samples were seen")
+    failed_ratio = float(metrics.get("num_failed", 0)) / float(total)
+    max_failed_ratio = float(cfg.get("data", {}).get("max_failed_ratio", 0.0))
+    if failed_ratio > max_failed_ratio:
+        raise RuntimeError(
+            f"{split_name}: failed sample ratio {failed_ratio:.4f} exceeds "
+            f"data.max_failed_ratio={max_failed_ratio:.4f}"
+        )
 
 
 def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
@@ -278,24 +293,28 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
     optimizer.zero_grad(set_to_none=True)
     total_loss = 0.0
     steps = 0
+    failed_seen = 0
+    valid_seen = 0
 
-    for step, batch in enumerate(tqdm(loader, desc=f"train {epoch}", leave=False), start=1):
-        graph, labels, _, _quality, _ = prepare_robust_batch(batch, device)
+    for batch in tqdm(loader, desc=f"train {epoch}", leave=False):
+        graph, labels, _, _quality, failed = prepare_robust_batch(batch, device)
+        failed_seen += int(failed)
         if graph is None:
             continue
+        valid_seen += int(labels.size(0))
         with get_amp_context(device, use_amp):
             logits, extra = model(graph, return_features=False)
             loss, _ = compute_robust_loss(logits, labels, extra, loss_cfg)
             loss = loss / max(grad_accum, 1)
+        steps += 1
         scaler.scale(loss).backward()
-        if step % grad_accum == 0:
+        if steps % grad_accum == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["train"].get("grad_clip", 1.0)))
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
         total_loss += float(loss.detach().item()) * max(grad_accum, 1)
-        steps += 1
 
     if steps > 0 and steps % grad_accum != 0:
         scaler.unscale_(optimizer)
@@ -303,6 +322,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+    enforce_failed_ratio({"num_eval": valid_seen, "num_failed": failed_seen}, cfg, f"train_epoch_{epoch}")
     return total_loss / max(steps, 1)
 
 
@@ -356,6 +376,7 @@ def run(cfg: dict) -> dict[str, Any]:
     for epoch in range(1, int(train_cfg.get("epochs", 1)) + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch)
         val_metrics, _ = evaluate(model, val_loader, device, use_amp, "val", dump_rows=False)
+        enforce_failed_ratio(val_metrics, cfg, "val")
         scheduler.step()
         logger.info(
             "epoch=%s train_loss=%.4f val_f1=%.4f val_auc=%.4f val_acc=%.4f",
@@ -380,6 +401,8 @@ def run(cfg: dict) -> dict[str, Any]:
 
     val_metrics, val_rows = evaluate(model, val_loader, device, use_amp, "val_clean", dump_rows=True)
     test_metrics, test_rows = evaluate(model, test_loader, device, use_amp, "test_clean", dump_rows=True)
+    enforce_failed_ratio(val_metrics, cfg, "val_clean")
+    enforce_failed_ratio(test_metrics, cfg, "test_clean")
 
     all_rows = val_rows + test_rows
     robust_results = {}
@@ -399,6 +422,7 @@ def run(cfg: dict) -> dict[str, Any]:
             robust_ds = build_dataset(cfg, "test", is_train=False, perturb_type=perturb, perturb_strength=strength)
             robust_loader = build_loader(cfg, robust_ds, is_train=False)
             metrics, rows = evaluate(model, robust_loader, device, use_amp, f"test_{result_key}", dump_rows=True)
+            enforce_failed_ratio(metrics, cfg, f"test_{result_key}")
             robust_results[result_key] = metrics
             all_rows.extend(rows)
 

@@ -30,8 +30,10 @@ from fusion.robust.manifest_features import (  # noqa: E402
     extract_manifest_record,
     load_manifest_vocab,
     save_manifest_vocab,
+    validate_manifest_vocab,
     vectorize_manifest_record,
 )
+from fusion.robust.semantic_categories import validate_api_type_mapping  # noqa: E402
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -50,7 +52,9 @@ def _collect_apks(apk_root: Path, splits: list[str]) -> list[dict[str, str]]:
         split_dir = apk_root / split
         if not split_dir.exists():
             continue
-        for apk_path in sorted(split_dir.glob("*.apk")):
+
+        apk_paths = sorted(split_dir.glob("*.apk"))
+        for apk_path in tqdm(apk_paths, desc=f"scan/hash {split}", unit="apk"):
             jobs.append(
                 {
                     "split": split,
@@ -155,6 +159,7 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         "max_permissions": int(manifest.get("max_permissions", 128)),
         "max_intents": int(manifest.get("max_intents", 64)),
         "max_features": int(manifest.get("max_features", 32)),
+        "allow_empty_vocab": bool(manifest.get("allow_empty_vocab", False)),
         "save_manifest_jsonl": bool(manifest.get("save_manifest_jsonl", True)),
         "manifest_jsonl_dir": manifest_jsonl_dir,
         "keep_method_names": bool(storage.get("keep_method_names", False)),
@@ -224,9 +229,18 @@ def _build_or_load_vocab(
             "source": "scripts/build_tri_modal_pts_direct.py",
             "leakage_guard": "train_only",
         }
+        validate_manifest_vocab(
+            vocab,
+            require_train_metadata=True,
+            allow_empty=cfg["allow_empty_vocab"],
+        )
         save_manifest_vocab(vocab, vocab_path)
         return vocab
-    return load_manifest_vocab(vocab_path)
+    return load_manifest_vocab(
+        vocab_path,
+        require_train_metadata=True,
+        allow_empty=cfg["allow_empty_vocab"],
+    )
 
 
 def _manifest_payload(record: dict[str, Any], vocab: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -344,6 +358,7 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
         ),
         flush=True,
     )
+    print("------------------------------------------")
     _validate_split_counts(split_counts)
     if dry_run:
         return {"ok": 0, "fail": 0, "dry_run": True, "split_counts": split_counts}
@@ -412,6 +427,7 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true", help="Force resume=true.")
     parser.add_argument("--no-resume", action="store_true", help="Force resume=false.")
     parser.add_argument("--rebuild-vocab", action="store_true", help="Force rebuild Manifest vocab from train split.")
+    parser.add_argument("--allow-empty-vocab", action="store_true", help="Allow an empty Manifest vocab for debug runs.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -433,8 +449,11 @@ def main() -> None:
         raw.setdefault("execution", {})["resume"] = False
     if args.rebuild_vocab:
         raw.setdefault("manifest", {})["rebuild_vocab"] = True
+    if args.allow_empty_vocab:
+        raw.setdefault("manifest", {})["allow_empty_vocab"] = True
 
     try:
+        validate_api_type_mapping()
         cfg = _parse_config(raw)
         run(cfg, dry_run=args.dry_run)
     except (RuntimeError, ValueError) as exc:

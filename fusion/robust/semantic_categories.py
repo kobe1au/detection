@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -36,6 +36,78 @@ DEFAULT_API_TYPE_ID_TO_CATEGORY: dict[int, str] = {
     14: "system_settings",
     15: "contacts",
 }
+
+
+def validate_api_type_mapping(
+    mapping: Mapping[int, str] | None = None,
+    api_category_names: Sequence[str] | None = None,
+    target_categories: Sequence[str] | None = None,
+) -> None:
+    """Validate `DEFAULT_API_TYPE_ID_TO_CATEGORY` against the extractor taxonomy.
+
+    Raises ``ValueError`` with a precise diff when:
+
+    * a mapping key falls outside the extractor's ``API_CATEGORY_NAMES``
+      range (id 0 is reserved for ``other`` / unknown);
+    * a mapping value is not in the shared 12-D taxonomy
+      (``SEMANTIC_CATEGORIES`` / ``DEFAULT_CATEGORIES``).
+
+    This is a defensive runtime check meant to catch silent drift between
+    ``extract/extract_graph_api.py::API_CATEGORY_NAMES`` and this module's
+    mapping table. It does NOT validate semantic correctness of each
+    individual mapping (e.g. that id=10 should map to ``storage``) — that
+    remains the author's responsibility.
+    """
+    if mapping is None:
+        mapping = DEFAULT_API_TYPE_ID_TO_CATEGORY
+    if api_category_names is None:
+        # Lazy import to avoid extract -> fusion import cycles.
+        from extract.extract_graph_api import API_CATEGORY_NAMES as _names
+        api_category_names = tuple(_names)
+    if target_categories is None:
+        target_categories = SEMANTIC_CATEGORIES
+
+    target_set = set(target_categories)
+    n_names = len(api_category_names)
+    if n_names < 2:
+        raise ValueError(
+            f"api_category_names must contain at least the reserved 'other' "
+            f"slot plus one real category; got {list(api_category_names)!r}"
+        )
+
+    def _key_is_valid(k: Any) -> bool:
+        # bool is a subclass of int in Python; reject explicitly to avoid
+        # `True`/`False` keys silently passing as id=1/id=0.
+        if not isinstance(k, int) or isinstance(k, bool):
+            return False
+        return 1 <= k < n_names
+
+    bad_keys_raw = [k for k in mapping if not _key_is_valid(k)]
+    # Stringify before sorting so mixed-type keys (e.g. an accidental str
+    # key in the mapping) don't blow up sorted() with a TypeError.
+    bad_keys = sorted(repr(k) for k in bad_keys_raw)
+    bad_values = sorted({v for v in mapping.values() if v not in target_set})
+
+    if not bad_keys and not bad_values:
+        return
+
+    parts: list[str] = []
+    if bad_keys:
+        parts.append(
+            f"keys outside extractor range [1, {n_names - 1}]: {bad_keys}"
+        )
+    if bad_values:
+        parts.append(
+            f"values not in 12-D taxonomy {sorted(target_set)}: {bad_values}"
+        )
+    raise ValueError(
+        "DEFAULT_API_TYPE_ID_TO_CATEGORY is inconsistent with extractor / "
+        "shared taxonomy: "
+        + "; ".join(parts)
+        + ". Update fusion.robust.semantic_categories.DEFAULT_API_TYPE_ID_TO_CATEGORY "
+        "together with extract.extract_graph_api.API_CATEGORY_NAMES and "
+        "fusion.robust.manifest_features.DEFAULT_CATEGORIES."
+    )
 
 
 def sanitize_semantic_counts(value: Any, *, require_exact: bool = False) -> torch.Tensor:

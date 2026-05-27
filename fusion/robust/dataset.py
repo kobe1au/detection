@@ -25,6 +25,9 @@ from fusion.robust.semantic_categories import (
 logger = logging.getLogger(__name__)
 
 
+VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
+
+
 def _as_float_tensor(value, length: int, default: float = 0.0) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         out = value.detach().float().view(-1)
@@ -38,6 +41,17 @@ def _as_float_tensor(value, length: int, default: float = 0.0) -> torch.Tensor:
     elif out.numel() > length:
         out = out[:length]
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _flat_numel(value) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.detach().view(-1).numel())
+    if value is None:
+        return 0
+    try:
+        return int(torch.as_tensor(value).view(-1).numel())
+    except (TypeError, ValueError):
+        return 0
 
 
 def _as_long_tensor(value, length: int | None = None, fill_value: int = 0) -> torch.Tensor:
@@ -60,6 +74,20 @@ def _first_present(sources: list[dict[str, Any]], key: str):
         if isinstance(src, dict) and key in src and src[key] is not None:
             return src[key]
     return None
+
+
+def _first_int(sources: list[dict[str, Any]], key: str, default: int) -> int:
+    value = _first_present(sources, key)
+    if value is None:
+        return int(default)
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().view(-1)[0].item()
+        elif isinstance(value, (list, tuple)):
+            value = value[0]
+        return max(0, int(value))
+    except (IndexError, TypeError, ValueError):
+        return int(default)
 
 
 def _normalize_loaded_pt(raw) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -96,8 +124,10 @@ class RobustTriModalDataset(Dataset):
         manifest_stats_dim: int = 11,
         manifest_permission_dim: int = 128,
         manifest_intent_dim: int = 64,
+        manifest_feature_dim: int = 32,
         drop_graph_behavior_hints: bool = False,
         degrade_category_counts: bool = True,
+        graph_semantic_source: str = "alignment",
         **_unused,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
@@ -122,8 +152,16 @@ class RobustTriModalDataset(Dataset):
         self.manifest_stats_dim = int(manifest_stats_dim)
         self.manifest_permission_dim = int(manifest_permission_dim)
         self.manifest_intent_dim = int(manifest_intent_dim)
+        self.manifest_feature_dim = int(manifest_feature_dim)
         self.drop_graph_behavior_hints = bool(drop_graph_behavior_hints)
         self.degrade_category_counts = bool(degrade_category_counts)
+        src = str(graph_semantic_source or "alignment").lower()
+        if src not in VALID_GRAPH_SEMANTIC_SOURCES:
+            raise ValueError(
+                f"Unsupported graph_semantic_source={graph_semantic_source!r}; "
+                f"must be one of {VALID_GRAPH_SEMANTIC_SOURCES}"
+            )
+        self.graph_semantic_source = src
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -252,12 +290,22 @@ class RobustTriModalDataset(Dataset):
         n = int(parts["api_ids"].numel())
         if n <= self.max_api_events_per_sample:
             return parts
-        keep = torch.arange(self.max_api_events_per_sample)
+        limit = max(0, int(self.max_api_events_per_sample))
+        keep = torch.arange(limit, device=parts["api_ids"].device)
         for key in ("api_ids", "api_type_ids", "api_sensitive_mask", "api_method_index", "api_in_graph_mask"):
-            parts[key] = parts[key][keep]
+            value = parts[key]
+            parts[key] = value[keep.to(value.device)] if value.numel() > 0 else value[:0]
         edge = parts["method_api_edge_index"]
         if edge.numel() > 0:
-            parts["method_api_edge_index"] = edge[:, edge[1] < self.max_api_events_per_sample]
+            mapping = torch.full((n,), -1, dtype=torch.long, device=edge.device)
+            keep_edge = keep.to(edge.device)
+            mapping[keep_edge] = torch.arange(keep_edge.numel(), dtype=torch.long, device=edge.device)
+            dst = edge[1].long()
+            valid = (dst >= 0) & (dst < n) & (mapping[dst.clamp(0, max(n - 1, 0))] >= 0)
+            edge = edge[:, valid].clone()
+            if edge.numel() > 0:
+                edge[1] = mapping[edge[1].long()]
+            parts["method_api_edge_index"] = edge
         return parts
 
     @staticmethod
@@ -332,14 +380,14 @@ class RobustTriModalDataset(Dataset):
         else:
             method_api_edge_index = torch.empty((2, 0), dtype=torch.long)
 
-        parts = self._limit_api_events({
+        parts = {
             "api_ids": api_ids,
             "api_type_ids": api_type_ids,
             "api_sensitive_mask": api_sensitive,
             "api_method_index": api_method_index,
             "api_in_graph_mask": api_in_graph,
             "method_api_edge_index": method_api_edge_index,
-        })
+        }
         return {
             "x": x,
             "edge_index": edge_index,
@@ -382,14 +430,36 @@ class RobustTriModalDataset(Dataset):
         final_api_in_graph = torch.cat([v for v in api_in_graph if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_in_graph) else torch.empty((0,), dtype=torch.float32)
         final_method_edges = torch.cat([e for e in method_edges if e.numel() > 0], dim=1) if any(e.numel() > 0 for e in method_edges) else torch.empty((2, 0), dtype=torch.long)
 
+        api_parts = self._limit_api_events({
+            "api_ids": final_api_ids,
+            "api_type_ids": final_api_types,
+            "api_sensitive_mask": final_api_sensitive,
+            "api_method_index": final_api_methods,
+            "api_in_graph_mask": final_api_in_graph,
+            "method_api_edge_index": final_method_edges,
+        })
+        final_api_ids = api_parts["api_ids"]
+        final_api_types = api_parts["api_type_ids"]
+        final_api_sensitive = api_parts["api_sensitive_mask"]
+        final_api_methods = api_parts["api_method_index"]
+        final_api_in_graph = api_parts["api_in_graph_mask"]
+        final_method_edges = api_parts["method_api_edge_index"]
+
         q_api = self._api_quality(final_api_ids, final_api_types, final_api_sensitive, final_api_in_graph)
         q_graph = self._graph_quality(edge_index, int(x.size(0)), sensitive_mask)
         q_align = self._align_quality(q_api, q_graph, final_method_edges, int(x.size(0)), int(final_api_ids.numel()))
         api_semantic_counts = self._api_semantic_category_counts(final_api_types)
-        graph_semantic_counts = graph_semantic_counts_from_method_api_edges(
-            final_api_types,
-            final_method_edges,
-        )
+        if self.graph_semantic_source == "alignment":
+            graph_semantic_counts = graph_semantic_counts_from_method_api_edges(
+                final_api_types,
+                final_method_edges,
+            )
+        elif self.graph_semantic_source == "full_api":
+            graph_semantic_counts = api_semantic_counts.clone()
+        else:  # "zero"
+            graph_semantic_counts = torch.zeros(
+                (SEMANTIC_CATEGORY_DIM,), dtype=torch.float32
+            )
         return {
             "x": x,
             "edge_index": edge_index,
@@ -417,6 +487,12 @@ class RobustTriModalDataset(Dataset):
     def _manifest_payload(self, sources: list[dict[str, Any]]) -> dict[str, Any]:
         manifest_x_raw = _first_present(sources, "manifest_x")
         has_manifest = manifest_x_raw is not None or _first_present(sources, "manifest_category_counts") is not None
+        raw_manifest_dim = _flat_numel(manifest_x_raw)
+        if raw_manifest_dim > self.manifest_dim:
+            raise ValueError(
+                f"manifest_x dimension {raw_manifest_dim} exceeds configured manifest_dim={self.manifest_dim}; "
+                "regenerate tri-modal .pt files or increase model.manifest_encoder.in_dim"
+            )
         manifest_x = _as_float_tensor(manifest_x_raw, self.manifest_dim)
         manifest_counts = sanitize_semantic_counts(_first_present(sources, "manifest_category_counts"))
         graph_raw = _first_present(sources, "graph_semantic_category_counts")
@@ -449,8 +525,9 @@ class RobustTriModalDataset(Dataset):
             "q_manifest": max(0.0, min(1.0, q_manifest)),
             "pert_manifest": max(0.0, min(1.0, pert_manifest)),
             "manifest_aug_type": "none" if has_manifest else "missing",
-            "manifest_permission_dim": self.manifest_permission_dim,
-            "manifest_intent_dim": self.manifest_intent_dim,
+            "manifest_permission_dim": _first_int(sources, "manifest_permission_dim", self.manifest_permission_dim),
+            "manifest_intent_dim": _first_int(sources, "manifest_intent_dim", self.manifest_intent_dim),
+            "manifest_feature_dim": _first_int(sources, "manifest_feature_dim", self.manifest_feature_dim),
         }
 
     def _to_data_object(self, data: dict[str, Any], label: int, sid: str, year: int) -> Data:
@@ -494,15 +571,16 @@ class RobustTriModalDataset(Dataset):
             data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
-            graph_counts_from_alignment = data.get("graph_semantic_category_counts")
+            # Graph counts computed via the configured source (alignment /
+            # full_api / zero) always win over whatever the .pt happens to
+            # carry — manifest_payload only provides a fallback for legacy
+            # files.
+            graph_counts_from_source = data.get("graph_semantic_category_counts")
             manifest_payload = self._manifest_payload(sources)
             data.update(manifest_payload)
-            if (
-                isinstance(graph_counts_from_alignment, torch.Tensor)
-                and graph_counts_from_alignment.abs().sum().item() > 0
-            ):
-                data["graph_semantic_category_counts"] = graph_counts_from_alignment
-                data["graph_category_counts"] = graph_counts_from_alignment
+            if isinstance(graph_counts_from_source, torch.Tensor):
+                data["graph_semantic_category_counts"] = graph_counts_from_source
+                data["graph_category_counts"] = graph_counts_from_source
             data["degrade_category_counts"] = self.degrade_category_counts
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)

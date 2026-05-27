@@ -16,6 +16,7 @@ from fusion.robust.manifest_features import (
     load_manifest_vocab,
     read_manifest_jsonl,
     save_manifest_vocab,
+    validate_manifest_vocab,
     vectorize_manifest_record,
 )
 
@@ -48,6 +49,9 @@ def _payload_for_missing(manifest_dim: int, category_dim: int, stats_dim: int):
         "q_manifest": torch.tensor([0.0], dtype=torch.float32),
         "pert_manifest": torch.tensor([1.0], dtype=torch.float32),
         "manifest_meta": {"parse_error": "missing manifest record"},
+        "manifest_permission_dim": 0,
+        "manifest_intent_dim": 0,
+        "manifest_feature_dim": 0,
     }
 
 
@@ -64,6 +68,7 @@ def main() -> None:
     parser.add_argument("--max-intents", type=int, default=64)
     parser.add_argument("--max-features", type=int, default=32)
     parser.add_argument("--manifest-dim", type=int, default=256)
+    parser.add_argument("--allow-empty-vocab", action="store_true", help="Allow an empty Manifest vocab for debugging only.")
     args = parser.parse_args()
 
     pt_dir = Path(args.pt_dir)
@@ -88,11 +93,20 @@ def main() -> None:
             "source_manifest_jsonl": str(Path(args.train_jsonl_for_vocab)),
             "leakage_guard": "train_only",
         }
+        validate_manifest_vocab(
+            vocab,
+            require_train_metadata=True,
+            allow_empty=args.allow_empty_vocab,
+        )
         save_manifest_vocab(vocab, args.vocab)
     else:
         if not Path(args.vocab).exists():
             raise SystemExit("Manifest vocab does not exist. Build it once from --split train before augmenting val/test.")
-        vocab = load_manifest_vocab(args.vocab)
+        vocab = load_manifest_vocab(
+            args.vocab,
+            require_train_metadata=True,
+            allow_empty=args.allow_empty_vocab,
+        )
 
     category_dim = len(vocab.get("categories") or [])
     stats_dim = 11

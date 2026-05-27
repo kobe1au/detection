@@ -1,6 +1,11 @@
+# Ablation: graph_semantic_source = zero
+# Graph semantic counts are forced to all zeros. Use this config to verify
+# that soft consistency / gate prior derive non-trivial signal from the
+# graph branch's structural-context categories (and not from any cross-modal
+# leakage).
 data:
   root: ""
-  out_dir: "experiments/tri_modal_robust"
+  out_dir: "experiments/tri_modal_robust_graph_zero"
   train_pt_dir: "C:/pts_tri/train"
   val_pt_dir: "C:/pts_tri/val"
   test_pt_dir: "C:/pts_tri/test"
@@ -9,6 +14,7 @@ data:
   test_csv: "results/labels/test.csv"
   max_api_events_per_sample: 1024
   max_failed_ratio: 0.0
+  graph_semantic_source: "zero"
 
 model:
   num_classes: 2
@@ -53,7 +59,7 @@ model:
     detach: true
 
 train:
-  exp_name: "tri_modal_robust"
+  exp_name: "tri_modal_robust_graph_zero"
   seed: 42
   device: "auto"
   use_amp: true

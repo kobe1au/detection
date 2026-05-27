@@ -9,7 +9,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.robust.manifest_features import build_manifest_vocab, read_manifest_jsonl, save_manifest_vocab
+from fusion.robust.manifest_features import (
+    build_manifest_vocab,
+    read_manifest_jsonl,
+    save_manifest_vocab,
+    validate_manifest_vocab,
+)
 
 
 def main() -> None:
@@ -19,6 +24,7 @@ def main() -> None:
     parser.add_argument("--max-permissions", type=int, default=128)
     parser.add_argument("--max-intents", type=int, default=64)
     parser.add_argument("--max-features", type=int, default=32)
+    parser.add_argument("--allow-empty-vocab", action="store_true", help="Allow an empty Manifest vocab for debugging only.")
     args = parser.parse_args()
 
     records = read_manifest_jsonl(args.train_manifest_jsonl)
@@ -33,6 +39,11 @@ def main() -> None:
         "source_manifest_jsonl": str(Path(args.train_manifest_jsonl)),
         "leakage_guard": "train_only",
     }
+    validate_manifest_vocab(
+        vocab,
+        require_train_metadata=True,
+        allow_empty=args.allow_empty_vocab,
+    )
     save_manifest_vocab(vocab, args.vocab)
 
 
