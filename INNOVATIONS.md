@@ -50,6 +50,12 @@ For an end-to-end APK to tri-modal `.pt` build, use:
 python scripts/build_tri_modal_pts.py --graph-config config/extract_graph_api.yaml --apk-root path/to/apks --graph-out-root path/to/pts_api_graph --tri-out-root path/to/pts_tri --rebuild-vocab
 ```
 
+After building `.pt` files, check semantic coverage before training:
+
+```bash
+python scripts/summarize_tri_modal_pts.py --pt-root path/to/pts_tri
+```
+
 ## Robust Fusion
 
 The model uses four decision branches:

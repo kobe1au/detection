@@ -12,26 +12,29 @@ SEMANTIC_CATEGORIES = tuple(DEFAULT_CATEGORIES)
 SEMANTIC_CATEGORY_DIM = len(SEMANTIC_CATEGORIES)
 CATEGORY_TO_INDEX = {name: idx for idx, name in enumerate(SEMANTIC_CATEGORIES)}
 
-# The API extractor stores compact type ids rather than category names. This
-# mapping makes the reliability/consistency space explicit and keeps id 0 as
-# unknown/background. If the extractor changes its taxonomy, update this table
-# rather than comparing raw type-id histograms to Manifest categories.
+# Must match extract/extract_graph_api.py::API_CATEGORY_NAMES:
+#   0 other, 1 telephony, 2 sms, 3 location, 4 contacts_content,
+#   5 camera_media, 6 network, 7 runtime_exec, 8 reflection,
+#   9 dynamic_loading, 10 file_io, 11 package_info, 12 crypto,
+#   13 webview, 14 system_settings, 15 account.
+# Keep id 0 as unknown/background. If extractor taxonomy changes, this table
+# and its regression test must change together.
 DEFAULT_API_TYPE_ID_TO_CATEGORY: dict[int, str] = {
-    1: "network",
+    1: "telephony",
     2: "sms",
     3: "location",
     4: "contacts",
-    5: "storage",
-    6: "telephony",
-    7: "camera_media",
-    8: "receiver",
-    9: "component_exposure",
-    10: "dynamic_loading",
-    11: "crypto",
-    12: "system_settings",
-    13: "dynamic_loading",
-    14: "crypto",
-    15: "system_settings",
+    5: "camera_media",
+    6: "network",
+    7: "dynamic_loading",
+    8: "dynamic_loading",
+    9: "dynamic_loading",
+    10: "storage",
+    11: "component_exposure",
+    12: "crypto",
+    13: "network",
+    14: "system_settings",
+    15: "contacts",
 }
 
 

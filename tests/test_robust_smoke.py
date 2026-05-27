@@ -10,12 +10,36 @@ from torch_geometric.data import Batch, Data
 from fusion.robust.dataset import RobustTriModalDataset, robust_collate_fn
 from fusion.robust.losses import compute_robust_loss
 from fusion.robust.model import TriModalRobustModel
+from fusion.robust.semantic_categories import CATEGORY_TO_INDEX, api_semantic_counts_from_type_ids
 from fusion.robust.perturbations import (
     apply_api_missing,
     apply_graph_missing,
     apply_manifest_missing,
     apply_manifest_permission_mask,
 )
+
+
+def test_api_type_id_mapping_matches_extractor_taxonomy():
+    expected = {
+        1: "telephony",
+        2: "sms",
+        3: "location",
+        4: "contacts",
+        5: "camera_media",
+        6: "network",
+        7: "dynamic_loading",
+        8: "dynamic_loading",
+        9: "dynamic_loading",
+        10: "storage",
+        11: "component_exposure",
+        12: "crypto",
+        13: "network",
+        14: "system_settings",
+        15: "contacts",
+    }
+    for type_id, category in expected.items():
+        counts = api_semantic_counts_from_type_ids(torch.tensor([type_id], dtype=torch.long))
+        assert counts[CATEGORY_TO_INDEX[category]].item() == 1.0
 
 
 def test_robust_model_forward_and_loss():
