@@ -1,0 +1,47 @@
+data:
+  # APK root must contain split subdirectories such as train/val/test.
+  apk_root: "D:/src"
+  # Final API+Graph+Manifest .pt files are written to out_root/<split>/<sha256>.pt.
+  out_root: "C:/pts_tri"
+  splits: ["train", "val", "test"]
+
+hyperparameters:
+  # Keep consistent with extract/extract_graph_api.py graph feature definition.
+  vocab_size: 256
+
+graph:
+  sensitive_hops: 1
+  use_behavior_hints: true
+  max_methods_per_dex: 4096
+  fallback_max_methods: 512
+  fallback_policy: api_rich
+
+api:
+  num_hash_buckets: 8192
+  max_events_per_dex: 1024
+  max_events_per_method: 32
+  event_scope: all_methods
+  framework_only: true
+  include_descriptor: false
+
+manifest:
+  # Built from train split only when rebuild_vocab=true or the file does not exist.
+  vocab_path: "config/manifest_vocab.yaml"
+  rebuild_vocab: false
+  manifest_dim: 256
+  max_permissions: 128
+  max_intents: 64
+  max_features: 32
+  save_manifest_jsonl: true
+  # Empty means out_root/_manifest_jsonl.
+  manifest_jsonl_dir: ""
+
+storage:
+  keep_method_names: false
+  keep_api_tokens: false
+
+execution:
+  workers: 4
+  resume: false
+  # Empty means out_root/failed_tri_modal_direct.json.
+  failed_json: ""

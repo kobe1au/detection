@@ -50,6 +50,12 @@ For an end-to-end APK to tri-modal `.pt` build, use:
 python scripts/build_tri_modal_pts.py --graph-config config/extract_graph_api.yaml --apk-root path/to/apks --graph-out-root path/to/pts_api_graph --tri-out-root path/to/pts_tri --rebuild-vocab
 ```
 
+For the direct builder with no intermediate API+Graph `.pt` files, use:
+
+```bash
+python scripts/build_tri_modal_pts_direct.py --config config/extract_tri_model.yaml --apk-root path/to/apks --out-root path/to/pts_tri --rebuild-vocab
+```
+
 After building `.pt` files, check semantic coverage before training:
 
 ```bash
