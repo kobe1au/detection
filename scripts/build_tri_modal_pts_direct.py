@@ -164,7 +164,8 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         "failed_json": str(execution.get("failed_json", "")),
     }
 
-    if "train" not in cfg["splits"] and (cfg["rebuild_vocab"] or not cfg["vocab_path"].exists()):
+    vocab_will_be_built = cfg["rebuild_vocab"] or not cfg["vocab_path"].exists()
+    if "train" not in cfg["splits"] and vocab_will_be_built:
         raise ValueError("train split is required when building Manifest vocab")
     if cfg["fallback_policy"] not in {"api_rich", "all_capped", "empty_dex"}:
         raise ValueError("graph.fallback_policy must be api_rich, all_capped, or empty_dex")
@@ -172,8 +173,11 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("api.event_scope must be all_methods or graph_methods")
     if cfg["workers"] <= 0:
         raise ValueError("execution.workers must be >= 1")
-    if cfg["rebuild_vocab"] and cfg["resume"]:
-        raise ValueError("rebuild_vocab=true is incompatible with resume=true; use --no-resume.")
+    if vocab_will_be_built and cfg["resume"]:
+        raise ValueError(
+            "Manifest vocab will be built/rebuilt, but resume=true may skip existing .pt files. "
+            "Use --no-resume when building/rebuilding vocab."
+        )
     return cfg
 
 
