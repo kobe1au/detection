@@ -6,3 +6,8 @@ train:
 
 model:
   fusion_mode: "tri_modal_fixed_gate"
+
+loss:
+  branch_aux_weight: 0.05
+  soft_consistency_weight: 0.0
+  gate_prior_weight: 0.0

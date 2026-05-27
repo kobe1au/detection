@@ -638,11 +638,14 @@ class TriModalRobustModel(nn.Module):
             extra["gate_evidence"] = evidence.detach()
             if self.fusion_mode == "tri_modal_fixed_gate":
                 gate_weights = torch.full((batch_size, 4), 0.25, device=device, dtype=dtype)
+                extra["gate_prior_enabled"] = False
             elif self.fusion_mode == "tri_modal_reliability_gate":
                 gate_weights = self._heuristic_reliability_gate(evidence).to(dtype=dtype)
+                extra["gate_prior_enabled"] = False
             else:
                 gate_input = evidence.detach() if self.gate_detach else evidence
                 gate_weights = self.gate_net(gate_input)
+                extra["gate_prior_enabled"] = True
             logits = (
                 gate_weights[:, 0:1] * api_logits
                 + gate_weights[:, 1:2] * graph_logits
@@ -652,6 +655,7 @@ class TriModalRobustModel(nn.Module):
 
         extra["gate_weights_train"] = gate_weights
         extra["gate_weights"] = gate_weights.detach()
+        extra.setdefault("gate_prior_enabled", False)
 
         if "api_confidence" not in extra:
             evidence, diagnostics = self._build_evidence(

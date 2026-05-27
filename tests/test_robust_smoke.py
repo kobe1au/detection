@@ -99,15 +99,18 @@ def test_robust_model_forward_and_loss():
         logits,
         torch.tensor([0, 1]),
         extra,
-        {"branch_aux_weight": 0.05, "soft_consistency_weight": 0.05},
+        {"branch_aux_weight": 0.05, "soft_consistency_weight": 0.05, "gate_prior_weight": 0.01},
     )
     assert logits.shape == (2, 2)
     assert extra["gate_weights"].shape == (2, 4)
+    assert extra["gate_prior_enabled"] is True
     assert extra["api_semantic_category_counts"].shape == (2, 12)
     assert extra["api_semantic_logits"].shape == (2, 12)
     assert torch.isfinite(loss)
     assert parts["branch_aux_weight"] == 0.05
     assert parts["soft_consistency_weight"] == 0.05
+    assert parts["gate_prior_weight"] == 0.01
+    assert parts["gate_prior"] >= 0.0
 
 
 def test_robust_dataset_collate(tmp_path: Path):
@@ -174,6 +177,29 @@ def test_heuristic_joint_gate_uses_manifest_reliability():
 
     weights = TriModalRobustModel._heuristic_reliability_gate(evidence)
     assert weights[0, 3] > weights[1, 3]
+
+
+def test_gate_prior_loss_only_applies_to_learned_gate():
+    logits = torch.zeros(2, 2, requires_grad=True)
+    labels = torch.tensor([0, 1], dtype=torch.long)
+    extra = {
+        "gate_weights_train": torch.full((2, 4), 0.25, requires_grad=True),
+        "r_api": torch.ones(2),
+        "r_graph": torch.zeros(2),
+        "r_manifest": torch.zeros(2),
+        "api_manifest_consistency": torch.zeros(2),
+        "graph_manifest_consistency": torch.zeros(2),
+        "api_alive": torch.ones(2),
+        "graph_alive": torch.ones(2),
+        "manifest_alive": torch.zeros(2),
+        "gate_prior_enabled": False,
+    }
+    _, disabled = compute_robust_loss(logits, labels, extra, {"gate_prior_weight": 0.01})
+    assert disabled["gate_prior"] == 0.0
+
+    extra["gate_prior_enabled"] = True
+    _, enabled = compute_robust_loss(logits, labels, extra, {"gate_prior_weight": 0.01})
+    assert enabled["gate_prior"] > 0.0
 
 
 def _perturbation_sample():

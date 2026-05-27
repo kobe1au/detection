@@ -88,18 +88,66 @@ def _soft_consistency_loss(extra: dict, ref_logits: torch.Tensor) -> torch.Tenso
     return torch.stack(terms).mean().to(dtype=ref_logits.dtype)
 
 
+def _gate_prior_target(extra: dict, ref_logits: torch.Tensor) -> torch.Tensor:
+    r_api = _reliability(extra, "r_api", ref_logits, 1.0).view(-1, 1)
+    r_graph = _reliability(extra, "r_graph", ref_logits, 1.0).view(-1, 1)
+    r_manifest = _reliability(extra, "r_manifest", ref_logits, 0.0).view(-1, 1)
+    api_manifest = _reliability(extra, "api_manifest_consistency", ref_logits, 0.0).view(-1, 1)
+    graph_manifest = _reliability(extra, "graph_manifest_consistency", ref_logits, 0.0).view(-1, 1)
+    api_alive = _reliability(extra, "api_alive", ref_logits, 1.0).view(-1, 1)
+    graph_alive = _reliability(extra, "graph_alive", ref_logits, 1.0).view(-1, 1)
+    manifest_alive = _reliability(extra, "manifest_alive", ref_logits, 0.0).view(-1, 1)
+
+    joint_score = (
+        (r_api * r_graph).sqrt()
+        * (0.5 + 0.25 * api_manifest + 0.25 * graph_manifest)
+        * (0.5 + 0.5 * r_manifest)
+    ).clamp(0.0, 1.0)
+    scores = torch.cat(
+        [
+            r_api * api_alive,
+            r_graph * graph_alive,
+            r_manifest * manifest_alive,
+            joint_score * api_alive.clamp_min(0.25) * graph_alive.clamp_min(0.25),
+        ],
+        dim=-1,
+    )
+    denom = scores.sum(dim=-1, keepdim=True)
+    target = scores / denom.clamp_min(1e-8)
+    fallback = torch.full_like(scores, 0.25)
+    return torch.where(denom > 1e-8, target, fallback).detach()
+
+
+def _gate_prior_loss(extra: dict, ref_logits: torch.Tensor) -> torch.Tensor:
+    if not bool(extra.get("gate_prior_enabled", False)):
+        return ref_logits.new_tensor(0.0)
+    gate_weights = extra.get("gate_weights_train")
+    if not isinstance(gate_weights, torch.Tensor):
+        return ref_logits.new_tensor(0.0)
+    gate_weights = gate_weights.to(device=ref_logits.device, dtype=ref_logits.dtype)
+    if gate_weights.ndim != 2 or gate_weights.size(0) != ref_logits.size(0) or gate_weights.size(1) != 4:
+        return ref_logits.new_tensor(0.0)
+    target = _gate_prior_target(extra, ref_logits).to(device=ref_logits.device, dtype=ref_logits.dtype)
+    return F.kl_div(
+        gate_weights.clamp_min(1e-8).log(),
+        target,
+        reduction="batchmean",
+    ).to(dtype=ref_logits.dtype)
+
+
 def compute_robust_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     extra: dict | None = None,
     loss_cfg: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Robust objective: CE(final) + branch auxiliary CE + optional soft category consistency."""
+    """Robust objective: CE(final) + branch CE + optional soft consistency/gate prior."""
     extra = extra or {}
     loss_cfg = loss_cfg or {}
     label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
     branch_aux_weight = float(loss_cfg.get("branch_aux_weight", 0.05))
     soft_consistency_weight = float(loss_cfg.get("soft_consistency_weight", 0.0))
+    gate_prior_weight = float(loss_cfg.get("gate_prior_weight", 0.0))
 
     ce = F.cross_entropy(logits, labels.long(), label_smoothing=label_smoothing)
     branch_loss = logits.new_tensor(0.0)
@@ -121,8 +169,18 @@ def compute_robust_loss(
         if soft_consistency_weight > 0.0
         else logits.new_tensor(0.0)
     )
+    gate_prior = (
+        _gate_prior_loss(extra, logits)
+        if gate_prior_weight > 0.0
+        else logits.new_tensor(0.0)
+    )
 
-    total = ce + branch_aux_weight * branch_loss + soft_consistency_weight * soft_loss
+    total = (
+        ce
+        + branch_aux_weight * branch_loss
+        + soft_consistency_weight * soft_loss
+        + gate_prior_weight * gate_prior
+    )
     return total, {
         "loss": float(total.detach().item()),
         "ce": float(ce.detach().item()),
@@ -130,4 +188,6 @@ def compute_robust_loss(
         "branch_aux_weight": branch_aux_weight,
         "soft_consistency": float(soft_loss.detach().item()),
         "soft_consistency_weight": soft_consistency_weight,
+        "gate_prior": float(gate_prior.detach().item()),
+        "gate_prior_weight": gate_prior_weight,
     }

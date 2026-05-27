@@ -29,6 +29,31 @@ from fusion.robust.utils import build_grad_scaler, get_amp_context
 logger = logging.getLogger("tri_modal_robust")
 
 
+GATE_DIAGNOSTIC_KEYS = (
+    "q_api",
+    "q_graph",
+    "q_manifest",
+    "q_align",
+    "pert_api",
+    "pert_graph",
+    "pert_manifest",
+    "r_api",
+    "r_graph",
+    "r_manifest",
+    "api_graph_consistency",
+    "api_manifest_consistency",
+    "graph_manifest_consistency",
+    "api_graph_disagreement",
+    "api_confidence",
+    "graph_confidence",
+    "manifest_confidence",
+    "joint_confidence",
+    "api_alive",
+    "graph_alive",
+    "manifest_alive",
+)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -232,18 +257,7 @@ def evaluate(model, loader, device, use_amp: bool, split_name: str, dump_rows: b
                         "w_manifest": float(gate_i[2].item()),
                         "w_joint": float(gate_i[3].item()),
                     })
-                for key in (
-                    "q_manifest",
-                    "pert_manifest",
-                    "api_manifest_consistency",
-                    "graph_manifest_consistency",
-                    "api_graph_consistency",
-                    "api_graph_disagreement",
-                    "api_confidence",
-                    "graph_confidence",
-                    "manifest_confidence",
-                    "joint_confidence",
-                ):
+                for key in GATE_DIAGNOSTIC_KEYS:
                     value = extra.get(key)
                     if isinstance(value, torch.Tensor) and value.numel() > i:
                         row[key] = float(value.view(-1)[i].detach().cpu().item())
