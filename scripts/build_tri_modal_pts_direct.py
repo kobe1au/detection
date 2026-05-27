@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import zipfile
@@ -58,6 +59,46 @@ def _collect_apks(apk_root: Path, splits: list[str]) -> list[dict[str, str]]:
                 }
             )
     return jobs
+
+
+def _split_counts(jobs: list[dict[str, str]], splits: list[str]) -> dict[str, int]:
+    counts = {split: 0 for split in splits}
+    for job in jobs:
+        counts[job["split"]] = counts.get(job["split"], 0) + 1
+    return counts
+
+
+def _validate_split_counts(split_counts: dict[str, int]) -> None:
+    empty = [split for split, count in split_counts.items() if count <= 0]
+    if empty:
+        raise RuntimeError(f"No APK files found for configured splits: {empty}")
+
+
+def _index_row(
+    job: dict[str, str],
+    out_path: Path,
+    status: str,
+    reason: str = "",
+) -> dict[str, str]:
+    apk_path = Path(job["apk_path"])
+    return {
+        "split": job["split"],
+        "sha256": job["sha256"],
+        "apk_name": apk_path.name,
+        "apk_path": str(apk_path),
+        "pt_path": str(out_path),
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _write_index_csv(rows: list[dict[str, str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["split", "sha256", "apk_name", "apk_path", "pt_path", "status", "reason"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _write_manifest_jsonl(records: dict[str, dict[str, Any]], path: Path) -> None:
@@ -131,6 +172,8 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("api.event_scope must be all_methods or graph_methods")
     if cfg["workers"] <= 0:
         raise ValueError("execution.workers must be >= 1")
+    if cfg["rebuild_vocab"] and cfg["resume"]:
+        raise ValueError("rebuild_vocab=true is incompatible with resume=true; use --no-resume.")
     return cfg
 
 
@@ -198,12 +241,12 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
     out_dir = Path(cfg["out_root"]) / split
     out_path = out_dir / f"{sha}.pt"
     if cfg["resume"] and out_path.exists():
-        return True, split, apk_path.name, ""
+        return True, _index_row(job, out_path, "ok", "resumed_existing_pt")
 
     try:
         dex_entries = list_dex_entries(apk_path)
         if not dex_entries:
-            return False, split, apk_path.name, "no classes*.dex"
+            return False, _index_row(job, out_path, "failed", "no classes*.dex")
 
         dex_list: list[dict[str, Any]] = []
         dex_failures: list[dict[str, str]] = []
@@ -250,7 +293,7 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
                     dex_failures.append({"dex": dex_name, "reason": f"{type(exc).__name__}: {exc}"})
 
         if not dex_list:
-            return False, split, apk_path.name, f"all dex entries failed: {dex_failures[:3]}"
+            return False, _index_row(job, out_path, "failed", f"all dex entries failed: {dex_failures[:3]}")
 
         payload = _manifest_payload(record, vocab, cfg)
         output = {
@@ -267,9 +310,9 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
             **payload,
         }
         atomic_torch_save(output, out_path)
-        return True, split, apk_path.name, ""
+        return True, _index_row(job, out_path, "ok")
     except Exception as exc:
-        return False, split, apk_path.name, f"{type(exc).__name__}: {exc}"
+        return False, _index_row(job, out_path, "failed", f"{type(exc).__name__}: {exc}")
 
 
 def _worker(args):
@@ -279,9 +322,7 @@ def _worker(args):
 
 def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     jobs = _collect_apks(cfg["apk_root"], cfg["splits"])
-    split_counts = {split: 0 for split in cfg["splits"]}
-    for job in jobs:
-        split_counts[job["split"]] = split_counts.get(job["split"], 0) + 1
+    split_counts = _split_counts(jobs, cfg["splits"])
 
     print(
         json.dumps(
@@ -299,10 +340,9 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
         ),
         flush=True,
     )
+    _validate_split_counts(split_counts)
     if dry_run:
         return {"ok": 0, "fail": 0, "dry_run": True, "split_counts": split_counts}
-    if not jobs:
-        return {"ok": 0, "fail": 0, "failed": [], "split_counts": split_counts}
 
     manifest_records = _extract_manifest_records(jobs, cfg)
     vocab = _build_or_load_vocab(jobs, manifest_records, cfg)
@@ -313,33 +353,40 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     ]
     ok = 0
     fail = 0
-    failed: list[dict[str, str]] = []
+    index_rows: list[dict[str, str]] = []
 
     if cfg["workers"] == 1:
         iterator = tqdm(tasks, desc="build tri-modal .pt", unit="apk")
         for task in iterator:
-            succ, split, apk_name, err = _worker(task)
+            succ, row = _worker(task)
+            index_rows.append(row)
             if succ:
                 ok += 1
             else:
                 fail += 1
-                failed.append({"split": split, "apk": apk_name, "reason": err})
     else:
         with ProcessPoolExecutor(max_workers=cfg["workers"]) as ex:
             future_map = {ex.submit(_worker, task): task[0] for task in tasks}
             for fut in tqdm(as_completed(future_map), total=len(future_map), desc="build tri-modal .pt", unit="apk"):
                 job = future_map[fut]
                 try:
-                    succ, split, apk_name, err = fut.result()
+                    succ, row = fut.result()
                 except Exception as exc:
-                    succ, split, apk_name = False, job["split"], Path(job["apk_path"]).name
-                    err = f"{type(exc).__name__}: {exc}"
+                    out_path = Path(cfg["out_root"]) / job["split"] / f"{job['sha256']}.pt"
+                    succ = False
+                    row = _index_row(job, out_path, "failed", f"{type(exc).__name__}: {exc}")
+                index_rows.append(row)
                 if succ:
                     ok += 1
                 else:
                     fail += 1
-                    failed.append({"split": split, "apk": apk_name, "reason": err})
 
+    index_rows.sort(key=lambda row: (row["split"], row["sha256"], row["apk_name"]))
+    index_path = Path(cfg["out_root"]) / "tri_modal_pt_index.csv"
+    _write_index_csv(index_rows, index_path)
+    print(f"index -> {index_path}", flush=True)
+
+    failed = [row for row in index_rows if row["status"] != "ok"]
     if failed:
         failed_path = Path(cfg["failed_json"]) if cfg["failed_json"] else Path(cfg["out_root"]) / "failed_tri_modal_direct.json"
         failed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,8 +430,11 @@ def main() -> None:
     if args.rebuild_vocab:
         raw.setdefault("manifest", {})["rebuild_vocab"] = True
 
-    cfg = _parse_config(raw)
-    run(cfg, dry_run=args.dry_run)
+    try:
+        cfg = _parse_config(raw)
+        run(cfg, dry_run=args.dry_run)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":

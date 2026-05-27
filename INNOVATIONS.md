@@ -56,6 +56,8 @@ For the direct builder with no intermediate API+Graph `.pt` files, use:
 python scripts/build_tri_modal_pts_direct.py --config config/extract_tri_model.yaml --apk-root path/to/apks --out-root path/to/pts_tri --rebuild-vocab
 ```
 
+The direct builder writes `tri_modal_pt_index.csv` under `out-root` with `split, sha256, apk_name, apk_path, pt_path, status, reason`, which should be used when merging labels into train/val/test CSVs.
+
 After building `.pt` files, check semantic coverage before training:
 
 ```bash

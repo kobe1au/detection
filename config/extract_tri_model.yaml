@@ -42,6 +42,7 @@ storage:
 
 execution:
   workers: 4
+  # rebuild_vocab=true is intentionally incompatible with resume=true.
   resume: false
   # Empty means out_root/failed_tri_modal_direct.json.
   failed_json: ""
