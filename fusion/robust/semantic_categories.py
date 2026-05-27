@@ -77,3 +77,34 @@ def api_semantic_counts_from_type_ids(
             counts[category_idx] += 1.0
     return counts
 
+
+def graph_semantic_counts_from_method_api_edges(
+    api_type_ids: torch.Tensor | None,
+    method_api_edge_index: torch.Tensor | None,
+    *,
+    mapping: Mapping[int, str] | None = None,
+) -> torch.Tensor:
+    """Aggregate API semantic categories carried by graph-aligned methods.
+
+    The graph branch is structural, so its semantic category distribution is
+    derived only from API events that are anchored to a graph method through
+    `method_api_edge_index`. This gives Graph-Manifest consistency a real
+    structural-context basis instead of reusing the full API histogram.
+    """
+    counts = torch.zeros((SEMANTIC_CATEGORY_DIM,), dtype=torch.float32)
+    if (
+        not isinstance(api_type_ids, torch.Tensor)
+        or not isinstance(method_api_edge_index, torch.Tensor)
+        or method_api_edge_index.ndim != 2
+        or method_api_edge_index.size(0) != 2
+        or api_type_ids.numel() == 0
+        or method_api_edge_index.numel() == 0
+    ):
+        return counts
+
+    api_idx = method_api_edge_index[1].detach().long().view(-1).cpu()
+    valid = (api_idx >= 0) & (api_idx < int(api_type_ids.numel()))
+    if not valid.any():
+        return counts
+    aligned_types = api_type_ids.detach().long().view(-1).cpu()[api_idx[valid]]
+    return api_semantic_counts_from_type_ids(aligned_types, mapping=mapping)

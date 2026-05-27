@@ -10,4 +10,3 @@ model:
 loss:
   branch_aux_weight: 0.05
   soft_consistency_weight: 0.05
-  clean_corrupted_kl_weight: 0.0

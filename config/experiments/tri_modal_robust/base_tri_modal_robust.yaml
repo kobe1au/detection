@@ -73,7 +73,6 @@ train:
 loss:
   branch_aux_weight: 0.05
   soft_consistency_weight: 0.0
-  clean_corrupted_kl_weight: 0.0
 
 robust:
   train_aug: true

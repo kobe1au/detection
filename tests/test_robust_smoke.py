@@ -133,6 +133,7 @@ def test_robust_dataset_collate(tmp_path: Path):
     assert graph.api_semantic_category_counts.shape == (1, 12)
     assert graph.graph_semantic_category_counts.shape == (1, 12)
     assert graph.api_category_counts.shape == (1, 12)
+    assert graph.graph_semantic_category_counts.sum().item() == 2.0
 
 
 def test_heuristic_joint_gate_uses_manifest_reliability():

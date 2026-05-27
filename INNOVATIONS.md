@@ -44,6 +44,12 @@ python scripts/build_manifest_vocab_from_train.py --train-manifest-jsonl path/to
 
 `scripts/augment_pts_with_manifest.py --build-vocab` is guarded so it only runs with `--split train` and an explicit `--train-jsonl-for-vocab`; val/test augmentation must load an existing train-built vocab.
 
+For an end-to-end APK to tri-modal `.pt` build, use:
+
+```bash
+python scripts/build_tri_modal_pts.py --graph-config config/extract_graph_api.yaml --apk-root path/to/apks --graph-out-root path/to/pts_api_graph --tri-out-root path/to/pts_tri --rebuild-vocab
+```
+
 ## Robust Fusion
 
 The model uses four decision branches:

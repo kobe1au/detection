@@ -18,6 +18,7 @@ from fusion.robust.perturbations import (
 from fusion.robust.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
     api_semantic_counts_from_type_ids,
+    graph_semantic_counts_from_method_api_edges,
     sanitize_semantic_counts,
 )
 
@@ -385,6 +386,10 @@ class RobustTriModalDataset(Dataset):
         q_graph = self._graph_quality(edge_index, int(x.size(0)), sensitive_mask)
         q_align = self._align_quality(q_api, q_graph, final_method_edges, int(x.size(0)), int(final_api_ids.numel()))
         api_semantic_counts = self._api_semantic_category_counts(final_api_types)
+        graph_semantic_counts = graph_semantic_counts_from_method_api_edges(
+            final_api_types,
+            final_method_edges,
+        )
         return {
             "x": x,
             "edge_index": edge_index,
@@ -397,6 +402,8 @@ class RobustTriModalDataset(Dataset):
             "method_api_edge_index": final_method_edges,
             "api_semantic_category_counts": api_semantic_counts,
             "api_category_counts": api_semantic_counts,
+            "graph_semantic_category_counts": graph_semantic_counts,
+            "graph_category_counts": graph_semantic_counts,
             "q_api": q_api,
             "q_graph": q_graph,
             "q_align": q_align,
@@ -487,7 +494,15 @@ class RobustTriModalDataset(Dataset):
             data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
-            data.update(self._manifest_payload(sources))
+            graph_counts_from_alignment = data.get("graph_semantic_category_counts")
+            manifest_payload = self._manifest_payload(sources)
+            data.update(manifest_payload)
+            if (
+                isinstance(graph_counts_from_alignment, torch.Tensor)
+                and graph_counts_from_alignment.abs().sum().item() > 0
+            ):
+                data["graph_semantic_category_counts"] = graph_counts_from_alignment
+                data["graph_category_counts"] = graph_counts_from_alignment
             data["degrade_category_counts"] = self.degrade_category_counts
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)

@@ -24,6 +24,8 @@ The .pt content is a list, one dict per dex:
     "api_in_graph_mask": UInt8Tensor [T],
     "method_api_edge_index": Int32Tensor [2, K],
     "api_category_counts": Float16Tensor [C],
+    "api_semantic_category_counts": Float16Tensor [12],
+    "graph_semantic_category_counts": Float16Tensor [12],
 
     "meta": {...}
   }
@@ -64,6 +66,12 @@ try:
 except Exception:  # pragma: no cover - androguard version compatibility
     Analysis = None
 from androguard.core.dex import DEX
+
+from fusion.robust.semantic_categories import (
+    SEMANTIC_CATEGORIES,
+    api_semantic_counts_from_type_ids,
+    graph_semantic_counts_from_method_api_edges,
+)
 
 warnings.filterwarnings("ignore")
 logging.getLogger("androguard").setLevel(logging.CRITICAL)
@@ -565,6 +573,8 @@ def _empty_dex_result(
         "api_in_graph_mask": torch.empty((0,), dtype=torch.uint8),
         "method_api_edge_index": torch.empty((2, 0), dtype=torch.int32),
         "api_category_counts": torch.zeros((len(API_CATEGORY_NAMES),), dtype=torch.float16),
+        "api_semantic_category_counts": torch.zeros((len(SEMANTIC_CATEGORIES),), dtype=torch.float16),
+        "graph_semantic_category_counts": torch.zeros((len(SEMANTIC_CATEGORIES),), dtype=torch.float16),
         "meta": {
             "empty_reason": reason,
             "graph": {
@@ -599,7 +609,9 @@ def _empty_dex_result(
                 "num_api_buckets": 0,
                 "num_api_categories": len(API_CATEGORY_NAMES),
                 "api_category_names": API_CATEGORY_NAMES,
+                "semantic_category_names": list(SEMANTIC_CATEGORIES),
                 "api_category_counts_source": "empty_dex",
+                "graph_semantic_category_counts_source": "empty_dex",
                 "hash_collision_scope": "empty_dex",
                 "api_event_scope": "",
                 "framework_only": True,
@@ -622,6 +634,8 @@ def _empty_dex_result(
                 "api_in_graph_mask": "uint8",
                 "method_api_edge_index": "int32",
                 "api_category_counts": "float16",
+                "api_semantic_category_counts": "float16",
+                "graph_semantic_category_counts": "float16",
             },
         },
     }
@@ -855,6 +869,12 @@ def build_graph_api_for_dex(
     if total > 0:
         counts /= total
 
+    api_semantic_counts = api_semantic_counts_from_type_ids(api_type_ids.long())
+    graph_semantic_counts = graph_semantic_counts_from_method_api_edges(
+        api_type_ids.long(),
+        method_api_edge_index.long(),
+    )
+
     result: Dict[str, Any] = {
         "call_x": torch.from_numpy(x_np).to(torch.float16),
         "call_edge_index": edge_index.contiguous(),
@@ -868,6 +888,8 @@ def build_graph_api_for_dex(
         "api_in_graph_mask": api_in_graph_mask,
         "method_api_edge_index": method_api_edge_index,
         "api_category_counts": torch.from_numpy(counts).to(torch.float16),
+        "api_semantic_category_counts": api_semantic_counts.to(torch.float16),
+        "graph_semantic_category_counts": graph_semantic_counts.to(torch.float16),
 
         "meta": {
             "graph": {
@@ -902,7 +924,10 @@ def build_graph_api_for_dex(
                 "num_api_buckets": int(num_api_buckets),
                 "num_api_categories": int(len(API_CATEGORY_NAMES)),
                 "api_category_names": API_CATEGORY_NAMES,
+                "semantic_category_names": list(SEMANTIC_CATEGORIES),
                 "api_category_counts_source": "kept_events_after_truncation",
+                "api_semantic_category_counts_source": "api_type_id_to_12d_semantic_taxonomy",
+                "graph_semantic_category_counts_source": "method_api_edge_index_aligned_api_events",
                 "hash_collision_scope": "per_dex_after_truncation", 
                 "api_event_scope": scope,
                 "framework_only": bool(framework_only),
@@ -925,6 +950,8 @@ def build_graph_api_for_dex(
                 "api_in_graph_mask": "uint8",
                 "method_api_edge_index": "int32",
                 "api_category_counts": "float16",
+                "api_semantic_category_counts": "float16",
+                "graph_semantic_category_counts": "float16",
             },
         },
     }
