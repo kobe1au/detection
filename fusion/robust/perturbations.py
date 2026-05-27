@@ -60,14 +60,80 @@ def _clamp_strength(strength: float) -> float:
     return max(0.0, min(1.0, float(strength)))
 
 
+def _scalar_float(value, default: float = 0.0) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return float(default)
+        return float(value.detach().float().view(-1)[0].item())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _set_min_pert(data: dict, key: str, strength: float) -> None:
-    current = float(data.get(key, 0.0) or 0.0)
+    current = _scalar_float(data.get(key), 0.0)
     data[key] = max(current, _clamp_strength(strength))
 
 
 def _degrade_quality(data: dict, key: str, strength: float) -> None:
-    q = float(data.get(key, 1.0) or 0.0)
+    q = _scalar_float(data.get(key), 1.0)
     data[key] = max(0.0, min(1.0, q * (1.0 - _clamp_strength(strength))))
+
+
+def refresh_align_quality_after_code_perturb(data: dict) -> None:
+    q_api = _scalar_float(data.get("q_api"), 0.0)
+    q_graph = _scalar_float(data.get("q_graph"), 0.0)
+    pert_api = _scalar_float(data.get("pert_api"), 0.0)
+    pert_graph = _scalar_float(data.get("pert_graph"), 0.0)
+    old = _scalar_float(data.get("q_align"), 0.0)
+    code_alive = min(max(q_api, 0.0), max(q_graph, 0.0))
+    code_pert = max(_clamp_strength(pert_api), _clamp_strength(pert_graph))
+    data["q_align"] = max(0.0, min(old, code_alive)) * (1.0 - code_pert)
+
+
+def _should_degrade_category_counts(data: dict) -> bool:
+    return bool(data.get("degrade_category_counts", True))
+
+
+def degrade_category_counts(data: dict, key: str, strength: float, mode: str) -> None:
+    if not _should_degrade_category_counts(data):
+        return
+    counts = data.get(key)
+    if not isinstance(counts, torch.Tensor) or counts.numel() == 0:
+        return
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return
+    out = counts.clone()
+    flat = out.view(-1)
+    n = min(flat.numel(), max(1, int(round(flat.numel() * strength))))
+    if mode == "mask":
+        idx = torch.randperm(flat.numel(), device=flat.device)[:n]
+        flat[idx] = 0.0
+    elif mode == "inject":
+        idx = torch.randperm(flat.numel(), device=flat.device)[:n]
+        flat[idx] = flat[idx] + 1.0
+    elif mode == "noise":
+        out = (out.float() + torch.randn_like(out.float()) * strength).clamp_min(0.0).to(dtype=counts.dtype)
+    elif mode == "scale":
+        out = (out.float() * (1.0 - strength)).clamp_min(0.0).to(dtype=counts.dtype)
+    else:
+        raise ValueError(f"Unsupported category count degradation mode: {mode}")
+    data[key] = out
+
+
+def degrade_manifest_counts(data: dict, strength: float, mode: str) -> None:
+    degrade_category_counts(data, "manifest_category_counts", strength, mode)
+
+
+def degrade_graph_counts(data: dict, strength: float) -> None:
+    degrade_category_counts(data, "graph_semantic_category_counts", strength, "scale")
+    graph_semantic = data.get("graph_semantic_category_counts")
+    if isinstance(graph_semantic, torch.Tensor):
+        data["graph_category_counts"] = graph_semantic
+    else:
+        degrade_category_counts(data, "graph_category_counts", strength, "scale")
 
 
 def _zero_tensor_like(value):
@@ -137,6 +203,7 @@ def apply_api_event_dropout(data: dict, strength: float, sensitive_only: bool = 
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_sensitive_event_dropout" if sensitive_only else "api_event_dropout"
     recompute_api_category_counts(data)
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -157,6 +224,7 @@ def apply_api_category_dropout(data: dict, strength: float) -> dict:
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_category_dropout"
     recompute_api_category_counts(data)
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -174,6 +242,7 @@ def apply_api_feature_noise(data: dict, strength: float) -> dict:
     _degrade_quality(data, "q_api", 0.5 * strength)
     _set_min_pert(data, "pert_api", strength)
     data["api_aug_type"] = "api_feature_noise"
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -205,6 +274,7 @@ def apply_api_missing(data: dict) -> dict:
     data["q_api"] = 0.0
     data["pert_api"] = 1.0
     data["api_aug_type"] = "modality_dropout_api"
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -213,6 +283,8 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
     if not isinstance(edge, torch.Tensor) or edge.ndim != 2 or edge.size(1) == 0:
         _degrade_quality(data, "q_graph", 1.0)
         _set_min_pert(data, "pert_graph", 1.0)
+        degrade_graph_counts(data, 1.0)
+        refresh_align_quality_after_code_perturb(data)
         return data
     strength = _clamp_strength(strength)
     keep = torch.rand(edge.size(1), device=edge.device) > strength
@@ -223,6 +295,8 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
     _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_sparsify"
+    degrade_graph_counts(data, actual)
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -248,6 +322,8 @@ def apply_graph_local_break(data: dict, strength: float) -> dict:
     _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_local_break"
+    degrade_graph_counts(data, actual)
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -266,6 +342,8 @@ def apply_graph_feature_obfuscation(data: dict, strength: float) -> dict:
     _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_feature_obfuscation"
+    degrade_graph_counts(data, actual)
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -284,6 +362,8 @@ def apply_graph_node_feature_mask(data: dict, strength: float) -> dict:
     _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_node_feature_mask"
+    degrade_graph_counts(data, actual)
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -306,6 +386,7 @@ def apply_graph_missing(data: dict) -> dict:
     data["q_graph"] = 0.0
     data["pert_graph"] = 1.0
     data["graph_aug_type"] = "modality_dropout_graph"
+    refresh_align_quality_after_code_perturb(data)
     return data
 
 
@@ -352,6 +433,7 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
         ids_new = ids.clone()
         ids_new[idx] = 0
         data["manifest_permission_ids"] = ids_new
+    degrade_manifest_counts(data, strength, "mask")
     _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_permission_mask"
@@ -365,6 +447,7 @@ def apply_manifest_permission_injection(data: dict, strength: float) -> dict:
         pos = _choose_vector_positions(vec, strength, 0, perm_dim)
         if pos.numel() > 0:
             data["manifest_x"] = _inject_vector_positions(vec, pos)
+    degrade_manifest_counts(data, strength, "inject")
     _degrade_quality(data, "q_manifest", 0.5 * _clamp_strength(strength))
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_permission_injection"
@@ -386,6 +469,7 @@ def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
         ids_new = ids.clone()
         ids_new[idx] = 0
         data["manifest_intent_ids"] = ids_new
+    degrade_manifest_counts(data, strength, "mask")
     _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_intent_mask"
@@ -407,6 +491,7 @@ def apply_manifest_component_mask(data: dict, strength: float) -> dict:
         pos = _choose_vector_positions(vec, strength, start, vec.size(-1))
         if pos.numel() > 0:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
+    degrade_manifest_counts(data, strength, "mask")
     _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_component_mask"
@@ -418,6 +503,7 @@ def apply_manifest_feature_noise(data: dict, strength: float) -> dict:
     if isinstance(vec, torch.Tensor) and vec.numel() > 0:
         noise = torch.randn_like(vec.float()) * (0.05 + 0.20 * _clamp_strength(strength))
         data["manifest_x"] = (vec.float() + noise).clamp(0.0, 1.0)
+    degrade_manifest_counts(data, strength, "noise")
     _degrade_quality(data, "q_manifest", 0.5 * _clamp_strength(strength))
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_feature_noise"

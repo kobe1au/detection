@@ -10,6 +10,12 @@ from torch_geometric.data import Batch, Data
 from fusion.robust.dataset import RobustTriModalDataset, robust_collate_fn
 from fusion.robust.losses import compute_robust_loss
 from fusion.robust.model import TriModalRobustModel
+from fusion.robust.perturbations import (
+    apply_api_missing,
+    apply_graph_missing,
+    apply_manifest_missing,
+    apply_manifest_permission_mask,
+)
 
 
 def test_robust_model_forward_and_loss():
@@ -143,3 +149,85 @@ def test_heuristic_joint_gate_uses_manifest_reliability():
 
     weights = TriModalRobustModel._heuristic_reliability_gate(evidence)
     assert weights[0, 3] > weights[1, 3]
+
+
+def _perturbation_sample():
+    return {
+        "api_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+        "api_type_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+        "api_sensitive_mask": torch.ones(3),
+        "api_method_index": torch.tensor([0, 1, 2], dtype=torch.long),
+        "api_in_graph_mask": torch.ones(3),
+        "method_api_edge_index": torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long),
+        "mask": torch.ones(3, 3),
+        "api_semantic_category_counts": torch.ones(12),
+        "api_category_counts": torch.ones(12),
+        "x": torch.randn(3, 8),
+        "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        "sensitive_mask": torch.ones(3, dtype=torch.uint8),
+        "graph_semantic_category_counts": torch.ones(12),
+        "graph_category_counts": torch.ones(12),
+        "manifest_x": torch.ones(16),
+        "manifest_permission_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+        "manifest_intent_ids": torch.tensor([1, 2], dtype=torch.long),
+        "manifest_category_counts": torch.ones(12),
+        "manifest_stats": torch.ones(11),
+        "q_api": 1.0,
+        "q_graph": 1.0,
+        "q_manifest": 1.0,
+        "q_align": 0.8,
+        "pert_api": 0.0,
+        "pert_graph": 0.0,
+        "pert_manifest": 0.0,
+        "degrade_category_counts": True,
+    }
+
+
+def test_api_missing_sets_q_align_zero():
+    data = apply_api_missing(_perturbation_sample())
+    assert data["q_api"] == 0.0
+    assert data["pert_api"] == 1.0
+    assert data["q_align"] == 0.0
+
+
+def test_graph_missing_sets_q_align_zero():
+    data = apply_graph_missing(_perturbation_sample())
+    assert data["q_graph"] == 0.0
+    assert data["pert_graph"] == 1.0
+    assert data["q_align"] == 0.0
+
+
+def test_manifest_permission_mask_changes_manifest_category_counts():
+    data = _perturbation_sample()
+    before = data["manifest_category_counts"].clone()
+    data = apply_manifest_permission_mask(data, 0.5)
+    assert not torch.equal(before, data["manifest_category_counts"])
+
+
+def test_manifest_missing_zeroes_manifest_counts_and_q_manifest():
+    data = apply_manifest_missing(_perturbation_sample())
+    assert data["manifest_category_counts"].sum().item() == 0.0
+    assert data["q_manifest"] == 0.0
+    assert data["pert_manifest"] == 1.0
+
+
+def test_soft_consistency_loss_nonzero_when_weight_enabled():
+    logits = torch.zeros(2, 2, requires_grad=True)
+    labels = torch.tensor([0, 1], dtype=torch.long)
+    counts = torch.zeros(2, 12)
+    counts[:, 0] = 1.0
+    extra = {
+        "api_semantic_logits": torch.zeros(2, 12, requires_grad=True),
+        "graph_semantic_logits": torch.zeros(2, 12, requires_grad=True),
+        "manifest_semantic_logits": torch.zeros(2, 12, requires_grad=True),
+        "api_semantic_category_counts": counts,
+        "graph_semantic_category_counts": counts,
+        "manifest_category_counts": counts,
+        "r_api": torch.ones(2),
+        "r_graph": torch.ones(2),
+        "r_manifest": torch.ones(2),
+    }
+    loss, parts = compute_robust_loss(logits, labels, extra, {"soft_consistency_weight": 0.05})
+    assert parts["soft_consistency"] > 0.0
+    loss.backward()
+    assert extra["api_semantic_logits"].grad is not None

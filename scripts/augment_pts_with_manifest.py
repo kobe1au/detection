@@ -58,7 +58,8 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True, help="Output .pt directory.")
     parser.add_argument("--vocab", required=True, help="Manifest vocab YAML. Build it only on train set.")
     parser.add_argument("--split", required=True, choices=["train", "val", "test", "extra"], help="Dataset split being augmented.")
-    parser.add_argument("--build-vocab", action="store_true", help="Build vocab from this JSONL before vectorizing.")
+    parser.add_argument("--build-vocab", action="store_true", help="Build vocab from --train-jsonl-for-vocab before vectorizing.")
+    parser.add_argument("--train-jsonl-for-vocab", default="", help="Train Manifest JSONL used only when --build-vocab is set.")
     parser.add_argument("--max-permissions", type=int, default=128)
     parser.add_argument("--max-intents", type=int, default=64)
     parser.add_argument("--max-features", type=int, default=32)
@@ -73,15 +74,18 @@ def main() -> None:
     if args.build_vocab:
         if args.split != "train":
             raise SystemExit("--build-vocab is only allowed with --split train to prevent val/test vocabulary leakage.")
+        if not args.train_jsonl_for_vocab:
+            raise SystemExit("--build-vocab requires --train-jsonl-for-vocab; do not build vocab from --manifest-jsonl implicitly.")
+        vocab_records = read_manifest_jsonl(args.train_jsonl_for_vocab)
         vocab = build_manifest_vocab(
-            records.values(),
+            vocab_records.values(),
             max_permissions=args.max_permissions,
             max_intents=args.max_intents,
             max_features=args.max_features,
         )
         vocab["metadata"] = {
             "source_split": "train",
-            "source_manifest_jsonl": str(Path(args.manifest_jsonl)),
+            "source_manifest_jsonl": str(Path(args.train_jsonl_for_vocab)),
             "leakage_guard": "train_only",
         }
         save_manifest_vocab(vocab, args.vocab)

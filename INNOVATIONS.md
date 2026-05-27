@@ -42,7 +42,7 @@ Build Manifest vocabularies from train Manifest JSONL only:
 python scripts/build_manifest_vocab_from_train.py --train-manifest-jsonl path/to/train_manifest.jsonl --vocab config/manifest_vocab.yaml
 ```
 
-`scripts/augment_pts_with_manifest.py --build-vocab` is guarded so it only runs with `--split train`; val/test augmentation must load an existing train-built vocab.
+`scripts/augment_pts_with_manifest.py --build-vocab` is guarded so it only runs with `--split train` and an explicit `--train-jsonl-for-vocab`; val/test augmentation must load an existing train-built vocab.
 
 ## Robust Fusion
 

@@ -96,6 +96,7 @@ class RobustTriModalDataset(Dataset):
         manifest_permission_dim: int = 128,
         manifest_intent_dim: int = 64,
         drop_graph_behavior_hints: bool = False,
+        degrade_category_counts: bool = True,
         **_unused,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
@@ -121,6 +122,7 @@ class RobustTriModalDataset(Dataset):
         self.manifest_permission_dim = int(manifest_permission_dim)
         self.manifest_intent_dim = int(manifest_intent_dim)
         self.drop_graph_behavior_hints = bool(drop_graph_behavior_hints)
+        self.degrade_category_counts = bool(degrade_category_counts)
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -486,6 +488,7 @@ class RobustTriModalDataset(Dataset):
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
             data.update(self._manifest_payload(sources))
+            data["degrade_category_counts"] = self.degrade_category_counts
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)
                 data = apply_perturbation(data, perturb_type, strength)

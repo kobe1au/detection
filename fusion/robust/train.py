@@ -120,6 +120,7 @@ def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | Non
         manifest_intent_dim=int(manifest_cfg.get("intent_dim", 64)),
         max_api_events_per_sample=data_cfg.get("max_api_events_per_sample"),
         drop_graph_behavior_hints=bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
+        degrade_category_counts=bool(robust_cfg.get("degrade_category_counts", True)),
     )
 
 
@@ -370,16 +371,22 @@ def run(cfg: dict) -> dict[str, Any]:
     robust_results = {}
     eval_cfg = cfg.get("eval", {})
     perturb_tests = list(eval_cfg.get("perturb_tests", ["clean"]))
-    perturb_strength = float(eval_cfg.get("perturb_strength", 0.5))
+    if eval_cfg.get("perturb_strengths") is not None:
+        perturb_strengths = [float(v) for v in eval_cfg.get("perturb_strengths") or []]
+    else:
+        perturb_strengths = [float(eval_cfg.get("perturb_strength", 0.5))]
+    perturb_strengths = perturb_strengths or [0.5]
     for perturb in perturb_tests:
         if perturb == "clean":
             robust_results[perturb] = test_metrics
             continue
-        robust_ds = build_dataset(cfg, "test", is_train=False, perturb_type=perturb, perturb_strength=perturb_strength)
-        robust_loader = build_loader(cfg, robust_ds, is_train=False)
-        metrics, rows = evaluate(model, robust_loader, device, use_amp, f"test_{perturb}", dump_rows=True)
-        robust_results[perturb] = metrics
-        all_rows.extend(rows)
+        for strength in perturb_strengths:
+            result_key = perturb if len(perturb_strengths) == 1 else f"{perturb}_s{strength:g}"
+            robust_ds = build_dataset(cfg, "test", is_train=False, perturb_type=perturb, perturb_strength=strength)
+            robust_loader = build_loader(cfg, robust_ds, is_train=False)
+            metrics, rows = evaluate(model, robust_loader, device, use_amp, f"test_{result_key}", dump_rows=True)
+            robust_results[result_key] = metrics
+            all_rows.extend(rows)
 
     write_gate_dump(out_dir / "gate_diagnostics.csv", all_rows)
     summary = {"best_val_f1": best_f1, "val": val_metrics, "test": test_metrics, "robust": robust_results}

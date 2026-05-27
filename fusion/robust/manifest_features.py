@@ -368,7 +368,7 @@ def vectorize_manifest_record(
 
 def read_manifest_jsonl(path: str | Path) -> dict[str, dict[str, Any]]:
     records = {}
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line:
