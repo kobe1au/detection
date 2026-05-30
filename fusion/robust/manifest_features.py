@@ -381,7 +381,7 @@ def vectorize_manifest_record(
     has_manifest = not bool(record.get("parse_error")) and (
         len(permissions) + len(intents) + len(features) + int(record.get("component_count", 0) or 0) > 0
     )
-    q_manifest = 0.0 if not has_manifest else min(1.0, 0.35 + 0.65 * float((manifest_x > 0).float().mean().sqrt().item()))
+    q_manifest = 1.0 if has_manifest else 0.0
 
     return {
         "manifest_x": manifest_x,

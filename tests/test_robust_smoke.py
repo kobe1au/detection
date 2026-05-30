@@ -24,6 +24,7 @@ from fusion.robust.semantic_categories import (
 from fusion.robust.perturbations import (
     apply_api_event_dropout,
     apply_api_missing,
+    apply_graph_feature_obfuscation,
     apply_perturbation,
     apply_graph_missing,
     apply_manifest_component_mask,
@@ -474,6 +475,33 @@ def test_graph_missing_sets_q_align_zero():
     assert data["q_align"] == 0.0
 
 
+def test_align_quality_requires_explicit_method_api_edges():
+    assert RobustTriModalDataset._align_quality(
+        1.0,
+        1.0,
+        torch.empty((2, 0), dtype=torch.long),
+        num_nodes=4,
+        num_api=4,
+    ) == 0.0
+    aligned = RobustTriModalDataset._align_quality(
+        1.0,
+        1.0,
+        torch.tensor([[0, 1], [0, 2]], dtype=torch.long),
+        num_nodes=4,
+        num_api=4,
+    )
+    assert 0.0 < aligned < 1.0
+
+
+def test_graph_degradation_changes_graph_category_direction():
+    torch.manual_seed(0)
+    data = _perturbation_sample()
+    before = data["graph_semantic_category_counts"].clone()
+    out = apply_graph_feature_obfuscation(data, 0.5)
+    assert not torch.equal(before, out["graph_semantic_category_counts"])
+    assert torch.equal(out["graph_semantic_category_counts"], out["graph_category_counts"])
+
+
 def test_manifest_permission_mask_changes_manifest_category_counts():
     data = _perturbation_sample()
     before = data["manifest_category_counts"].clone()
@@ -517,6 +545,41 @@ def test_zero_strength_degradation_is_noop():
                 assert torch.equal(actual, expected), perturb_type
             else:
                 assert actual == expected, perturb_type
+
+
+def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
+    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="deterministic_eval")
+    dataset = RobustTriModalDataset(
+        str(pt_dir),
+        str(csv_path),
+        is_train=False,
+        robust_aug=False,
+        manifest_dim=16,
+        manifest_stats_dim=11,
+        eval_perturb_type="all_degraded",
+        eval_perturb_strength=0.5,
+    )
+    first = dataset[0]
+    second = dataset[0]
+    assert first.api_aug_type == second.api_aug_type
+    assert first.graph_aug_type == second.graph_aug_type
+    assert first.manifest_aug_type == second.manifest_aug_type
+    assert torch.equal(first.api_ids, second.api_ids)
+    assert torch.equal(first.edge_index, second.edge_index)
+    assert torch.equal(first.manifest_x, second.manifest_x)
+    stronger = RobustTriModalDataset(
+        str(pt_dir),
+        str(csv_path),
+        is_train=False,
+        robust_aug=False,
+        manifest_dim=16,
+        manifest_stats_dim=11,
+        eval_perturb_type="all_degraded",
+        eval_perturb_strength=0.9,
+    )[0]
+    assert first.api_aug_type == stronger.api_aug_type
+    assert first.graph_aug_type == stronger.graph_aug_type
+    assert first.manifest_aug_type == stronger.manifest_aug_type
 
 
 def test_manifest_component_mask_uses_vector_layout_stats_offset():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import logging
 import random
 from pathlib import Path
@@ -26,6 +28,25 @@ logger = logging.getLogger(__name__)
 
 
 VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
+
+
+def _stable_seed(*parts: object) -> int:
+    text = "|".join(str(p) for p in parts)
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False) % (2**31 - 1)
+
+
+@contextmanager
+def _temporary_random_seed(seed: int):
+    py_state = random.getstate()
+    torch_state = torch.random.get_rng_state()
+    random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        torch.random.set_rng_state(torch_state)
 
 
 def _as_float_tensor(value, length: int, default: float = 0.0) -> torch.Tensor:
@@ -319,10 +340,9 @@ class RobustTriModalDataset(Dataset):
             return 0.0
         count_score = min(1.0, n / 128.0)
         diversity_score = min(1.0, float(api_ids.unique().numel()) / max(n, 1) * 2.0)
-        sensitive_score = float(api_sensitive.float().mean().item()) if api_sensitive.numel() else 0.0
         coverage_score = float(api_in_graph.float().mean().item()) if api_in_graph.numel() == n else 0.0
         type_score = float((api_type_ids.long() > 0).float().mean().item()) if api_type_ids.numel() == n else 0.0
-        return max(0.0, min(1.0, 0.25 * count_score + 0.25 * diversity_score + 0.2 * sensitive_score + 0.2 * coverage_score + 0.1 * type_score))
+        return max(0.0, min(1.0, 0.35 * count_score + 0.25 * diversity_score + 0.25 * coverage_score + 0.15 * type_score))
 
     @staticmethod
     def _graph_quality(edge_index: torch.Tensor, num_nodes: int, sensitive_mask: torch.Tensor) -> float:
@@ -330,18 +350,17 @@ class RobustTriModalDataset(Dataset):
             return 0.0
         node_score = min(1.0, num_nodes / 32.0)
         edge_score = min(1.0, edge_index.size(1) / max(num_nodes, 1)) if edge_index.ndim == 2 else 0.0
-        sensitive_score = float(sensitive_mask.float().mean().item()) if sensitive_mask.numel() else 0.0
-        return max(0.0, min(1.0, 0.45 * node_score + 0.45 * edge_score + 0.10 * sensitive_score))
+        return max(0.0, min(1.0, 0.5 * node_score + 0.5 * edge_score))
 
     @staticmethod
     def _align_quality(q_api: float, q_graph: float, method_api_edge_index: torch.Tensor, num_nodes: int, num_api: int) -> float:
         if num_nodes <= 0 or num_api <= 0 or method_api_edge_index.numel() == 0:
-            edge_cover = 0.0
-        else:
-            node_cover = method_api_edge_index[0].unique().numel() / max(num_nodes, 1)
-            api_cover = method_api_edge_index[1].unique().numel() / max(num_api, 1)
-            edge_cover = 0.5 * float(node_cover) + 0.5 * float(api_cover)
-        return max(0.0, min(1.0, 0.3 * q_api + 0.3 * q_graph + 0.4 * edge_cover))
+            return 0.0
+        node_cover = method_api_edge_index[0].unique().numel() / max(num_nodes, 1)
+        api_cover = method_api_edge_index[1].unique().numel() / max(num_api, 1)
+        edge_cover = 0.5 * float(node_cover) + 0.5 * float(api_cover)
+        code_quality = (max(0.0, min(1.0, q_api)) * max(0.0, min(1.0, q_graph))) ** 0.5
+        return max(0.0, min(1.0, edge_cover * code_quality))
 
     def _process_dex(self, dex: dict[str, Any], node_offset: int, api_offset: int):
         x = self._sanitize_call_x(dex.get("call_x"))
@@ -586,7 +605,10 @@ class RobustTriModalDataset(Dataset):
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)
                 data = apply_perturbation(data, perturb_type, strength)
             elif not self.is_train and self.eval_perturb_type:
-                data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
+                # Keep aggregate perturbation subtypes stable across strength sweeps.
+                seed = _stable_seed(sid, self.eval_perturb_type)
+                with _temporary_random_seed(seed):
+                    data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
             return self._to_data_object(data, label, sid, year)
         except Exception as exc:
             return self._dummy(label, sid, year, f"{type(exc).__name__}: {exc}", pt_path)
@@ -620,6 +642,9 @@ def robust_collate_fn(data_list):
         }
 
     sids = [d.sid for d in valid_items]
+    api_aug_types = [getattr(d, "api_aug_type", "none") for d in valid_items]
+    graph_aug_types = [getattr(d, "graph_aug_type", "none") for d in valid_items]
+    manifest_aug_types = [getattr(d, "manifest_aug_type", "none") for d in valid_items]
     years = torch.stack([d.year for d in valid_items]).view(-1)
     labels = torch.stack([d.y for d in valid_items])
     graph_list = []
@@ -710,6 +735,9 @@ def robust_collate_fn(data_list):
         "graph_batch": graph_batch,
         "labels": labels,
         "sids": sids,
+        "api_aug_types": api_aug_types,
+        "graph_aug_types": graph_aug_types,
+        "manifest_aug_types": manifest_aug_types,
         "years": years,
         "quality": {
             "q_api": q_api,

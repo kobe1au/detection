@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import zipfile
@@ -10,30 +11,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import torch
 import yaml
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from extract.extract_graph_api import (  # noqa: E402
-    DEX,
-    atomic_torch_save,
-    build_graph_api_for_dex,
-    list_dex_entries,
-    sha256_file,
-)
-from fusion.robust.manifest_features import (  # noqa: E402
-    build_manifest_vocab,
-    extract_manifest_record,
-    load_manifest_vocab,
-    save_manifest_vocab,
-    validate_manifest_vocab,
-    vectorize_manifest_record,
-)
-from fusion.robust.semantic_categories import validate_api_type_mapping  # noqa: E402
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -46,20 +29,76 @@ def _resolve_path(value: str | Path, base: Path = PROJECT_ROOT) -> Path:
     return path if path.is_absolute() else base / path
 
 
-def _collect_apks(apk_root: Path, splits: list[str]) -> list[dict[str, str]]:
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _validate_runtime_dependencies() -> None:
+    try:
+        import extract.extract_graph_api  # noqa: F401
+        import fusion.robust.manifest_features  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"Missing runtime dependency for tri-modal PT build: {exc.name}. "
+            "Run this script with the same Python environment used for training, including PyTorch."
+        ) from exc
+
+
+def _resolve_split_dirs(data: dict[str, Any], splits: list[str]) -> tuple[dict[str, Path], Path | None]:
+    split_dirs_raw = data.get("split_dirs") or data.get("apk_dirs") or {}
+    if split_dirs_raw:
+        split_dirs_raw = {str(k): v for k, v in split_dirs_raw.items()}
+        missing = [split for split in splits if not split_dirs_raw.get(split)]
+        if missing:
+            raise ValueError(f"data.split_dirs is missing configured splits: {missing}")
+        return {
+            split: _resolve_path(split_dirs_raw[split])
+            for split in splits
+        }, None
+
+    apk_root_raw = data.get("apk_root", "")
+    if not apk_root_raw:
+        raise ValueError("Either data.split_dirs or data.apk_root is required")
+    apk_root = _resolve_path(apk_root_raw)
+    return {split: apk_root / split for split in splits}, apk_root
+
+
+def _resolve_out_dirs(data: dict[str, Any], out_root: Path, splits: list[str]) -> dict[str, Path]:
+    out_dirs_raw = data.get("out_dirs") or {}
+    if out_dirs_raw:
+        out_dirs_raw = {str(k): v for k, v in out_dirs_raw.items()}
+        missing = [split for split in splits if not out_dirs_raw.get(split)]
+        if missing:
+            raise ValueError(f"data.out_dirs is missing configured splits: {missing}")
+        return {
+            split: _resolve_path(out_dirs_raw[split])
+            for split in splits
+        }
+    return {split: out_root / split for split in splits}
+
+
+def _collect_apks(split_dirs: dict[str, Path], splits: list[str], hash_files: bool = True) -> list[dict[str, str]]:
     jobs: list[dict[str, str]] = []
     for split in splits:
-        split_dir = apk_root / split
+        split_dir = split_dirs[split]
         if not split_dir.exists():
             continue
 
-        apk_paths = sorted(split_dir.glob("*.apk"))
+        apk_paths = sorted(
+            path
+            for path in split_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".apk"
+        )
         for apk_path in tqdm(apk_paths, desc=f"scan/hash {split}", unit="apk"):
             jobs.append(
                 {
                     "split": split,
                     "apk_path": str(apk_path),
-                    "sha256": sha256_file(apk_path),
+                    "sha256": _sha256_file(apk_path) if hash_files else "",
                 }
             )
     return jobs
@@ -121,14 +160,15 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
     storage = raw.get("storage", {})
     execution = raw.get("execution", {})
 
-    apk_root_raw = data.get("apk_root", "")
     out_root_raw = data.get("out_root", "")
-    if not apk_root_raw:
-        raise ValueError("data.apk_root is required")
     if not out_root_raw:
         raise ValueError("data.out_root is required")
-    apk_root = _resolve_path(apk_root_raw)
     out_root = _resolve_path(out_root_raw)
+    splits = [str(split) for split in data.get("splits", ["train", "val", "test"])]
+    if not splits:
+        raise ValueError("data.splits must not be empty")
+    split_dirs, apk_root = _resolve_split_dirs(data, splits)
+    out_dirs = _resolve_out_dirs(data, out_root, splits)
     vocab_path = _resolve_path(manifest.get("vocab_path", "config/manifest_vocab.yaml"))
     manifest_jsonl_dir_raw = manifest.get("manifest_jsonl_dir", "")
     manifest_jsonl_dir = (
@@ -139,8 +179,10 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
 
     cfg = {
         "apk_root": apk_root,
+        "split_dirs": split_dirs,
         "out_root": out_root,
-        "splits": list(data.get("splits", ["train", "val", "test"])),
+        "out_dirs": out_dirs,
+        "splits": splits,
         "vocab_size": int(hp.get("vocab_size", 256)),
         "sensitive_hops": int(graph.get("sensitive_hops", 1)),
         "max_methods_per_dex": int(graph.get("max_methods_per_dex", 4096)),
@@ -166,6 +208,7 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         "keep_api_tokens": bool(storage.get("keep_api_tokens", False)),
         "workers": int(execution.get("workers", 1)),
         "resume": bool(execution.get("resume", True)),
+        "fail_on_error": bool(execution.get("fail_on_error", False)),
         "failed_json": str(execution.get("failed_json", "")),
     }
 
@@ -187,6 +230,8 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_manifest_records(jobs: list[dict[str, str]], cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    from fusion.robust.manifest_features import extract_manifest_record
+
     records: dict[str, dict[str, Any]] = {}
     for job in tqdm(jobs, desc="extract manifests", unit="apk"):
         sid = job["sha256"]
@@ -209,6 +254,13 @@ def _build_or_load_vocab(
     manifest_records: dict[str, dict[str, Any]],
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
+    from fusion.robust.manifest_features import (
+        build_manifest_vocab,
+        load_manifest_vocab,
+        save_manifest_vocab,
+        validate_manifest_vocab,
+    )
+
     vocab_path: Path = cfg["vocab_path"]
     if cfg["rebuild_vocab"] or not vocab_path.exists():
         train_records = [
@@ -244,6 +296,8 @@ def _build_or_load_vocab(
 
 
 def _manifest_payload(record: dict[str, Any], vocab: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    from fusion.robust.manifest_features import vectorize_manifest_record
+
     payload = vectorize_manifest_record(record, vocab, manifest_dim=cfg["manifest_dim"])
     meta = dict(payload.get("manifest_meta") or {})
     meta.setdefault("sha256", record.get("sha256", ""))
@@ -253,10 +307,17 @@ def _manifest_payload(record: dict[str, Any], vocab: dict[str, Any], cfg: dict[s
 
 
 def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any], record: dict[str, Any]):
+    from extract.extract_graph_api import (
+        DEX,
+        atomic_torch_save,
+        build_graph_api_for_dex,
+        list_dex_entries,
+    )
+
     apk_path = Path(job["apk_path"])
     split = job["split"]
     sha = job["sha256"]
-    out_dir = Path(cfg["out_root"]) / split
+    out_dir = Path(cfg["out_dirs"][split])
     out_path = out_dir / f"{sha}.pt"
     if cfg["resume"] and out_path.exists():
         return True, _index_row(job, out_path, "ok", "resumed_existing_pt")
@@ -339,19 +400,28 @@ def _worker(args):
 
 
 def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
-    jobs = _collect_apks(cfg["apk_root"], cfg["splits"])
+    if not dry_run:
+        _validate_runtime_dependencies()
+        from fusion.robust.semantic_categories import validate_api_type_mapping
+
+        validate_api_type_mapping()
+
+    jobs = _collect_apks(cfg["split_dirs"], cfg["splits"], hash_files=not dry_run)
     split_counts = _split_counts(jobs, cfg["splits"])
 
     print(
         json.dumps(
             {
-                "apk_root": str(cfg["apk_root"]),
+                "apk_root": str(cfg["apk_root"]) if cfg["apk_root"] is not None else "",
+                "split_dirs": {split: str(path) for split, path in cfg["split_dirs"].items()},
                 "out_root": str(cfg["out_root"]),
+                "out_dirs": {split: str(path) for split, path in cfg["out_dirs"].items()},
                 "splits": cfg["splits"],
                 "split_counts": split_counts,
                 "vocab_path": str(cfg["vocab_path"]),
                 "workers": cfg["workers"],
                 "resume": cfg["resume"],
+                "fail_on_error": cfg["fail_on_error"],
                 "direct": True,
             },
             indent=2,
@@ -391,7 +461,7 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
                 try:
                     succ, row = fut.result()
                 except Exception as exc:
-                    out_path = Path(cfg["out_root"]) / job["split"] / f"{job['sha256']}.pt"
+                    out_path = Path(cfg["out_dirs"][job["split"]]) / f"{job['sha256']}.pt"
                     succ = False
                     row = _index_row(job, out_path, "failed", f"{type(exc).__name__}: {exc}")
                 index_rows.append(row)
@@ -414,6 +484,11 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
 
     summary = {"ok": ok, "fail": fail, "failed": failed, "split_counts": split_counts}
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    if fail > 0 and cfg["fail_on_error"]:
+        raise RuntimeError(
+            f"{fail} APK(s) failed to build tri-modal .pt files. "
+            f"See {failed_path if failed else 'tri_modal_pt_index.csv'} for details."
+        )
     return summary
 
 
@@ -421,12 +496,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Directly build API+Graph+Manifest tri-modal .pt files from APKs.")
     parser.add_argument("--config", default="config/extract_tri_model.yaml")
     parser.add_argument("--apk-root", default="", help="Override data.apk_root.")
+    parser.add_argument("--train-dir", default="", help="Override data.split_dirs.train.")
+    parser.add_argument("--val-dir", default="", help="Override data.split_dirs.val.")
+    parser.add_argument("--test-dir", default="", help="Override data.split_dirs.test.")
     parser.add_argument("--out-root", default="", help="Override data.out_root.")
+    parser.add_argument("--train-out-dir", default="", help="Override data.out_dirs.train.")
+    parser.add_argument("--val-out-dir", default="", help="Override data.out_dirs.val.")
+    parser.add_argument("--test-out-dir", default="", help="Override data.out_dirs.test.")
     parser.add_argument("--splits", nargs="+", default=None, help="Override data.splits.")
     parser.add_argument("--workers", type=int, default=None, help="Override execution.workers.")
     parser.add_argument("--resume", action="store_true", help="Force resume=true.")
     parser.add_argument("--no-resume", action="store_true", help="Force resume=false.")
+    parser.add_argument("--fail-on-error", action="store_true", help="Exit non-zero if any APK fails.")
+    parser.add_argument("--allow-failures", action="store_true", help="Set execution.fail_on_error=false.")
     parser.add_argument("--rebuild-vocab", action="store_true", help="Force rebuild Manifest vocab from train split.")
+    parser.add_argument("--no-rebuild-vocab", action="store_true", help="Force rebuild_vocab=false.")
     parser.add_argument("--allow-empty-vocab", action="store_true", help="Allow an empty Manifest vocab for debug runs.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -434,26 +518,60 @@ def main() -> None:
     cfg_path = _resolve_path(args.config)
     raw = _load_yaml(cfg_path)
     if args.apk_root:
-        raw.setdefault("data", {})["apk_root"] = args.apk_root
+        data = raw.setdefault("data", {})
+        data["apk_root"] = args.apk_root
+        data.pop("split_dirs", None)
+        data.pop("apk_dirs", None)
+    split_dir_overrides = {
+        "train": args.train_dir,
+        "val": args.val_dir,
+        "test": args.test_dir,
+    }
+    if any(split_dir_overrides.values()):
+        data = raw.setdefault("data", {})
+        split_dirs = data.setdefault("split_dirs", {})
+        for split, path in split_dir_overrides.items():
+            if path:
+                split_dirs[split] = path
     if args.out_root:
-        raw.setdefault("data", {})["out_root"] = args.out_root
+        data = raw.setdefault("data", {})
+        data["out_root"] = args.out_root
+        data.pop("out_dirs", None)
+    out_dir_overrides = {
+        "train": args.train_out_dir,
+        "val": args.val_out_dir,
+        "test": args.test_out_dir,
+    }
+    if any(out_dir_overrides.values()):
+        data = raw.setdefault("data", {})
+        out_dirs = data.setdefault("out_dirs", {})
+        for split, path in out_dir_overrides.items():
+            if path:
+                out_dirs[split] = path
     if args.splits is not None:
         raw.setdefault("data", {})["splits"] = args.splits
     if args.workers is not None:
         raw.setdefault("execution", {})["workers"] = args.workers
     if args.resume and args.no_resume:
         raise SystemExit("Use only one of --resume or --no-resume.")
+    if args.rebuild_vocab and args.no_rebuild_vocab:
+        raise SystemExit("Use only one of --rebuild-vocab or --no-rebuild-vocab.")
     if args.resume:
         raw.setdefault("execution", {})["resume"] = True
     if args.no_resume:
         raw.setdefault("execution", {})["resume"] = False
+    if args.fail_on_error:
+        raw.setdefault("execution", {})["fail_on_error"] = True
+    if args.allow_failures:
+        raw.setdefault("execution", {})["fail_on_error"] = False
     if args.rebuild_vocab:
         raw.setdefault("manifest", {})["rebuild_vocab"] = True
+    if args.no_rebuild_vocab:
+        raw.setdefault("manifest", {})["rebuild_vocab"] = False
     if args.allow_empty_vocab:
         raw.setdefault("manifest", {})["allow_empty_vocab"] = True
 
     try:
-        validate_api_type_mapping()
         cfg = _parse_config(raw)
         run(cfg, dry_run=args.dry_run)
     except (RuntimeError, ValueError) as exc:

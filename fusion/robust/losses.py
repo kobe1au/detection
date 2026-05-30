@@ -11,6 +11,13 @@ BRANCH_AUX_KEYS = (
     "joint_logits_aux",
 )
 
+BRANCH_AUX_NAMES = {
+    "api_logits_aux": "api",
+    "graph_logits_aux": "graph",
+    "manifest_logits_aux": "manifest",
+    "joint_logits_aux": "joint",
+}
+
 
 def _matrix(extra: dict, key: str, ref: torch.Tensor) -> torch.Tensor | None:
     value = extra.get(key)
@@ -151,18 +158,25 @@ def compute_robust_loss(
 
     ce = F.cross_entropy(logits, labels.long(), label_smoothing=label_smoothing)
     branch_loss = logits.new_tensor(0.0)
-    branch_count = 0
+    branch_weight_sum = 0.0
+    branch_weights = loss_cfg.get("branch_aux_weights") or {}
+    if not isinstance(branch_weights, dict):
+        branch_weights = {}
     for key in BRANCH_AUX_KEYS:
         aux_logits = extra.get(key)
         if isinstance(aux_logits, torch.Tensor) and aux_logits.shape == logits.shape:
-            branch_loss = branch_loss + F.cross_entropy(
+            branch_name = BRANCH_AUX_NAMES.get(key, key)
+            weight = float(branch_weights.get(branch_name, branch_weights.get(key, 1.0)))
+            if weight <= 0.0:
+                continue
+            branch_loss = branch_loss + weight * F.cross_entropy(
                 aux_logits,
                 labels.long(),
                 label_smoothing=label_smoothing,
             )
-            branch_count += 1
-    if branch_count > 0:
-        branch_loss = branch_loss / float(branch_count)
+            branch_weight_sum += weight
+    if branch_weight_sum > 0.0:
+        branch_loss = branch_loss / branch_loss.new_tensor(branch_weight_sum)
 
     soft_loss = (
         _soft_consistency_loss(extra, logits)

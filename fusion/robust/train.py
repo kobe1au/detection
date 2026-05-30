@@ -264,6 +264,13 @@ def evaluate(model, loader, device, use_amp: bool, split_name: str, dump_rows: b
                     "pred": int(pred[i].detach().cpu().item()),
                     "year": int(batch.get("years")[i].detach().cpu().item()) if batch.get("years") is not None else 0,
                 }
+                for row_key, batch_key in (
+                    ("api_aug_type", "api_aug_types"),
+                    ("graph_aug_type", "graph_aug_types"),
+                    ("manifest_aug_type", "manifest_aug_types"),
+                ):
+                    values = batch.get(batch_key) or []
+                    row[row_key] = str(values[i]) if i < len(values) else "none"
                 if isinstance(gate, torch.Tensor) and gate.size(0) > i:
                     gate_i = gate[i].detach().cpu()
                     row.update({

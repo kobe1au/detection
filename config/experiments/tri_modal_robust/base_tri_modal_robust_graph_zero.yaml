@@ -6,9 +6,9 @@
 data:
   root: ""
   out_dir: "experiments/tri_modal_robust_graph_zero"
-  train_pt_dir: "C:/pts_tri/train"
+  train_pt_dir: "E:/pts_tri/train"
   val_pt_dir: "C:/pts_tri/val"
-  test_pt_dir: "C:/pts_tri/test"
+  test_pt_dir: "D:/pts_tri/test"
   train_csv: "results/labels/train.csv"
   val_csv: "results/labels/val.csv"
   test_csv: "results/labels/test.csv"

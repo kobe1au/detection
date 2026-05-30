@@ -119,13 +119,19 @@ def degrade_category_counts(data: dict, key: str, strength: float, mode: str) ->
         return
     out = counts.clone()
     flat = out.view(-1)
-    n = _num_to_perturb(flat.numel(), strength)
-    if n <= 0:
-        return
     if mode == "mask":
-        idx = torch.randperm(flat.numel(), device=flat.device)[:n]
+        candidates = torch.where(flat > 0)[0]
+        if candidates.numel() == 0:
+            return
+        n = _num_to_perturb(candidates.numel(), strength)
+        if n <= 0:
+            return
+        idx = candidates[torch.randperm(candidates.numel(), device=flat.device)[:n]]
         flat[idx] = 0.0
     elif mode == "inject":
+        n = _num_to_perturb(flat.numel(), strength)
+        if n <= 0:
+            return
         idx = torch.randperm(flat.numel(), device=flat.device)[:n]
         flat[idx] = flat[idx] + 1.0
     elif mode == "noise":
@@ -142,12 +148,37 @@ def degrade_manifest_counts(data: dict, strength: float, mode: str) -> None:
 
 
 def degrade_graph_counts(data: dict, strength: float) -> None:
-    degrade_category_counts(data, "graph_semantic_category_counts", strength, "scale")
-    graph_semantic = data.get("graph_semantic_category_counts")
-    if isinstance(graph_semantic, torch.Tensor):
-        data["graph_category_counts"] = graph_semantic
-    else:
-        degrade_category_counts(data, "graph_category_counts", strength, "scale")
+    if not _should_degrade_category_counts(data):
+        return
+    strength = _clamp_strength(strength)
+    if strength <= 0.0:
+        return
+    counts = data.get("graph_semantic_category_counts")
+    if not isinstance(counts, torch.Tensor) or counts.numel() == 0:
+        counts = data.get("graph_category_counts")
+    if not isinstance(counts, torch.Tensor) or counts.numel() == 0:
+        return
+
+    out = counts.clone()
+    if strength >= 1.0:
+        out = torch.zeros_like(out)
+        data["graph_semantic_category_counts"] = out
+        data["graph_category_counts"] = out.clone()
+        return
+    flat = out.view(-1)
+    candidates = torch.where(flat > 0)[0]
+    if candidates.numel() == 0:
+        return
+    n = _num_to_perturb(candidates.numel(), strength)
+    if n <= 0:
+        return
+    idx = candidates[torch.randperm(candidates.numel(), device=flat.device)[:n]]
+    flat[idx] = 0.0
+    if strength >= 0.5:
+        noise = torch.randn_like(out.float()) * (0.05 * strength)
+        out = (out.float() + noise).clamp_min(0.0).to(dtype=counts.dtype)
+    data["graph_semantic_category_counts"] = out
+    data["graph_category_counts"] = out.clone()
 
 
 def _zero_tensor_like(value):
