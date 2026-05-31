@@ -68,7 +68,7 @@ train:
   eval_batch_size: 32
   grad_accum_steps: 1
   num_workers: 8
-  pin_memory: true
+  pin_memory: false
   persistent_workers: true
   lr: 0.0003
   weight_decay: 0.01

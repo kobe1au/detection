@@ -13,7 +13,7 @@ from fusion.dataset import RobustTriModalDataset, robust_collate_fn
 from fusion.losses import compute_robust_loss
 from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
 from fusion.model import TriModalRobustModel
-from fusion.train import enforce_failed_ratio
+from fusion.train import _metrics, enforce_failed_ratio
 from fusion.semantic_categories import (
     CATEGORY_TO_INDEX,
     DEFAULT_API_TYPE_ID_TO_CATEGORY,
@@ -31,6 +31,21 @@ from fusion.perturbations import (
     apply_manifest_missing,
     apply_manifest_permission_mask,
 )
+
+
+def test_metrics_report_macro_f1_as_primary_f1():
+    labels = [0, 0, 1, 1]
+    preds = [1, 1, 1, 1]
+    probs = [0.7, 0.8, 0.9, 0.6]
+
+    metrics = _metrics(labels, probs, preds)
+
+    assert metrics["acc"] == pytest.approx(0.5)
+    assert metrics["f1_pos"] == pytest.approx(2.0 / 3.0)
+    assert metrics["macro_f1"] == pytest.approx(1.0 / 3.0)
+    assert metrics["f1"] == pytest.approx(metrics["macro_f1"])
+    assert metrics["recall_pos"] == pytest.approx(1.0)
+    assert metrics["macro_recall"] == pytest.approx(0.5)
 
 
 def test_api_type_id_mapping_matches_extractor_taxonomy():

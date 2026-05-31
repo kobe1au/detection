@@ -13,7 +13,13 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
-from sklearn.metrics import accuracy_score, average_precision_score, f1_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -153,6 +159,8 @@ def _dataset_common_kwargs(
         "drop_graph_behavior_hints": bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
         "degrade_category_counts": bool(robust_cfg.get("degrade_category_counts", True)),
         "graph_semantic_source": str(data_cfg.get("graph_semantic_source", "alignment")),
+        "num_classes": int(model_cfg.get("num_classes", 2)),
+        "label_map": data_cfg.get("label_map"),
     }
 
 
@@ -270,11 +278,29 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
 
 def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[str, float]:
     if not labels:
-        return {"acc": 0.0, "f1": 0.0, "recall": 0.0, "auc": 0.0, "ap": 0.0}
+        return {
+            "acc": 0.0,
+            "f1": 0.0,
+            "macro_f1": 0.0,
+            "f1_pos": 0.0,
+            "recall": 0.0,
+            "macro_recall": 0.0,
+            "recall_pos": 0.0,
+            "auc": 0.0,
+            "ap": 0.0,
+        }
+    macro_f1 = float(f1_score(labels, preds, average="macro", zero_division=0))
+    f1_pos = float(f1_score(labels, preds, average="binary", pos_label=1, zero_division=0))
+    macro_recall = float(recall_score(labels, preds, average="macro", zero_division=0))
+    recall_pos = float(recall_score(labels, preds, average="binary", pos_label=1, zero_division=0))
     out = {
         "acc": float(accuracy_score(labels, preds)),
-        "f1": float(f1_score(labels, preds, zero_division=0)),
-        "recall": float(recall_score(labels, preds, zero_division=0)),
+        "f1": macro_f1,
+        "macro_f1": macro_f1,
+        "f1_pos": f1_pos,
+        "recall": macro_recall,
+        "macro_recall": macro_recall,
+        "recall_pos": recall_pos,
     }
     if len(set(labels)) > 1:
         out["auc"] = float(roc_auc_score(labels, probs))
@@ -475,7 +501,7 @@ def run(cfg: dict) -> dict[str, Any]:
         enforce_failed_ratio(val_metrics, cfg, "val")
         scheduler.step()
         logger.info(
-            "epoch=%s train_loss=%.4f val_f1=%.4f val_auc=%.4f val_acc=%.4f",
+            "epoch=%s train_loss=%.4f val_macro_f1=%.4f val_auc=%.4f val_acc=%.4f",
             epoch,
             train_loss,
             val_metrics["f1"],
@@ -569,6 +595,8 @@ def run(cfg: dict) -> dict[str, Any]:
         _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
     summary = {
         "best_val_f1": best_f1,
+        "best_val_macro_f1": best_f1,
+        "checkpoint_metric": "macro_f1",
         "val": val_metrics,
         "test": test_metrics,
         "robust": robust_results,

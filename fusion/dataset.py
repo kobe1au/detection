@@ -149,6 +149,8 @@ class RobustTriModalDataset(Dataset):
         drop_graph_behavior_hints: bool = False,
         degrade_category_counts: bool = True,
         graph_semantic_source: str = "alignment",
+        num_classes: int = 2,
+        label_map: dict | None = None,
         **_unused,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
@@ -192,8 +194,37 @@ class RobustTriModalDataset(Dataset):
             raise ValueError("CSV must contain label")
         year_col = next((c for c in ["year", "Year", "vt_year", "dex_year"] if c in df.columns), None)
 
-        sid_series = df[id_col].astype(str).str.lower()
-        labels = dict(zip(sid_series, df["label"].astype(int)))
+        sid_series = df[id_col].astype(str).str.strip().str.lower()
+        raw_labels = df["label"].astype(str).str.strip()
+        if label_map:
+            normalized_map = {str(k).strip(): int(v) for k, v in label_map.items()}
+            mapped = raw_labels.map(normalized_map)
+            if mapped.isna().any():
+                bad = df.loc[mapped.isna(), [id_col, "label"]].head(10).to_dict("records")
+                raise ValueError(
+                    f"CSV {csv_path} contains labels not covered by data.label_map; "
+                    f"examples={bad}"
+                )
+            label_series = mapped.astype(int)
+        else:
+            label_series = pd.to_numeric(df["label"], errors="coerce")
+            if label_series.isna().any():
+                bad = df.loc[label_series.isna(), [id_col, "label"]].head(10).to_dict("records")
+                raise ValueError(f"CSV {csv_path} contains non-integer labels; examples={bad}")
+            label_series = label_series.astype(int)
+        num_classes = int(num_classes)
+        if num_classes <= 1:
+            raise ValueError(f"num_classes must be > 1, got {num_classes}")
+        invalid = ~label_series.between(0, num_classes - 1)
+        if invalid.any():
+            bad = df.loc[invalid, [id_col, "label"]].head(20).to_dict("records")
+            counts = label_series.value_counts().sort_index().to_dict()
+            raise ValueError(
+                f"CSV {csv_path} contains labels outside [0, {num_classes - 1}] "
+                f"for num_classes={num_classes}; label_counts={counts}; examples={bad}. "
+                "Fix the CSV labels or set data.label_map in the config."
+            )
+        labels = dict(zip(sid_series, label_series))
         years = (
             dict(zip(sid_series, pd.to_numeric(df[year_col], errors="coerce").fillna(0).astype(int)))
             if year_col

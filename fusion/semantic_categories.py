@@ -12,6 +12,25 @@ SEMANTIC_CATEGORIES = tuple(DEFAULT_CATEGORIES)
 SEMANTIC_CATEGORY_DIM = len(SEMANTIC_CATEGORIES)
 CATEGORY_TO_INDEX = {name: idx for idx, name in enumerate(SEMANTIC_CATEGORIES)}
 
+EXTRACTOR_API_CATEGORY_NAMES = (
+    "other",
+    "telephony",
+    "sms",
+    "location",
+    "contacts_content",
+    "camera_media",
+    "network",
+    "runtime_exec",
+    "reflection",
+    "dynamic_loading",
+    "file_io",
+    "package_info",
+    "crypto",
+    "webview",
+    "system_settings",
+    "account",
+)
+
 # Must match extract/extract_graph_api.py::API_CATEGORY_NAMES:
 #   0 other, 1 telephony, 2 sms, 3 location, 4 contacts_content,
 #   5 camera_media, 6 network, 7 runtime_exec, 8 reflection,
@@ -61,9 +80,14 @@ def validate_api_type_mapping(
     if mapping is None:
         mapping = DEFAULT_API_TYPE_ID_TO_CATEGORY
     if api_category_names is None:
-        # Lazy import to avoid extract -> fusion import cycles.
-        from extract.extract_graph_api import API_CATEGORY_NAMES as _names
-        api_category_names = tuple(_names)
+        # Training/inference deployments may omit the extractor package. The
+        # model still needs to run, so fall back to the frozen taxonomy used
+        # when tri-modal .pt files were generated.
+        try:
+            from extract.extract_graph_api import API_CATEGORY_NAMES as _names
+            api_category_names = tuple(_names)
+        except ModuleNotFoundError:
+            api_category_names = EXTRACTOR_API_CATEGORY_NAMES
     if target_categories is None:
         target_categories = SEMANTIC_CATEGORIES
 
