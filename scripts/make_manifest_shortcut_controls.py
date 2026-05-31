@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -15,8 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM
-from fusion.robust.train import load_config, resolve
+from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
+from fusion.train import load_config, resolve
 
 
 ID_CANDIDATES = ("id", "sha256", "ID", "Id")
@@ -202,6 +202,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         split_summary: dict[str, int] = {}
         for control in controls:
+            if control == "shuffled" and len(pt_paths) < 2:
+                split_summary[control] = 0
+                split_summary[f"{control}_failed"] = len(pt_paths)
+                for pt_path in pt_paths:
+                    sid = pt_path.stem.lower()
+                    dst_path = out_root / control / split / pt_path.name
+                    index_rows.append(
+                        {
+                            "split": split,
+                            "control": control,
+                            "sid": sid,
+                            "donor_sid": "",
+                            "src_pt_path": str(pt_path),
+                            "dst_pt_path": str(dst_path),
+                            "status": "failed",
+                            "reason": "shuffled control requires at least two samples",
+                        }
+                    )
+                _write_csv(csv_out_dir / f"{control}_{split}.csv", fieldnames, [])
+                continue
+
             ok = 0
             failed = 0
             generated_sids: set[str] = set()

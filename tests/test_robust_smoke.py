@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 from pathlib import Path
@@ -9,19 +9,19 @@ import yaml
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
-from fusion.robust.dataset import RobustTriModalDataset, robust_collate_fn
-from fusion.robust.losses import compute_robust_loss
-from fusion.robust.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
-from fusion.robust.model import TriModalRobustModel
-from fusion.robust.train import enforce_failed_ratio
-from fusion.robust.semantic_categories import (
+from fusion.dataset import RobustTriModalDataset, robust_collate_fn
+from fusion.losses import compute_robust_loss
+from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
+from fusion.model import TriModalRobustModel
+from fusion.train import enforce_failed_ratio
+from fusion.semantic_categories import (
     CATEGORY_TO_INDEX,
     DEFAULT_API_TYPE_ID_TO_CATEGORY,
     SEMANTIC_CATEGORIES,
     api_semantic_counts_from_type_ids,
     validate_api_type_mapping,
 )
-from fusion.robust.perturbations import (
+from fusion.perturbations import (
     apply_api_event_dropout,
     apply_api_missing,
     apply_graph_feature_obfuscation,

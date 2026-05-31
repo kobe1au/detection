@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import copy
@@ -17,17 +17,21 @@ from sklearn.metrics import accuracy_score, average_precision_score, f1_score, r
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from fusion.robust.losses import compute_robust_loss
-from fusion.robust.dataset import (
+from fusion.losses import compute_robust_loss
+from fusion.dataset import (
     RobustTriModalDataset,
     prepare_robust_batch,
     robust_collate_fn,
 )
-from fusion.robust.model import TriModalRobustModel
-from fusion.robust.utils import build_grad_scaler, get_amp_context
+from fusion.model import TriModalRobustModel
+from fusion.utils import build_grad_scaler, get_amp_context
 
 
 logger = logging.getLogger("tri_modal_robust")
+
+
+class EmptyExtraEvalSetError(RuntimeError):
+    """Raised when an optional external eval set has no usable samples."""
 
 
 GATE_DIAGNOSTIC_KEYS = (
@@ -160,16 +164,22 @@ def build_dataset_from_paths(
     perturb_type: str | None = None,
     perturb_strength: float = 0.0,
 ):
-    return RobustTriModalDataset(
-        pt_dir=str(pt_dir),
-        csv_path=str(csv_path),
-        **_dataset_common_kwargs(
-            cfg,
-            is_train=is_train,
-            perturb_type=perturb_type,
-            perturb_strength=perturb_strength,
-        ),
-    )
+    try:
+        return RobustTriModalDataset(
+            pt_dir=str(pt_dir),
+            csv_path=str(csv_path),
+            **_dataset_common_kwargs(
+                cfg,
+                is_train=is_train,
+                perturb_type=perturb_type,
+                perturb_strength=perturb_strength,
+            ),
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "No matching .pt samples found" in msg:
+            raise EmptyExtraEvalSetError(msg) from exc
+        raise
 
 
 def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | None = None, perturb_strength: float = 0.0):
@@ -528,7 +538,7 @@ def run(cfg: dict) -> dict[str, Any]:
                 perturb_type=str(perturb_type) if perturb_type else None,
                 perturb_strength=perturb_strength,
             )
-        except Exception as exc:
+        except EmptyExtraEvalSetError as exc:
             if bool(extra.get("skip_if_empty", True)):
                 extra_results[name] = {
                     "skipped": True,

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -40,7 +40,7 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 def _validate_runtime_dependencies() -> None:
     try:
         import extract.extract_graph_api  # noqa: F401
-        import fusion.robust.manifest_features  # noqa: F401
+        import fusion.manifest_features  # noqa: F401
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             f"Missing runtime dependency for tri-modal PT build: {exc.name}. "
@@ -115,6 +115,27 @@ def _validate_split_counts(split_counts: dict[str, int]) -> None:
     empty = [split for split, count in split_counts.items() if count <= 0]
     if empty:
         raise RuntimeError(f"No APK files found for configured splits: {empty}")
+
+
+def _drop_empty_splits(
+    cfg: dict[str, Any],
+    split_counts: dict[str, int],
+) -> tuple[dict[str, Any], dict[str, int], list[str]]:
+    if not bool(cfg.get("allow_empty_splits", False)):
+        _validate_split_counts(split_counts)
+        return cfg, split_counts, []
+
+    empty = [split for split, count in split_counts.items() if count <= 0]
+    if not empty:
+        return cfg, split_counts, []
+    kept = [split for split in cfg["splits"] if split not in empty]
+    if not kept:
+        raise RuntimeError(f"No APK files found for any configured split: {empty}")
+    cfg = dict(cfg)
+    cfg["splits"] = kept
+    cfg["split_dirs"] = {split: cfg["split_dirs"][split] for split in kept}
+    cfg["out_dirs"] = {split: cfg["out_dirs"][split] for split in kept}
+    return cfg, {split: split_counts[split] for split in kept}, empty
 
 
 def _index_row(
@@ -210,6 +231,7 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         "resume": bool(execution.get("resume", True)),
         "fail_on_error": bool(execution.get("fail_on_error", False)),
         "failed_json": str(execution.get("failed_json", "")),
+        "allow_empty_splits": bool(execution.get("allow_empty_splits", False)),
     }
 
     vocab_will_be_built = cfg["rebuild_vocab"] or not cfg["vocab_path"].exists()
@@ -230,7 +252,7 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_manifest_records(jobs: list[dict[str, str]], cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    from fusion.robust.manifest_features import extract_manifest_record
+    from fusion.manifest_features import extract_manifest_record
 
     records: dict[str, dict[str, Any]] = {}
     for job in tqdm(jobs, desc="extract manifests", unit="apk"):
@@ -254,7 +276,7 @@ def _build_or_load_vocab(
     manifest_records: dict[str, dict[str, Any]],
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
-    from fusion.robust.manifest_features import (
+    from fusion.manifest_features import (
         build_manifest_vocab,
         load_manifest_vocab,
         save_manifest_vocab,
@@ -296,7 +318,7 @@ def _build_or_load_vocab(
 
 
 def _manifest_payload(record: dict[str, Any], vocab: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
-    from fusion.robust.manifest_features import vectorize_manifest_record
+    from fusion.manifest_features import vectorize_manifest_record
 
     payload = vectorize_manifest_record(record, vocab, manifest_dim=cfg["manifest_dim"])
     meta = dict(payload.get("manifest_meta") or {})
@@ -402,12 +424,15 @@ def _worker(args):
 def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     if not dry_run:
         _validate_runtime_dependencies()
-        from fusion.robust.semantic_categories import validate_api_type_mapping
+        from fusion.semantic_categories import validate_api_type_mapping
 
         validate_api_type_mapping()
 
     jobs = _collect_apks(cfg["split_dirs"], cfg["splits"], hash_files=not dry_run)
     split_counts = _split_counts(jobs, cfg["splits"])
+    cfg, split_counts, skipped_empty_splits = _drop_empty_splits(cfg, split_counts)
+    if skipped_empty_splits:
+        jobs = [job for job in jobs if job["split"] in set(cfg["splits"])]
 
     print(
         json.dumps(
@@ -418,6 +443,7 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
                 "out_dirs": {split: str(path) for split, path in cfg["out_dirs"].items()},
                 "splits": cfg["splits"],
                 "split_counts": split_counts,
+                "skipped_empty_splits": skipped_empty_splits,
                 "vocab_path": str(cfg["vocab_path"]),
                 "workers": cfg["workers"],
                 "resume": cfg["resume"],
@@ -429,9 +455,14 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
         flush=True,
     )
     print("------------------------------------------")
-    _validate_split_counts(split_counts)
     if dry_run:
-        return {"ok": 0, "fail": 0, "dry_run": True, "split_counts": split_counts}
+        return {
+            "ok": 0,
+            "fail": 0,
+            "dry_run": True,
+            "split_counts": split_counts,
+            "skipped_empty_splits": skipped_empty_splits,
+        }
 
     manifest_records = _extract_manifest_records(jobs, cfg)
     vocab = _build_or_load_vocab(jobs, manifest_records, cfg)
@@ -482,7 +513,13 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
         failed_path.write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"failed list -> {failed_path}", flush=True)
 
-    summary = {"ok": ok, "fail": fail, "failed": failed, "split_counts": split_counts}
+    summary = {
+        "ok": ok,
+        "fail": fail,
+        "failed": failed,
+        "split_counts": split_counts,
+        "skipped_empty_splits": skipped_empty_splits,
+    }
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     if fail > 0 and cfg["fail_on_error"]:
         raise RuntimeError(

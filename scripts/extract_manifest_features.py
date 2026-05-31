@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.robust.manifest_features import extract_manifest_record
+from fusion.manifest_features import extract_manifest_record
 
 
 def _find_col(fieldnames: list[str] | None, candidates: list[str]) -> str | None:

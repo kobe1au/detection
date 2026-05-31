@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.robust.semantic_categories import (
+from fusion.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
     api_semantic_counts_from_type_ids,
     graph_semantic_counts_from_method_api_edges,

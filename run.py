@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import os
@@ -49,7 +49,7 @@ def resolve_targets(target: str) -> list[Path]:
 def run_config(config_path: Path) -> None:
     print(f"==> Running {config_path}", flush=True)
     subprocess.run(
-        [PYTHON_BIN, "-m", "fusion.robust.train", "--config", str(config_path)],
+        [PYTHON_BIN, "-m", "fusion.train", "--config", str(config_path)],
         check=True,
     )
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Build graph + API-sequence features from APK files.
@@ -67,7 +67,7 @@ except Exception:  # pragma: no cover - androguard version compatibility
     Analysis = None
 from androguard.core.dex import DEX
 
-from fusion.robust.semantic_categories import (
+from fusion.semantic_categories import (
     SEMANTIC_CATEGORIES,
     api_semantic_counts_from_type_ids,
     graph_semantic_counts_from_method_api_edges,

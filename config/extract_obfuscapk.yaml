@@ -66,4 +66,7 @@ execution:
   workers: 4
   resume: true
   fail_on_error: false
+  # Obfuscapk techniques are often generated incrementally; do not require
+  # every configured technique directory to be non-empty in each extraction run.
+  allow_empty_splits: true
   failed_json: ""

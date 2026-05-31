@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import random
 from typing import Iterable
 
 import torch
 
-from fusion.robust.semantic_categories import (
+from fusion.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
     api_semantic_counts_from_type_ids,
     graph_semantic_counts_from_method_api_edges,

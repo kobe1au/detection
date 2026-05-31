@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -15,11 +15,36 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.robust.dataset import RobustTriModalDataset, _normalize_loaded_pt
-from fusion.robust.train import build_dataset, load_config, resolve
+from fusion.dataset import RobustTriModalDataset, _normalize_loaded_pt
+from fusion.train import build_dataset, load_config, resolve
 
 
 ID_CANDIDATES = ("id", "sha256", "ID", "Id")
+SLICE_FIELDNAMES = [
+    "id",
+    "sha256",
+    "label",
+    "split",
+    "sid",
+    "slice",
+    "year",
+    "pt_path",
+    "dataset_failed",
+    "fail_reason",
+    "q_api",
+    "q_graph",
+    "q_manifest",
+    "q_align",
+    "pert_api",
+    "pert_graph",
+    "pert_manifest",
+    "api_semantic_sum",
+    "graph_semantic_sum",
+    "manifest_semantic_sum",
+    "manifest_parse_error",
+    "dex_failure_count",
+    "num_dex",
+]
 
 
 def _scalar(value: Any, default: float = 0.0) -> float:
@@ -151,13 +176,11 @@ def _slice_flags(metrics: dict[str, Any], args: argparse.Namespace) -> dict[str,
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames: list[str] = []
+    fieldnames: list[str] = list(SLICE_FIELDNAMES)
     for row in rows:
         for key in row:
             if key not in fieldnames:
                 fieldnames.append(key)
-    if not fieldnames:
-        fieldnames = ["split", "sid", "slice"]
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

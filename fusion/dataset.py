@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
@@ -12,12 +12,12 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
-from fusion.robust.perturbations import (
+from fusion.perturbations import (
     EVAL_PERTURB_TYPES,
     apply_perturbation,
     sample_training_perturbation,
 )
-from fusion.robust.semantic_categories import (
+from fusion.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
     api_semantic_counts_from_type_ids,
     graph_semantic_counts_from_method_api_edges,

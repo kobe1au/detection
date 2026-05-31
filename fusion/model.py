@@ -1,12 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fusion.robust.constants import ArchitectureConstants
-from fusion.robust.graph_encoders import GraphEncoderGAT, GraphEncoderGCN, GraphEncoderGPS
-from fusion.robust.semantic_categories import SEMANTIC_CATEGORY_DIM, validate_api_type_mapping
+from fusion.constants import ArchitectureConstants
+from fusion.graph_encoders import GraphEncoderGAT, GraphEncoderGCN, GraphEncoderGPS
+from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM, validate_api_type_mapping
 
 
 TRI_MODAL_FUSION_MODES = {

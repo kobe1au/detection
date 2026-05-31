@@ -1,4 +1,4 @@
-# Robust Tri-modal Fusion Mainline
+﻿# Robust Tri-modal Fusion Mainline
 
 Current mainline:
 
@@ -39,14 +39,14 @@ The robust model no longer compares raw API type-id histograms with Manifest cat
 The 12-D space is connected to the extractor through three hand-written tables that must stay consistent:
 
 - `extract.extract_graph_api.API_CATEGORY_NAMES` — extractor's per-API-event type id space (id 0 reserved for `other` / unknown).
-- `fusion.robust.semantic_categories.DEFAULT_API_TYPE_ID_TO_CATEGORY` — mapping from extractor type ids into the 12-D taxonomy.
-- `fusion.robust.manifest_features.DEFAULT_CATEGORIES` — the canonical 12-D category list.
+- `fusion.semantic_categories.DEFAULT_API_TYPE_ID_TO_CATEGORY` — mapping from extractor type ids into the 12-D taxonomy.
+- `fusion.manifest_features.DEFAULT_CATEGORIES` — the canonical 12-D category list.
 
 `validate_api_type_mapping()` is called at every model `__init__` and at the start of the direct tri-modal builder. It raises with a precise diff when a mapping key falls outside the extractor range or a mapping value is not in the 12-D taxonomy, preventing the three tables from silently drifting apart.
 
 ### Structural-context graph category alignment
 
-The Graph branch is structural; reusing the full API histogram as its semantic distribution would conflate "events present anywhere in the sample" with "events that the call graph actually carries". `graph_semantic_counts_from_method_api_edges` in `fusion/robust/semantic_categories.py` instead aggregates only the API events anchored to graph methods through `method_api_edge_index`. This is the default Graph semantic source.
+The Graph branch is structural; reusing the full API histogram as its semantic distribution would conflate "events present anywhere in the sample" with "events that the call graph actually carries". `graph_semantic_counts_from_method_api_edges` in `fusion/semantic_categories.py` instead aggregates only the API events anchored to graph methods through `method_api_edge_index`. This is the default Graph semantic source.
 
 Three sources are exposed for ablation through `data.graph_semantic_source` in the dataset config:
 

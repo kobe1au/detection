@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
 
-from fusion.robust.manifest_features import DEFAULT_CATEGORIES
+from fusion.manifest_features import DEFAULT_CATEGORIES
 
 
 SEMANTIC_CATEGORIES = tuple(DEFAULT_CATEGORIES)
@@ -104,9 +104,9 @@ def validate_api_type_mapping(
         "DEFAULT_API_TYPE_ID_TO_CATEGORY is inconsistent with extractor / "
         "shared taxonomy: "
         + "; ".join(parts)
-        + ". Update fusion.robust.semantic_categories.DEFAULT_API_TYPE_ID_TO_CATEGORY "
+        + ". Update fusion.semantic_categories.DEFAULT_API_TYPE_ID_TO_CATEGORY "
         "together with extract.extract_graph_api.API_CATEGORY_NAMES and "
-        "fusion.robust.manifest_features.DEFAULT_CATEGORIES."
+        "fusion.manifest_features.DEFAULT_CATEGORIES."
     )
 
 

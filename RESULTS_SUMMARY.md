@@ -1,4 +1,4 @@
-# Robust Experiment Summary
+﻿# Robust Experiment Summary
 
 The active experiment set is `config/experiments/tri_modal_robust`.
 
@@ -16,7 +16,7 @@ python run.py reliability
 Training entry:
 
 ```bash
-python -m fusion.robust.train --config config/experiments/tri_modal_robust/T7_tri_modal_full_soft_consistency.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/T7_tri_modal_full_soft_consistency.yaml
 ```
 
 ## Baselines
