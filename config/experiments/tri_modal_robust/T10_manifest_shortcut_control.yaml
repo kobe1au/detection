@@ -1,0 +1,17 @@
+defaults:
+  - T7_tri_modal_full_soft_consistency.yaml
+
+train:
+  exp_name: "T10_manifest_shortcut_control"
+
+eval:
+  extra_sets:
+    - name: "manifest_shuffled"
+      pt_dir: "D:/pts_manifest_controls/shuffled/test"
+      csv: "results/manifest_shortcut_controls/shuffled_test.csv"
+    - name: "manifest_zeroed"
+      pt_dir: "D:/pts_manifest_controls/zeroed/test"
+      csv: "results/manifest_shortcut_controls/zeroed_test.csv"
+    - name: "manifest_noisy"
+      pt_dir: "D:/pts_manifest_controls/noisy/test"
+      csv: "results/manifest_shortcut_controls/noisy_test.csv"

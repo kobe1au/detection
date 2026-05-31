@@ -1,0 +1,32 @@
+defaults:
+  - T7_tri_modal_full_soft_consistency.yaml
+
+train:
+  exp_name: "T8_obfuscapk_eval"
+
+eval:
+  extra_sets:
+    - name: "obfuscapk_rebuild"
+      pt_dir: "D:/pts_obfuscapk/rebuild"
+      csv: "D:/obfuscapk_benchmark/labels/rebuild.csv"
+    - name: "obfuscapk_rename"
+      pt_dir: "D:/pts_obfuscapk/rename"
+      csv: "D:/obfuscapk_benchmark/labels/rename.csv"
+    - name: "obfuscapk_string_encrypt"
+      pt_dir: "D:/pts_obfuscapk/string_encrypt"
+      csv: "D:/obfuscapk_benchmark/labels/string_encrypt.csv"
+    - name: "obfuscapk_reflection"
+      pt_dir: "D:/pts_obfuscapk/reflection"
+      csv: "D:/obfuscapk_benchmark/labels/reflection.csv"
+    - name: "obfuscapk_call_indirection"
+      pt_dir: "D:/pts_obfuscapk/call_indirection"
+      csv: "D:/obfuscapk_benchmark/labels/call_indirection.csv"
+    - name: "obfuscapk_control_flow"
+      pt_dir: "D:/pts_obfuscapk/control_flow"
+      csv: "D:/obfuscapk_benchmark/labels/control_flow.csv"
+    - name: "obfuscapk_junk_code"
+      pt_dir: "D:/pts_obfuscapk/junk_code"
+      csv: "D:/obfuscapk_benchmark/labels/junk_code.csv"
+    - name: "obfuscapk_manifest_noise"
+      pt_dir: "D:/pts_obfuscapk/manifest_noise"
+      csv: "D:/obfuscapk_benchmark/labels/manifest_noise.csv"

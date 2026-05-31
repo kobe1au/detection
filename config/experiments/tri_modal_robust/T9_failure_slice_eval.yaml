@@ -1,0 +1,29 @@
+defaults:
+  - T7_tri_modal_full_soft_consistency.yaml
+
+train:
+  exp_name: "T9_failure_slice_eval"
+
+eval:
+  extra_sets:
+    - name: "slice_api_low_quality"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_api_low_quality.csv"
+    - name: "slice_graph_low_quality"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_graph_low_quality.csv"
+    - name: "slice_align_low_quality"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_align_low_quality.csv"
+    - name: "slice_code_common_failure"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_code_common_failure.csv"
+    - name: "slice_graph_semantic_missing"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_graph_semantic_missing.csv"
+    - name: "slice_manifest_parse_failed"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_manifest_parse_failed.csv"
+    - name: "slice_multi_dex_partial_failed"
+      pt_dir: "D:/pts_tri/test"
+      csv: "results/robust_slices/test_multi_dex_partial_failed.csv"

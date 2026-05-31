@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import json
 import logging
 import os
 import random
@@ -121,33 +122,68 @@ def resolve(root: str | Path, path: str | Path) -> str:
     return str(Path(root) / path)
 
 
-def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | None = None, perturb_strength: float = 0.0):
+def _dataset_common_kwargs(
+    cfg: dict,
+    is_train: bool,
+    perturb_type: str | None = None,
+    perturb_strength: float = 0.0,
+) -> dict[str, Any]:
     data_cfg = cfg["data"]
     robust_cfg = cfg.get("robust", {})
     model_cfg = cfg.get("model", {})
     manifest_cfg = model_cfg.get("manifest_encoder", {})
+    return {
+        "is_train": is_train,
+        "robust_aug": bool(robust_cfg.get("train_aug", False)) if is_train else False,
+        "perturb_prob": float(robust_cfg.get("perturb_prob", 0.5)),
+        "perturb_strengths": list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
+        "eval_perturb_type": perturb_type,
+        "eval_perturb_strength": perturb_strength,
+        "manifest_dim": int(manifest_cfg.get("in_dim", 256)),
+        "manifest_category_dim": int(manifest_cfg.get("category_dim", 12)),
+        "manifest_stats_dim": int(manifest_cfg.get("stats_dim", 11)),
+        "manifest_permission_dim": int(manifest_cfg.get("permission_dim", 128)),
+        "manifest_intent_dim": int(manifest_cfg.get("intent_dim", 64)),
+        "manifest_feature_dim": int(manifest_cfg.get("feature_dim", 32)),
+        "max_api_events_per_sample": data_cfg.get("max_api_events_per_sample"),
+        "drop_graph_behavior_hints": bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
+        "degrade_category_counts": bool(robust_cfg.get("degrade_category_counts", True)),
+        "graph_semantic_source": str(data_cfg.get("graph_semantic_source", "alignment")),
+    }
+
+
+def build_dataset_from_paths(
+    cfg: dict,
+    pt_dir: str | Path,
+    csv_path: str | Path,
+    is_train: bool,
+    perturb_type: str | None = None,
+    perturb_strength: float = 0.0,
+):
+    return RobustTriModalDataset(
+        pt_dir=str(pt_dir),
+        csv_path=str(csv_path),
+        **_dataset_common_kwargs(
+            cfg,
+            is_train=is_train,
+            perturb_type=perturb_type,
+            perturb_strength=perturb_strength,
+        ),
+    )
+
+
+def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | None = None, perturb_strength: float = 0.0):
+    data_cfg = cfg["data"]
     data_root = data_cfg.get("root", "")
     pt_dir = resolve(data_root, data_cfg[f"{split}_pt_dir"])
     csv_path = resolve(data_root, data_cfg[f"{split}_csv"])
-    return RobustTriModalDataset(
-        pt_dir=pt_dir,
-        csv_path=csv_path,
+    return build_dataset_from_paths(
+        cfg,
+        pt_dir,
+        csv_path,
         is_train=is_train,
-        robust_aug=bool(robust_cfg.get("train_aug", False)) if is_train else False,
-        perturb_prob=float(robust_cfg.get("perturb_prob", 0.5)),
-        perturb_strengths=list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
-        eval_perturb_type=perturb_type,
-        eval_perturb_strength=perturb_strength,
-        manifest_dim=int(manifest_cfg.get("in_dim", 256)),
-        manifest_category_dim=int(manifest_cfg.get("category_dim", 12)),
-        manifest_stats_dim=int(manifest_cfg.get("stats_dim", 11)),
-        manifest_permission_dim=int(manifest_cfg.get("permission_dim", 128)),
-        manifest_intent_dim=int(manifest_cfg.get("intent_dim", 64)),
-        manifest_feature_dim=int(manifest_cfg.get("feature_dim", 32)),
-        max_api_events_per_sample=data_cfg.get("max_api_events_per_sample"),
-        drop_graph_behavior_hints=bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
-        degrade_category_counts=bool(robust_cfg.get("degrade_category_counts", True)),
-        graph_semantic_source=str(data_cfg.get("graph_semantic_source", "alignment")),
+        perturb_type=perturb_type,
+        perturb_strength=perturb_strength,
     )
 
 
@@ -165,12 +201,20 @@ def build_loader(cfg: dict, dataset, is_train: bool):
     )
 
 
-def enforce_failed_ratio(metrics: dict[str, Any], cfg: dict, split_name: str) -> None:
+def enforce_failed_ratio(
+    metrics: dict[str, Any],
+    cfg: dict,
+    split_name: str,
+    max_failed_ratio: float | None = None,
+) -> None:
     total = int(metrics.get("num_eval", 0)) + int(metrics.get("num_failed", 0))
     if total <= 0:
         raise RuntimeError(f"{split_name}: no valid or failed samples were seen")
     failed_ratio = float(metrics.get("num_failed", 0)) / float(total)
-    max_failed_ratio = float(cfg.get("data", {}).get("max_failed_ratio", 0.0))
+    if max_failed_ratio is None:
+        max_failed_ratio = float(cfg.get("data", {}).get("max_failed_ratio", 0.0))
+    else:
+        max_failed_ratio = float(max_failed_ratio)
     if failed_ratio > max_failed_ratio:
         raise RuntimeError(
             f"{split_name}: failed sample ratio {failed_ratio:.4f} exceeds "
@@ -344,6 +388,41 @@ def write_gate_dump(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _normalize_extra_eval_sets(raw_sets: Any) -> list[dict[str, Any]]:
+    if not raw_sets:
+        return []
+    if isinstance(raw_sets, dict):
+        return [
+            {"name": str(name), **(value if isinstance(value, dict) else {})}
+            for name, value in raw_sets.items()
+        ]
+    if isinstance(raw_sets, list):
+        out = []
+        for idx, item in enumerate(raw_sets):
+            if not isinstance(item, dict):
+                raise ValueError(f"eval.extra_sets[{idx}] must be a mapping")
+            out.append(dict(item))
+        return out
+    raise ValueError("eval.extra_sets must be a list or mapping")
+
+
+def _extra_eval_paths(cfg: dict, item: dict[str, Any]) -> tuple[str, str]:
+    root = str(item.get("root", cfg.get("data", {}).get("root", "")) or "")
+    pt_value = item.get("pt_dir") or item.get("test_pt_dir")
+    csv_value = item.get("csv") or item.get("csv_path") or item.get("test_csv")
+    if not pt_value:
+        raise ValueError(f"extra eval set {item.get('name', '<unnamed>')} is missing pt_dir")
+    if not csv_value:
+        raise ValueError(f"extra eval set {item.get('name', '<unnamed>')} is missing csv")
+    return resolve(root, pt_value), resolve(root, csv_value)
+
+
+def _write_metrics_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def run(cfg: dict) -> dict[str, Any]:
     logging.basicConfig(level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO))
     train_cfg = cfg["train"]
@@ -433,8 +512,58 @@ def run(cfg: dict) -> dict[str, Any]:
             robust_results[result_key] = metrics
             all_rows.extend(rows)
 
+    extra_results = {}
+    extra_rows: list[dict[str, Any]] = []
+    for idx, extra in enumerate(_normalize_extra_eval_sets(eval_cfg.get("extra_sets"))):
+        name = str(extra.get("name") or f"extra_{idx}")
+        pt_dir, csv_path = _extra_eval_paths(cfg, extra)
+        perturb_type = extra.get("perturb_type")
+        perturb_strength = float(extra.get("perturb_strength", 0.0))
+        try:
+            extra_ds = build_dataset_from_paths(
+                cfg,
+                pt_dir=pt_dir,
+                csv_path=csv_path,
+                is_train=False,
+                perturb_type=str(perturb_type) if perturb_type else None,
+                perturb_strength=perturb_strength,
+            )
+        except Exception as exc:
+            if bool(extra.get("skip_if_empty", True)):
+                extra_results[name] = {
+                    "skipped": True,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "pt_dir": str(pt_dir),
+                    "csv": str(csv_path),
+                }
+                continue
+            raise
+        extra_loader = build_loader(cfg, extra_ds, is_train=False)
+        split_name = str(extra.get("split_name") or name)
+        metrics, rows = evaluate(model, extra_loader, device, use_amp, split_name, dump_rows=True)
+        enforce_failed_ratio(metrics, cfg, split_name, max_failed_ratio=extra.get("max_failed_ratio"))
+        metrics = {
+            **metrics,
+            "pt_dir": str(pt_dir),
+            "csv": str(csv_path),
+            "perturb_type": str(perturb_type or ""),
+            "perturb_strength": perturb_strength,
+        }
+        extra_results[name] = metrics
+        all_rows.extend(rows)
+        extra_rows.extend(rows)
+
     write_gate_dump(out_dir / "gate_diagnostics.csv", all_rows)
-    summary = {"best_val_f1": best_f1, "val": val_metrics, "test": test_metrics, "robust": robust_results}
+    write_gate_dump(out_dir / "gate_diagnostics_extra_eval.csv", extra_rows)
+    if extra_results:
+        _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
+    summary = {
+        "best_val_f1": best_f1,
+        "val": val_metrics,
+        "test": test_metrics,
+        "robust": robust_results,
+        "extra_eval": extra_results,
+    }
     with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(summary, f, sort_keys=False)
     logger.info("finished: %s", out_dir)
