@@ -258,7 +258,7 @@ class AEGModel(nn.Module):
         q_manifest = _graph_scalar(data, "q_manifest", 0.0).to(data.x.device)
         q_align = _graph_scalar(data, "q_align", 0.0).to(data.x.device)
         code_rel = (q_api.clamp_min(0.0) * q_graph.clamp_min(0.0)).sqrt()
-        risk_rel = torch.stack([code_rel, q_manifest, q_align.clamp_min(0.0)], dim=-1).amax(dim=-1)
+        risk_rel = _masked_mean(data.node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
         global_rel = torch.stack([code_rel, q_manifest], dim=-1).amax(dim=-1)
         token_rel = torch.stack(
             [q_graph, q_api, q_manifest, q_manifest, risk_rel, q_api, global_rel],

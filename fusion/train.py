@@ -276,6 +276,9 @@ def evaluate(
                     "manifest_reliability": float(extra["manifest_reliability"][idx].item()),
                     "code_manifest_similarity": float(extra["code_manifest_similarity"][idx].item()),
                     "code_manifest_conflict": float(extra["code_manifest_conflict"][idx].item()),
+                    "manifest_donor_sid": batch.get("manifest_donor_sid", [""] * y.numel())[idx]
+                    if idx < len(batch.get("manifest_donor_sid", []))
+                    else "",
                 }
                 if isinstance(attn, torch.Tensor) and attn.ndim == 2 and idx < attn.size(0):
                     attn_names = [

@@ -106,6 +106,8 @@ def test_aeg_perturbation_updates_reliability():
     assert degraded.view_type_id.item() == VIEW_TYPES["api_missing"]
     assert degraded.q_api.item() == 0.0
     assert degraded.q_align.item() == 0.0
+    method_mask = degraded.node_type == NODE_TYPES["METHOD"]
+    assert torch.all(degraded.node_semantic[method_mask] == 0)
     api_related = torch.isin(
         degraded.edge_type,
         torch.tensor(
@@ -114,12 +116,37 @@ def test_aeg_perturbation_updates_reliability():
                 EDGE_TYPES["API_FAMILY_INVOKED_BY_METHOD"],
                 EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"],
                 EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
+                EDGE_TYPES["METHOD_HAS_RISK"],
+                EDGE_TYPES["RISK_OBSERVED_IN_METHOD"],
             ],
             dtype=torch.long,
         ),
     )
     assert bool(api_related.any())
     assert torch.all(degraded.edge_quality[api_related] == 0)
+
+
+def test_manifest_missing_clears_aggregate_semantic_and_refreshes_risk():
+    degraded = apply_aeg_view(payload_to_data(_payload(), label=1), view="manifest_missing", strength=1.0)
+    apk_mask = degraded.node_type == NODE_TYPES["APK"]
+    assert torch.all(degraded.node_semantic[apk_mask] == 0)
+    risk_mask = degraded.node_type == NODE_TYPES["RISK_SEMANTIC"]
+    src, dst = degraded.edge_index
+    risk_edge_types = torch.tensor(
+        [
+            EDGE_TYPES["METHOD_HAS_RISK"],
+            EDGE_TYPES["RISK_OBSERVED_IN_METHOD"],
+            EDGE_TYPES["MANIFEST_HAS_RISK"],
+            EDGE_TYPES["RISK_DECLARED_BY_MANIFEST"],
+        ],
+        dtype=torch.long,
+    )
+    risk_edge_mask = torch.isin(degraded.edge_type, risk_edge_types) & (degraded.edge_quality > 0)
+    for idx in torch.where(risk_mask)[0].tolist():
+        has_live = bool((((src == idx) | (dst == idx)) & risk_edge_mask).any())
+        if not has_live:
+            assert degraded.node_quality[idx].item() == 0.0
+            assert torch.all(degraded.node_semantic[idx] == 0)
 
 
 def test_manifest_shuffle_is_type_aware(tmp_path: Path):
@@ -139,6 +166,8 @@ def test_manifest_shuffle_is_type_aware(tmp_path: Path):
     )
     shuffled = batch["aug"].to_data_list()[0]
     assert torch.equal(shuffled.node_type, before_type)
+    apk_mask = shuffled.node_type == NODE_TYPES["APK"]
+    assert torch.all(shuffled.node_semantic[apk_mask] == 0)
     manifest_types = {NODE_TYPES["PERMISSION"], NODE_TYPES["INTENT"], NODE_TYPES["COMPONENT"]}
     for node_type in manifest_types:
         mask = (shuffled.node_source == 1) & (shuffled.node_type == node_type)

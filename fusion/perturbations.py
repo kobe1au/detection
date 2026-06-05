@@ -11,6 +11,8 @@ API_EDGE_TYPES = {
     EDGE_TYPES["API_FAMILY_INVOKED_BY_METHOD"],
     EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"],
     EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
+    EDGE_TYPES["METHOD_HAS_RISK"],
+    EDGE_TYPES["RISK_OBSERVED_IN_METHOD"],
 }
 
 GRAPH_EDGE_TYPES = {
@@ -105,13 +107,78 @@ def _refresh_align_after_code_perturb(data: Data) -> None:
     _set_scalar(data, "q_align", min(q_align, q_api, q_graph))
 
 
+def clear_aggregate_apk_semantic(data: Data) -> None:
+    if not hasattr(data, "node_semantic"):
+        return
+    apk_mask = _node_mask(data, node_types={NODE_TYPES["APK"]})
+    if bool(apk_mask.any()):
+        data.node_semantic[apk_mask] = 0.0
+
+
+def _degrade_api_derived_method_semantic(data: Data, strength: float, *, missing: bool) -> None:
+    if not hasattr(data, "node_semantic"):
+        return
+    method_mask = _node_mask(data, node_types={NODE_TYPES["METHOD"]})
+    if not bool(method_mask.any()):
+        return
+    if missing:
+        data.node_semantic[method_mask] = 0.0
+    else:
+        data.node_semantic[method_mask] = data.node_semantic[method_mask] * (1.0 - _clamp_strength(strength))
+
+
+def refresh_risk_node_quality(data: Data) -> None:
+    if not hasattr(data, "node_quality") or not hasattr(data, "node_semantic") or not hasattr(data, "edge_type"):
+        return
+    risk_nodes = torch.where(_node_mask(data, node_types={NODE_TYPES["RISK_SEMANTIC"]}))[0]
+    if risk_nodes.numel() == 0:
+        return
+    if not hasattr(data, "edge_quality") or data.edge_index.numel() == 0:
+        data.node_quality[risk_nodes] = 0.0
+        data.node_semantic[risk_nodes] = 0.0
+        return
+
+    device = data.node_quality.device
+    edge_type = data.edge_type.to(device)
+    edge_quality = data.edge_quality.to(device).float().view(-1).clamp_min(0.0)
+    src, dst = data.edge_index.to(device).long()
+    code_edge_types = torch.tensor(
+        [EDGE_TYPES["METHOD_HAS_RISK"], EDGE_TYPES["RISK_OBSERVED_IN_METHOD"]],
+        dtype=torch.long,
+        device=device,
+    )
+    manifest_edge_types = torch.tensor(
+        [EDGE_TYPES["MANIFEST_HAS_RISK"], EDGE_TYPES["RISK_DECLARED_BY_MANIFEST"]],
+        dtype=torch.long,
+        device=device,
+    )
+    q_api = float(getattr(data, "q_api", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    q_graph = float(getattr(data, "q_graph", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    q_manifest = float(getattr(data, "q_manifest", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    code_reliability = max(q_api, 0.0) ** 0.5 * max(q_graph, 0.0) ** 0.5
+
+    code_type_mask = torch.isin(edge_type, code_edge_types)
+    manifest_type_mask = torch.isin(edge_type, manifest_edge_types)
+    for risk_idx in risk_nodes.tolist():
+        incident = (src == risk_idx) | (dst == risk_idx)
+        code_strength = edge_quality[incident & code_type_mask].max().item() if bool((incident & code_type_mask).any()) else 0.0
+        manifest_strength = edge_quality[incident & manifest_type_mask].max().item() if bool((incident & manifest_type_mask).any()) else 0.0
+        quality = max(code_reliability * code_strength, q_manifest * manifest_strength)
+        data.node_quality[risk_idx] = float(max(0.0, min(1.0, quality)))
+        if quality <= 0.0:
+            data.node_semantic[risk_idx] = 0.0
+
+
 def _degrade_api(data: Data, strength: float, *, missing: bool = False) -> None:
     api_nodes = _node_mask(data, node_types={NODE_TYPES["API_FAMILY"]})
     api_edges = _edge_mask(data, edge_types=API_EDGE_TYPES)
     _soft_degrade_nodes(data, api_nodes, strength, zero=missing)
     _soft_degrade_edges(data, api_edges, strength, zero=missing)
+    _degrade_api_derived_method_semantic(data, strength, missing=missing)
+    clear_aggregate_apk_semantic(data)
     _set_scalar(data, "q_api", 0.0 if missing else float(data.q_api.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
     _refresh_align_after_code_perturb(data)
+    refresh_risk_node_quality(data)
 
 
 def _degrade_graph(data: Data, strength: float, *, missing: bool = False) -> None:
@@ -121,6 +188,7 @@ def _degrade_graph(data: Data, strength: float, *, missing: bool = False) -> Non
     _soft_degrade_edges(data, graph_edges, strength, zero=missing)
     _set_scalar(data, "q_graph", 0.0 if missing else float(data.q_graph.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
     _refresh_align_after_code_perturb(data)
+    refresh_risk_node_quality(data)
 
 
 def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noisy: bool = False) -> None:
@@ -128,7 +196,9 @@ def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noi
     manifest_edges = _edge_mask(data, edge_types=MANIFEST_EDGE_TYPES, sources={SOURCE_TYPES["manifest"]})
     _soft_degrade_nodes(data, manifest_nodes, strength, zero=missing, noise=noisy)
     _soft_degrade_edges(data, manifest_edges, strength, zero=missing)
+    clear_aggregate_apk_semantic(data)
     _set_scalar(data, "q_manifest", 0.0 if missing else float(data.q_manifest.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
+    refresh_risk_node_quality(data)
 
 
 def apply_aeg_view(data: Data, *, view: str, strength: float = 0.5) -> Data:

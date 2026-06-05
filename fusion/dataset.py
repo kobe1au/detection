@@ -18,7 +18,7 @@ from fusion.constants import (
     SOURCE_TYPES,
     VIEW_TYPES,
 )
-from fusion.perturbations import apply_aeg_view
+from fusion.perturbations import apply_aeg_view, clear_aggregate_apk_semantic, refresh_risk_node_quality
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
 
 
@@ -313,6 +313,8 @@ def _copy_manifest_content(target: Data, donor: Data) -> None:
         target.node_semantic[target_idx] = donor.node_semantic[repeat]
     target.q_manifest = donor.q_manifest.clone()
     _zero_shuffled_manifest_edges(target)
+    clear_aggregate_apk_semantic(target)
+    refresh_risk_node_quality(target)
 
 
 def _zero_manifest_nodes(data: Data) -> None:
@@ -323,6 +325,8 @@ def _zero_manifest_nodes(data: Data) -> None:
         data.node_semantic[mask] = 0.0
     data.q_manifest = torch.tensor([0.0], dtype=torch.float32)
     _zero_shuffled_manifest_edges(data)
+    clear_aggregate_apk_semantic(data)
+    refresh_risk_node_quality(data)
 
 
 def _zero_shuffled_manifest_edges(data: Data) -> None:
