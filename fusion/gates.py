@@ -31,6 +31,11 @@ class FourBranchEvidenceGate(nn.Module):
 
 
 def heuristic_reliability_gate(evidence: torch.Tensor) -> torch.Tensor:
+    if evidence.size(-1) < EvidenceIndex.BASE_DIM:
+        raise ValueError(
+            f"heuristic_reliability_gate expected ≥{EvidenceIndex.BASE_DIM} evidence dims, "
+            f"got {evidence.size(-1)}"
+        )
     r_api = evidence[:, EvidenceIndex.R_API : EvidenceIndex.R_API + 1]
     r_graph = evidence[:, EvidenceIndex.R_GRAPH : EvidenceIndex.R_GRAPH + 1]
     r_manifest = evidence[:, EvidenceIndex.R_MANIFEST : EvidenceIndex.R_MANIFEST + 1]
@@ -74,6 +79,11 @@ def heuristic_reliability_gate(evidence: torch.Tensor) -> torch.Tensor:
 
 
 def confidence_gate(evidence: torch.Tensor) -> torch.Tensor:
+    if evidence.size(-1) < EvidenceIndex.BASE_DIM:
+        raise ValueError(
+            f"confidence_gate expected ≥{EvidenceIndex.BASE_DIM} evidence dims, "
+            f"got {evidence.size(-1)}"
+        )
     scores = torch.cat(
         [
             evidence[:, EvidenceIndex.API_CONFIDENCE : EvidenceIndex.API_CONFIDENCE + 1],

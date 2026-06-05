@@ -110,6 +110,14 @@ def available_configs() -> dict[str, Path]:
             continue
         rel = path.relative_to(CONFIG_DIR).with_suffix("")
         configs[str(rel).replace("\\", "/")] = path
+        if path.stem in configs:
+            import warnings
+            warnings.warn(
+                f"Config stem collision: '{path.stem}' from '{rel}' is not reachable "
+                f"by stem lookup because the earlier entry "
+                f"'{configs[path.stem].relative_to(CONFIG_DIR)}' keeps that alias. "
+                "Use the relative config path to select the later entry."
+            )
         configs.setdefault(path.stem, path)
     return configs
 

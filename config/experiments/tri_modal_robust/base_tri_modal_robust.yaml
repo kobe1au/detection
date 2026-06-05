@@ -14,6 +14,8 @@ data:
   graph_semantic_source: alignment
   strict_split_integrity: true
   strict_partition_isolation: true
+  # Formal experiments must use one consistent current-schema PT dataset.
+  min_pt_schema_version: 3
 
 train:
   exp_name: base_tri_modal_robust
@@ -63,8 +65,8 @@ model:
     hidden: 128
     heads: 4
     layers: 2
-    use_behavior_hint: true
-    drop_extracted_behavior_hints: false
+    use_behavior_hint: false
+    drop_extracted_behavior_hints: true
 
   manifest_encoder:
     enabled: true
@@ -99,7 +101,6 @@ robust:
   train_aug: true
   perturb_prob: 0.5
   perturb_strengths: [0.1, 0.3, 0.5]
-  degrade_category_counts: true
 
 eval:
   run_test: true

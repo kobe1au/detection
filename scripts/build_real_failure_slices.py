@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.dataset import RobustTriModalDataset, _normalize_loaded_pt
+from fusion.dataset import RobustTriModalDataset, _normalize_loaded_pt, apply_dex_success_ratio
 from fusion.train import build_dataset, load_config, resolve
 
 
@@ -112,6 +112,7 @@ def _analyze_pt(dataset: RobustTriModalDataset, pt_path: Path) -> dict[str, Any]
         data = dataset._aggregate_api_graph(dex_list)
         if data is None:
             raise ValueError("empty valid sample")
+        apply_dex_success_ratio(data, sources)
         graph_counts_from_source = data.get("graph_semantic_category_counts")
         manifest_payload = dataset._manifest_payload(sources)
         data.update(manifest_payload)
@@ -152,7 +153,7 @@ def _analyze_pt(dataset: RobustTriModalDataset, pt_path: Path) -> dict[str, Any]
         "manifest_semantic_sum": _tensor_sum(data.get("manifest_category_counts")),
         "manifest_parse_error": str(manifest_meta.get("parse_error") or ""),
         "dex_failure_count": len(dex_failures or []) if isinstance(dex_failures, list) else 0,
-        "num_dex": int(meta.get("num_dex", len(dex_list))) if isinstance(meta, dict) else len(dex_list),
+        "num_dex": int(meta.get("num_dex_total", meta.get("num_dex", len(dex_list)))) if isinstance(meta, dict) else len(dex_list),
     }
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from fusion.constants import ArchitectureConstants
+from fusion.constants import ArchitectureConstants, EvidenceIndex
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
 
 
@@ -85,8 +85,11 @@ def prob_disagreement(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def modality_alive(emb: torch.Tensor) -> torch.Tensor:
+    # NOTE: the `>` comparison already breaks gradient flow, so `gate_detach=False`
+    # cannot propagate gradients through alive signals — this is intentional
+    # because alive is a binary gate quantity, not a continuous optimisation target.
     alive = (
-        emb.detach().abs().sum(dim=-1, keepdim=True)
+        emb.abs().sum(dim=-1, keepdim=True)
         > ArchitectureConstants.MODALITY_ALIVE_THRESHOLD
     )
     return alive.to(dtype=emb.dtype)
@@ -134,8 +137,18 @@ def directional_semantic_conflicts(
     code = code / code.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     manifest = manifest / manifest.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
-    manifest_to_code = (manifest - code).clamp_min(0.0).sum(dim=-1, keepdim=True)
-    code_to_manifest = (code - manifest).clamp_min(0.0).sum(dim=-1, keepdim=True)
+    # Asymmetric conflict: excess weighted by the source distribution so the
+    # two directions are not trivially equal.  When code · manifest ≜ 1,
+    # sum(max(manifest-code, 0)) = sum(max(code-manifest, 0)), so the
+    # unweighted total-variation directions are identical.  Weighting by the
+    # *declaring* distribution breaks the symmetry:
+    #   manifest→code: where manifest exceeds code, weight by manifest
+    #   code→manifest: where code     exceeds manifest, weight by code
+    manifest_excess = (manifest - code).clamp_min(0.0)
+    code_excess = (code - manifest).clamp_min(0.0)
+
+    manifest_to_code = (manifest_excess * manifest).sum(dim=-1, keepdim=True)
+    code_to_manifest = (code_excess * code).sum(dim=-1, keepdim=True)
 
     zero = torch.zeros_like(manifest_to_code)
 
@@ -158,7 +171,8 @@ def build_evidence(
     use_consistency_evidence: bool,
     use_conflict_evidence: bool,
     use_perturbation_evidence: bool,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    diagnostics_only: bool = False,
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
     batch_size = api_logits.size(0)
     device = api_logits.device
     dtype = api_logits.dtype
@@ -195,7 +209,7 @@ def build_evidence(
         device,
         dtype,
     )
-    if float(api_counts.detach().abs().sum().item()) <= 0.0:
+    if api_counts.detach().abs().sum() <= 0.0:
         api_counts = semantic_counts_attr(
             graph_data,
             "api_category_counts",
@@ -211,7 +225,7 @@ def build_evidence(
         device,
         dtype,
     )
-    if float(graph_counts.detach().abs().sum().item()) <= 0.0:
+    if graph_counts.detach().abs().sum() <= 0.0:
         graph_counts = semantic_counts_attr(
             graph_data,
             "graph_category_counts",
@@ -271,31 +285,45 @@ def build_evidence(
         * (q_manifest > 0.0).to(dtype=dtype)
     )
 
-    evidence = torch.cat(
-        [
-            q_align,
-            r_api,
-            r_graph,
-            r_manifest,
-            api_conf,
-            graph_conf,
-            manifest_conf,
-            joint_conf,
-            api_graph_disagreement,
-            evidence_api_graph_consistency,
-            evidence_api_manifest_consistency,
-            evidence_graph_manifest_consistency,
-            api_alive,
-            graph_alive,
-            manifest_alive,
-            evidence_manifest_to_code_conflict,
-            evidence_code_to_manifest_conflict,
-        ],
-        dim=-1,
-    )
+    if diagnostics_only:
+        evidence = None
+    else:
+        evidence = torch.cat(
+            [
+                q_align,
+                r_api,
+                r_graph,
+                r_manifest,
+                api_conf,
+                graph_conf,
+                manifest_conf,
+                joint_conf,
+                api_graph_disagreement,
+                evidence_api_graph_consistency,
+                evidence_api_manifest_consistency,
+                evidence_graph_manifest_consistency,
+                api_alive,
+                graph_alive,
+                manifest_alive,
+                evidence_manifest_to_code_conflict,
+                evidence_code_to_manifest_conflict,
+            ],
+            dim=-1,
+        )
 
-    if use_perturbation_evidence:
-        evidence = torch.cat([evidence, pert_api, pert_graph, pert_manifest], dim=-1)
+        if use_perturbation_evidence:
+            evidence = torch.cat([evidence, pert_api, pert_graph, pert_manifest], dim=-1)
+
+        expected_dim = (
+            EvidenceIndex.WITH_PERTURBATION_DIM
+            if use_perturbation_evidence
+            else EvidenceIndex.BASE_DIM
+        )
+        if evidence.size(-1) != expected_dim:
+            raise RuntimeError(
+                f"Evidence dimension mismatch: built {evidence.size(-1)}, "
+                f"expected {expected_dim}"
+            )
 
     diagnostics = {
         "q_api": q_api.detach().view(batch_size),

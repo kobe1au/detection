@@ -32,7 +32,7 @@ crypto, system_settings
 
 The robust model no longer compares raw API type-id histograms with Manifest categories. API type ids are mapped into this taxonomy, Graph counts are accepted only when already provided in this taxonomy, and Manifest counts are produced from the same category list.
 
-`T7_tri_modal_full_soft_consistency.yaml` enables the trainable soft consistency loss. This loss uses lightweight semantic projection heads over API, Graph, and Manifest embeddings, then applies reliability-weighted cosine direction losses against category-count soft targets. It is category-level soft supervision, not Manifest hard-anchor embedding alignment.
+`config/experiments/tri_modal_robust/full/ours.yaml` enables the trainable cross-source soft consistency loss. This loss uses lightweight semantic projection heads over API, Graph, and Manifest embeddings, then applies reliability-weighted cosine direction losses against category-count soft targets. It is category-level soft supervision, not Manifest hard-anchor embedding alignment.
 
 ### Trust chain (runtime-validated)
 

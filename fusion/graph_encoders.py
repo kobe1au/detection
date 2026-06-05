@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, GCNConv
-from torch_geometric.utils import softmax, to_dense_batch
+from torch_geometric.utils import softmax
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ def _filter_edges(edge_index: torch.Tensor, keep_global: torch.Tensor,
     return torch.stack([src[valid], dst[valid]], dim=0)
 
 
-def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = True):
+def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = False):
     """Sensitive-node-priority truncation (vectorised)."""
     batch = getattr(data, "batch", None)
     if batch is None:
@@ -238,10 +238,27 @@ def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = True):
 # ─────────────────────────────────────────────────────────────────────────────
 # Encoders
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _empty_graph_forward(data, batch, keep_local_parts, out_dim: int):
+    """Shared empty-graph early-return for GAT / GCN encoders."""
+    num_graphs = int(getattr(data, "num_graphs", 1))
+    return (
+        data.x.new_zeros((0, out_dim)),
+        data.x.new_zeros((num_graphs, out_dim)),
+        batch,
+        keep_local_parts,
+    )
+
+
+def _num_graphs_from_batch(batch, data) -> int:
+    """Return the number of graphs from a PyG batch tensor."""
+    if batch is not None and batch.numel() > 0:
+        return int(batch.max().item()) + 1
+    return int(getattr(data, "num_graphs", 1))
 class GraphEncoderGAT(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden: int = 128,
                  heads: int = 4, num_layers: int = 2, max_nodes: int = 2048,
-                 use_behavior_hint: bool = True):
+                 use_behavior_hint: bool = False):
         super().__init__()
         if hidden % heads != 0 or out_dim % heads != 0:
             raise ValueError(
@@ -269,20 +286,17 @@ class GraphEncoderGAT(nn.Module):
     def forward(self, data):
         x, edge_index, batch, keep_local_parts = truncate_per_graph(data, self.max_nodes, self.use_behavior_hint)
         if x.numel() == 0:
-            num_graphs = int(getattr(data, "num_graphs", 1))
-            out = x.new_zeros((num_graphs, self.out_dim))
-            return x.new_zeros((0, self.out_dim)), out, batch, keep_local_parts
+            return _empty_graph_forward(data, batch, keep_local_parts, self.out_dim)
         h = self.in_proj(x)
         for conv, norm in zip(self.gat_layers, self.norm_layers):
             h = norm(F.elu(conv(h, edge_index)))
-        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else int(
-            getattr(data, "num_graphs", 1))
+        num_graphs = _num_graphs_from_batch(batch, data)
         sensitive_mask = _recover_truncated_sensitive_mask(data, keep_local_parts)
         graph_emb = self.readout(h, batch, num_graphs, sensitive_mask)
         return h, graph_emb, batch, keep_local_parts
 class GraphEncoderGCN(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden: int = 128,
-                 max_nodes: int = 2048, use_behavior_hint: bool = True):
+                 max_nodes: int = 2048, use_behavior_hint: bool = False):
         super().__init__()
         self.max_nodes = max_nodes
         self.use_behavior_hint = bool(use_behavior_hint)
@@ -296,89 +310,11 @@ class GraphEncoderGCN(nn.Module):
     def forward(self, data):
         x, edge_index, batch, keep_local_parts = truncate_per_graph(data, self.max_nodes, self.use_behavior_hint)
         if x.numel() == 0:
-            num_graphs = int(getattr(data, "num_graphs", 1))
-            return (x.new_zeros((0, self._out_dim)),
-                    x.new_zeros((num_graphs, self._out_dim)),
-                    batch, keep_local_parts)
+            return _empty_graph_forward(data, batch, keep_local_parts, self._out_dim)
         h = self.in_proj(x)
         h = self.norm1(F.elu(self.gcn1(h, edge_index)))
         h = self.norm2(F.elu(self.gcn2(h, edge_index)))
-        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else int(
-            getattr(data, "num_graphs", 1))
-        sensitive_mask = _recover_truncated_sensitive_mask(data, keep_local_parts)
-        graph_emb = self.readout(h, batch, num_graphs, sensitive_mask)
-        return h, graph_emb, batch, keep_local_parts
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Graph Transformer baseline (GPS-style, Rampasek et al., NeurIPS 2022)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class GPSLayer(nn.Module):
-    """
-    Simplified GPS layer: local MPNN (GATv2) + global self-attention.
-    Captures both local structural info and long-range dependencies.
-    """
-    def __init__(self, dim: int, heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.local = GATv2Conv(dim, dim // heads, heads=heads, dropout=dropout)
-        self.global_attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
-        self.norm_local = nn.LayerNorm(dim)
-        self.norm_global = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim),
-        )
-        self.norm_ffn = nn.LayerNorm(dim)
-
-    def forward(self, x, edge_index, batch):
-        # Local MPNN branch
-        h_local = self.local(x, edge_index)
-        h_local = self.norm_local(x + F.elu(h_local))
-        # Global attention branch (per-graph)
-        dense_x, mask = to_dense_batch(h_local, batch)  # ★ 使用顶部 import
-        attn_out, _ = self.global_attn(
-            dense_x, dense_x, dense_x,
-            key_padding_mask=~mask, need_weights=False,
-        )
-        h_global = attn_out[mask]
-        h_global = self.norm_global(h_local + h_global)
-        # FFN
-        h_out = self.norm_ffn(h_global + self.ffn(h_global))
-        return h_out
-
-
-class GraphEncoderGPS(nn.Module):
-    """GPS-style Graph Transformer encoder (baseline for comparison)."""
-    def __init__(self, in_dim: int, out_dim: int, hidden: int = 128,
-                 heads: int = 4, num_layers: int = 2, max_nodes: int = 2048,
-                 use_behavior_hint: bool = True):
-        super().__init__()
-        if hidden % heads != 0:
-            raise ValueError(f"hidden ({hidden}) must be divisible by heads ({heads})")
-        self.max_nodes = max_nodes
-        self.use_behavior_hint = bool(use_behavior_hint)
-        self.in_proj = nn.Linear(in_dim, hidden)
-        self.layers = nn.ModuleList([
-            GPSLayer(hidden, heads=heads, dropout=0.1) for _ in range(num_layers)
-        ])
-        self.out_proj = nn.Linear(hidden, out_dim)
-        self.out_norm = nn.LayerNorm(out_dim)
-        self.readout = SensitiveAwareReadout(out_dim, use_sensitive_hint=self.use_behavior_hint)
-        self._out_dim = out_dim
-
-    def forward(self, data):
-        x, edge_index, batch, keep_local_parts = truncate_per_graph(data, self.max_nodes, self.use_behavior_hint)
-        if x.numel() == 0:
-            num_graphs = int(getattr(data, "num_graphs", 1))
-            return (x.new_zeros((0, self._out_dim)),
-                    x.new_zeros((num_graphs, self._out_dim)),
-                    batch, keep_local_parts)
-        h = self.in_proj(x)
-        for layer in self.layers:
-            h = layer(h, edge_index, batch)
-        h = self.out_norm(self.out_proj(h))
-        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else int(
-            getattr(data, "num_graphs", 1))
+        num_graphs = _num_graphs_from_batch(batch, data)
         sensitive_mask = _recover_truncated_sensitive_mask(data, keep_local_parts)
         graph_emb = self.readout(h, batch, num_graphs, sensitive_mask)
         return h, graph_emb, batch, keep_local_parts

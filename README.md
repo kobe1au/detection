@@ -19,9 +19,10 @@ The model uses sample-level reliability evidence and conflict-aware gate weights
 ## Innovations
 
 1. **Heterogeneous tri-modal reliability modeling for code common-mode failure**
-   - Models `q_api`, `q_graph`, `q_manifest`.
-   - Models `pert_api`, `pert_graph`, `pert_manifest`.
-   - Uses `r = q * (1 - pert)` as sample-level reliability evidence.
+   - Models `q_api`, `q_graph`, `q_manifest` (sample-level quality scores).
+   - Models `pert_api`, `pert_graph`, `pert_manifest` (synthetic perturbation strength; oracle metadata unavailable for real-world APKs).
+   - Default reliability: `r = q` (perturbation strength is unobservable in practice).
+   - When `use_perturbation_evidence=True` (ablations only): `r = q * (1 - pert)`.
 
 2. **Manifest-guided cross-source soft consistency learning**
    - API, Graph, and Manifest are mapped into a shared 12-D semantic category space.
@@ -89,6 +90,14 @@ config/
   extract_tri_model.yaml
   experiments/tri_modal_robust/
 ```
+
+## Design Notes
+
+**Graph branch input separation.** The canonical setup uses 515-D structural node features. API-derived 4-D node hints are disabled during extraction, dropped from legacy 519-D PT files, and disabled in graph readout. The extracted subgraph is still selected around sensitive API seeds, and Graph semantic counts are alignment-derived, so Graph must not be described as independent of API evidence. A behavior-hint ablation requires a separately generated 519-D PT dataset.
+
+**Reliability evidence.** The default main method uses `r = q` — only observable quality scores. Synthetic perturbation strength `pert` is oracle metadata that is unavailable for real-world APKs. The `use_perturbation_evidence` flag gates `r = q * (1 - pert)` exclusively for controlled ablations.
+
+**Semantic category perturbations.** API category counts are recomputed after API edits. New PT schema files also store train-vocabulary term-to-category maps, allowing Manifest permission/intent edits to update semantic counts coherently. Graph structural edits do not randomly modify semantic counts. Synthetic `pert_*` values remain diagnostics and are not exposed to the main gate.
 
 ## Environment
 
@@ -205,6 +214,10 @@ python scripts/build_tri_modal_pts_direct.py \
 ```
 
 The direct builder records failures instead of exiting when `fail_on_error=false` or `--allow-failures` is used. Failed APKs are written to the index/failed output and should be removed from the corresponding label CSV before training.
+
+Each new PT stores a schema/config/vocabulary fingerprint. Resume skips only matching PTs. Legacy PTs without a fingerprint are rejected unless `execution.allow_legacy_resume=true` is explicitly set. Do not enable that option for formal experiments.
+
+Current-schema PTs also contain Manifest term-to-category maps, component-derived category counts, and continuous Manifest extraction coverage. The formal experiment base config locks `data.min_pt_schema_version: 3`, so all I1/I2/I3/Full results use one consistent PT schema. Regenerate PTs before formal experiments; yesterday's legacy-PT results remain pilot results only.
 
 The builder writes:
 
@@ -418,7 +431,7 @@ python scripts/make_manifest_shortcut_controls.py \
   --resume
 ```
 
-Then evaluate with a small override YAML that adds the generated control sets under `eval.extra_sets`:
+Then evaluate the already-trained checkpoint with a small override YAML that sets `eval.eval_only`, `eval.checkpoint_path`, and the generated control sets under `eval.extra_sets`:
 
 ```bash
 python -m fusion.train \
@@ -443,7 +456,7 @@ python scripts/build_real_failure_slices.py \
   --write-empty
 ```
 
-Evaluate with an override YAML that adds the slice CSVs under `eval.extra_sets`:
+Evaluate the locked checkpoint with an override YAML that sets `eval.eval_only: true`, `eval.checkpoint_path`, and the slice CSVs under `eval.extra_sets`. Extra-set CSVs may select a subset of a larger PT directory; missing CSV samples are still rejected.
 
 ```bash
 python -m fusion.train \

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn.functional as F
+
+from fusion.constants import EvidenceIndex
+from fusion.gates import heuristic_reliability_gate
 
 
 BRANCH_AUX_KEYS = (
@@ -140,43 +144,31 @@ def _semantic_losses(
 
 
 def _gate_prior_target(extra: dict, ref_logits: torch.Tensor) -> torch.Tensor:
-    r_api = _reliability(extra, "r_api", ref_logits, 1.0).view(-1, 1)
-    r_graph = _reliability(extra, "r_graph", ref_logits, 1.0).view(-1, 1)
-    r_manifest = _reliability(extra, "r_manifest", ref_logits, 0.0).view(-1, 1)
-    api_manifest = _reliability(extra, "api_manifest_consistency", ref_logits, 0.0).view(-1, 1)
-    graph_manifest = _reliability(extra, "graph_manifest_consistency", ref_logits, 0.0).view(-1, 1)
-    api_graph = _reliability(extra, "api_graph_consistency", ref_logits, 0.0).view(-1, 1)
-    api_alive = _reliability(extra, "api_alive", ref_logits, 1.0).view(-1, 1)
-    graph_alive = _reliability(extra, "graph_alive", ref_logits, 1.0).view(-1, 1)
-    manifest_alive = _reliability(extra, "manifest_alive", ref_logits, 0.0).view(-1, 1)
+    """Return a heuristic gate-prior target for the learned gate.
 
-    alive_sum = (api_alive + graph_alive + manifest_alive).clamp_min(1.0)
-    reliability_support = (
-        r_api * api_alive + r_graph * graph_alive + r_manifest * manifest_alive
-    ) / alive_sum
-    pair_support = api_alive * graph_alive + api_alive * manifest_alive + graph_alive * manifest_alive
-    pair_consistency = (
-        api_graph * api_alive * graph_alive
-        + api_manifest * api_alive * manifest_alive
-        + graph_manifest * graph_alive * manifest_alive
-    ) / pair_support.clamp_min(1.0)
-    joint_score = (
-        reliability_support.square() * (0.5 + 0.5 * pair_consistency)
-    ).clamp(0.0, 1.0)
-    joint_availability = (alive_sum / 3.0).clamp(0.0, 1.0)
-    scores = torch.cat(
-        [
-            r_api * api_alive,
-            r_graph * graph_alive,
-            r_manifest * manifest_alive,
-            joint_score * joint_availability,
-        ],
-        dim=-1,
-    )
-    denom = scores.sum(dim=-1, keepdim=True)
-    target = scores / denom.clamp_min(1e-8)
-    fallback = torch.full_like(scores, 0.25)
-    return torch.where(denom > 1e-8, target, fallback).detach()
+    Prefer ``extra["gate_evidence"]`` (already built during the forward pass)
+    over reconstructing the evidence tensor from scratch.  Fall back to the
+    explicit rebuild only when the cached tensor is missing (e.g. standalone
+    loss tests).
+    """
+    dtype = ref_logits.dtype
+    cached = extra.get("gate_evidence")
+    if isinstance(cached, torch.Tensor):
+        evidence = cached[..., : EvidenceIndex.BASE_DIM].to(device=ref_logits.device, dtype=dtype)
+    else:
+        batch_size = ref_logits.size(0)
+        device = ref_logits.device
+        evidence = torch.zeros((batch_size, EvidenceIndex.BASE_DIM), device=device, dtype=dtype)
+        evidence[:, EvidenceIndex.R_API] = _reliability(extra, "r_api", ref_logits, 1.0)
+        evidence[:, EvidenceIndex.R_GRAPH] = _reliability(extra, "r_graph", ref_logits, 1.0)
+        evidence[:, EvidenceIndex.R_MANIFEST] = _reliability(extra, "r_manifest", ref_logits, 0.0)
+        evidence[:, EvidenceIndex.API_GRAPH_CONSISTENCY] = _reliability(extra, "api_graph_consistency", ref_logits, 0.0)
+        evidence[:, EvidenceIndex.API_MANIFEST_CONSISTENCY] = _reliability(extra, "api_manifest_consistency", ref_logits, 0.0)
+        evidence[:, EvidenceIndex.GRAPH_MANIFEST_CONSISTENCY] = _reliability(extra, "graph_manifest_consistency", ref_logits, 0.0)
+        evidence[:, EvidenceIndex.API_ALIVE] = _reliability(extra, "api_alive", ref_logits, 1.0)
+        evidence[:, EvidenceIndex.GRAPH_ALIVE] = _reliability(extra, "graph_alive", ref_logits, 1.0)
+        evidence[:, EvidenceIndex.MANIFEST_ALIVE] = _reliability(extra, "manifest_alive", ref_logits, 0.0)
+    return heuristic_reliability_gate(evidence).to(dtype=dtype).detach()
 
 
 def _gate_prior_loss(extra: dict, ref_logits: torch.Tensor) -> torch.Tensor:
@@ -217,7 +209,7 @@ def compute_robust_loss(
         "gate_prior_weight": gate_prior_weight,
     }
     for name, value in named_weights.items():
-        if not torch.isfinite(logits.new_tensor(value)).item() or value < 0.0:
+        if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and non-negative, got {value}")
     for name in ("cross_source_min_reliability", "cross_source_min_consistency"):
         value = float(loss_cfg.get(name, 0.0))

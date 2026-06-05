@@ -15,6 +15,7 @@ import yaml
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PT_SCHEMA_VERSION = 3
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -111,6 +112,27 @@ def _split_counts(jobs: list[dict[str, str]], splits: list[str]) -> dict[str, in
     return counts
 
 
+def _validate_unique_hashes(jobs: list[dict[str, str]]) -> None:
+    by_sha: dict[str, list[dict[str, str]]] = {}
+    for job in jobs:
+        sha = str(job.get("sha256") or "")
+        if sha:
+            by_sha.setdefault(sha, []).append(job)
+    duplicates = {sha: items for sha, items in by_sha.items() if len(items) > 1}
+    if duplicates:
+        examples = [
+            {
+                "sha256": sha,
+                "locations": [f"{item['split']}:{item['apk_path']}" for item in items],
+            }
+            for sha, items in list(duplicates.items())[:5]
+        ]
+        raise RuntimeError(
+            f"Duplicate APK hashes detected across configured inputs; count={len(duplicates)} "
+            f"examples={examples}"
+        )
+
+
 def _validate_split_counts(split_counts: dict[str, int]) -> None:
     empty = [split for split, count in split_counts.items() if count <= 0]
     if empty:
@@ -167,9 +189,21 @@ def _write_index_csv(rows: list[dict[str, str]], path: Path) -> None:
 
 def _write_manifest_jsonl(records: dict[str, dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    merged: dict[str, dict[str, Any]] = {}
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                sid = str(item.get("sid") or item.get("sha256") or "").lower()
+                if sid:
+                    merged[sid] = item
+    merged.update(records)
     with path.open("w", encoding="utf-8") as f:
-        for sid in sorted(records):
-            f.write(json.dumps(records[sid], ensure_ascii=True, sort_keys=True) + "\n")
+        for sid in sorted(merged):
+            f.write(json.dumps(merged[sid], ensure_ascii=True, sort_keys=True) + "\n")
 
 
 def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
@@ -209,7 +243,7 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         "max_methods_per_dex": int(graph.get("max_methods_per_dex", 4096)),
         "fallback_max_methods": int(graph.get("fallback_max_methods", 512)),
         "fallback_policy": str(graph.get("fallback_policy", "api_rich")),
-        "use_graph_behavior_hints": bool(graph.get("use_behavior_hints", True)),
+        "use_graph_behavior_hints": bool(graph.get("use_behavior_hints", False)),
         "num_api_buckets": int(api.get("num_hash_buckets", 8192)),
         "max_api_events_per_dex": int(api.get("max_events_per_dex", 1024)),
         "max_api_events_per_method": int(api.get("max_events_per_method", 32)),
@@ -232,6 +266,7 @@ def _parse_config(raw: dict[str, Any]) -> dict[str, Any]:
         "fail_on_error": bool(execution.get("fail_on_error", False)),
         "failed_json": str(execution.get("failed_json", "")),
         "allow_empty_splits": bool(execution.get("allow_empty_splits", False)),
+        "allow_legacy_resume": bool(execution.get("allow_legacy_resume", False)),
     }
 
     vocab_will_be_built = cfg["rebuild_vocab"] or not cfg["vocab_path"].exists()
@@ -328,7 +363,99 @@ def _manifest_payload(record: dict[str, Any], vocab: dict[str, Any], cfg: dict[s
     return payload
 
 
-def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any], record: dict[str, Any]):
+def _build_fingerprint(cfg: dict[str, Any], vocab: dict[str, Any]) -> str:
+    source_hashes = {}
+    for relative in (
+        "extract/extract_graph_api.py",
+        "fusion/manifest_features.py",
+        "fusion/semantic_categories.py",
+    ):
+        source_hashes[relative] = _sha256_file(PROJECT_ROOT / relative)
+    relevant = {
+        "pt_schema_version": PT_SCHEMA_VERSION,
+        "source_hashes": source_hashes,
+        "vocab_size": cfg["vocab_size"],
+        "sensitive_hops": cfg["sensitive_hops"],
+        "max_methods_per_dex": cfg["max_methods_per_dex"],
+        "fallback_max_methods": cfg["fallback_max_methods"],
+        "fallback_policy": cfg["fallback_policy"],
+        "use_graph_behavior_hints": cfg["use_graph_behavior_hints"],
+        "num_api_buckets": cfg["num_api_buckets"],
+        "max_api_events_per_dex": cfg["max_api_events_per_dex"],
+        "max_api_events_per_method": cfg["max_api_events_per_method"],
+        "api_event_scope": cfg["api_event_scope"],
+        "framework_only": cfg["framework_only"],
+        "include_descriptor": cfg["include_descriptor"],
+        "manifest_dim": cfg["manifest_dim"],
+        "manifest_vocab": {
+            "permission_vocab": list(vocab.get("permission_vocab") or []),
+            "intent_vocab": list(vocab.get("intent_vocab") or []),
+            "feature_vocab": list(vocab.get("feature_vocab") or []),
+            "categories": list(vocab.get("categories") or []),
+        },
+    }
+    encoded = json.dumps(relevant, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resume_existing(
+    job: dict[str, str],
+    cfg: dict[str, Any],
+    build_fingerprint: str,
+) -> tuple[bool | None, dict[str, str] | None]:
+    """Return resume status: True=skip, False=reject, None=needs build."""
+    out_path = Path(cfg["out_dirs"][job["split"]]) / f"{job['sha256']}.pt"
+    if not cfg["resume"] or not out_path.exists():
+        return None, None
+    try:
+        import torch
+
+        existing = torch.load(out_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return False, _index_row(
+            job,
+            out_path,
+            "failed",
+            f"existing PT could not be validated: {type(exc).__name__}: {exc}",
+        )
+    meta = existing.get("direct_build_meta", {}) if isinstance(existing, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    existing_fingerprint = str(meta.get("build_fingerprint") or "")
+    try:
+        schema_version = int(meta.get("pt_schema_version", 0) or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    required_payload = (
+        isinstance(existing, dict)
+        and "manifest_permission_category_map" in existing
+        and "manifest_intent_category_map" in existing
+        and "manifest_component_category_counts" in existing
+    )
+    if (
+        existing_fingerprint == build_fingerprint
+        and schema_version == PT_SCHEMA_VERSION
+        and required_payload
+    ):
+        return True, _index_row(job, out_path, "ok", "resumed_matching_pt")
+    if not existing_fingerprint and cfg["allow_legacy_resume"]:
+        return True, _index_row(job, out_path, "ok", "resumed_legacy_pt_without_fingerprint")
+    return False, _index_row(
+        job,
+        out_path,
+        "failed",
+        "existing PT fingerprint does not match current extraction config/vocab; "
+        "rerun with --no-resume or explicitly set execution.allow_legacy_resume=true",
+    )
+
+
+def _process_one(
+    job: dict[str, str],
+    cfg: dict[str, Any],
+    vocab: dict[str, Any],
+    record: dict[str, Any],
+    build_fingerprint: str,
+):
     from extract.extract_graph_api import (
         DEX,
         atomic_torch_save,
@@ -341,8 +468,6 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
     sha = job["sha256"]
     out_dir = Path(cfg["out_dirs"][split])
     out_path = out_dir / f"{sha}.pt"
-    if cfg["resume"] and out_path.exists():
-        return True, _index_row(job, out_path, "ok", "resumed_existing_pt")
 
     try:
         dex_entries = list_dex_entries(apk_path)
@@ -405,7 +530,12 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
             "dex_list": dex_list,
             "direct_build_meta": {
                 "builder": "scripts/build_tri_modal_pts_direct.py",
+                "pt_schema_version": PT_SCHEMA_VERSION,
+                "build_fingerprint": build_fingerprint,
                 "num_dex": len(dex_list),
+                "num_dex_total": len(dex_entries),
+                "num_dex_success": len(dex_list),
+                "dex_success_ratio": len(dex_list) / max(len(dex_entries), 1),
                 "dex_failures": dex_failures,
             },
             **payload,
@@ -417,8 +547,8 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
 
 
 def _worker(args):
-    job, cfg, vocab, record = args
-    return _process_one(job, cfg, vocab, record)
+    job, cfg, vocab, record, build_fingerprint = args
+    return _process_one(job, cfg, vocab, record, build_fingerprint)
 
 
 def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
@@ -429,6 +559,8 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
         validate_api_type_mapping()
 
     jobs = _collect_apks(cfg["split_dirs"], cfg["splits"], hash_files=not dry_run)
+    if not dry_run:
+        _validate_unique_hashes(jobs)
     split_counts = _split_counts(jobs, cfg["splits"])
     cfg, split_counts, skipped_empty_splits = _drop_empty_splits(cfg, split_counts)
     if skipped_empty_splits:
@@ -464,16 +596,31 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
             "skipped_empty_splits": skipped_empty_splits,
         }
 
-    manifest_records = _extract_manifest_records(jobs, cfg)
-    vocab = _build_or_load_vocab(jobs, manifest_records, cfg)
+    if cfg["resume"]:
+        vocab = _build_or_load_vocab(jobs, {}, cfg)
+        build_fingerprint = _build_fingerprint(cfg, vocab)
+        pending_jobs: list[dict[str, str]] = []
+        index_rows: list[dict[str, str]] = []
+        for job in tqdm(jobs, desc="validate resumed PTs", unit="pt"):
+            status, row = _resume_existing(job, cfg, build_fingerprint)
+            if status is None:
+                pending_jobs.append(job)
+            elif row is not None:
+                index_rows.append(row)
+        manifest_records = _extract_manifest_records(pending_jobs, cfg)
+    else:
+        pending_jobs = jobs
+        manifest_records = _extract_manifest_records(pending_jobs, cfg)
+        vocab = _build_or_load_vocab(jobs, manifest_records, cfg)
+        build_fingerprint = _build_fingerprint(cfg, vocab)
+        index_rows = []
 
     tasks = [
-        (job, cfg, vocab, manifest_records.get(job["sha256"], {}))
-        for job in jobs
+        (job, cfg, vocab, manifest_records.get(job["sha256"], {}), build_fingerprint)
+        for job in pending_jobs
     ]
-    ok = 0
-    fail = 0
-    index_rows: list[dict[str, str]] = []
+    ok = sum(1 for row in index_rows if row["status"] == "ok")
+    fail = sum(1 for row in index_rows if row["status"] != "ok")
 
     if cfg["workers"] == 1:
         iterator = tqdm(tasks, desc="build tri-modal .pt", unit="apk")
@@ -517,6 +664,8 @@ def run(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
         "ok": ok,
         "fail": fail,
         "failed": failed,
+        "pt_schema_version": PT_SCHEMA_VERSION,
+        "build_fingerprint": build_fingerprint,
         "split_counts": split_counts,
         "skipped_empty_splits": skipped_empty_splits,
     }

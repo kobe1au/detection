@@ -159,6 +159,24 @@ def sanitize_semantic_counts(value: Any, *, require_exact: bool = False) -> torc
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+# Cached vectorized lookup: type_id → category_index for the default mapping.
+# Rebuilt lazily on first use; the default mapping is frozen after startup.
+_DEFAULT_TYPE_ID_TABLE: torch.Tensor | None = None
+
+
+def _build_type_id_table(mapping: Mapping[int, str]) -> torch.Tensor:
+    """Build a (max_id+1,)-shaped tensor mapping type_id → category_index."""
+    max_id = max(mapping.keys()) if mapping else -1
+    if max_id < 0:
+        return torch.empty((0,), dtype=torch.long)
+    table = torch.full((max_id + 1,), -1, dtype=torch.long)
+    for type_id, category in mapping.items():
+        cat_idx = CATEGORY_TO_INDEX.get(category or "")
+        if cat_idx is not None:
+            table[type_id] = cat_idx
+    return table
+
+
 def api_semantic_counts_from_type_ids(
     api_type_ids: torch.Tensor | None,
     mapping: Mapping[int, str] | None = None,
@@ -167,13 +185,31 @@ def api_semantic_counts_from_type_ids(
     if not isinstance(api_type_ids, torch.Tensor) or api_type_ids.numel() == 0:
         return counts
 
-    mapping = mapping or DEFAULT_API_TYPE_ID_TO_CATEGORY
     flat = api_type_ids.detach().long().view(-1).cpu()
-    for type_id in flat.tolist():
-        category = mapping.get(int(type_id))
-        category_idx = CATEGORY_TO_INDEX.get(category or "")
-        if category_idx is not None:
-            counts[category_idx] += 1.0
+
+    # Use cached default table for the common case.
+    if mapping is None or mapping is DEFAULT_API_TYPE_ID_TO_CATEGORY:
+        global _DEFAULT_TYPE_ID_TABLE
+        if _DEFAULT_TYPE_ID_TABLE is None:
+            _DEFAULT_TYPE_ID_TABLE = _build_type_id_table(DEFAULT_API_TYPE_ID_TO_CATEGORY)
+        table = _DEFAULT_TYPE_ID_TABLE
+    else:
+        table = _build_type_id_table(mapping)
+
+    if table.numel() == 0:
+        return counts
+
+    valid = (flat >= 0) & (flat < table.size(0))
+    if not valid.any():
+        return counts
+    cat_idx = table[flat[valid].clamp(0, table.size(0) - 1)]
+    valid_cat = cat_idx >= 0
+    if valid_cat.any():
+        counts.scatter_add_(
+            0,
+            cat_idx[valid_cat],
+            torch.ones(int(valid_cat.sum()), dtype=torch.float32),
+        )
     return counts
 
 

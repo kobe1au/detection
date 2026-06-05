@@ -7,16 +7,14 @@ data:
 hyperparameters:
   # Keep consistent with the current graph feature definition:
   # call_x = 256 mean opcode hist + 256 max opcode hist + 3 CFG stats
-  #        + 4 graph-lite behavior hints when graph.use_behavior_hints=true.
+  # Optional +4 API-derived behavior hints are disabled in the canonical setup.
   vocab_size: 256
 
 graph:
   # Keep the graph centered around methods that call sensitive framework APIs.
   sensitive_hops: 1
-  # Append four lightweight method behavior hints to each graph node:
-  # sensitive flag, API event count, sensitive API ratio, semantic API ratio.
-  # This strengthens graph-only without copying full API identity/sequence.
-  use_behavior_hints: true
+  # Keep Graph node features structural; subgraph selection remains API-seeded.
+  use_behavior_hints: false
   # Safety cap for very large DEX files.
   max_methods_per_dex: 4096
   # If no sensitive seed exists, keep API-rich methods rather than dropping the DEX.
@@ -47,7 +45,5 @@ storage:
 
 execution:
   workers: 8
-  # Graph-Lite changed call_x from 515 to 519 dims. Keep this false when
-  # regenerating a dataset, or write to a fresh out_root, to avoid mixing
-  # old 515-dim .pt files with new 519-dim .pt files.
+  # Keep false when regenerating a dataset or write to a fresh out_root.
   resume: false

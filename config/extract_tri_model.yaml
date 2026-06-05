@@ -19,7 +19,9 @@ hyperparameters:
 
 graph:
   sensitive_hops: 1
-  use_behavior_hints: true
+  # Keep Graph node features structural. Subgraph selection still uses
+  # sensitive API seeds, so Graph is contextual rather than API-independent.
+  use_behavior_hints: false
   max_methods_per_dex: 4096
   fallback_max_methods: 512
   fallback_policy: api_rich
@@ -53,6 +55,9 @@ execution:
   workers: 4
   # rebuild_vocab=true is intentionally incompatible with resume=true.
   resume: false
+  # Legacy PTs without a build fingerprint are rejected during resume by
+  # default, preventing silent mixtures of extraction schemas.
+  allow_legacy_resume: false
   # Failed APKs are recorded in the index/failed list. Filter CSVs after generation.
   fail_on_error: false
   # Empty means out_root/failed_tri_modal_direct.json.

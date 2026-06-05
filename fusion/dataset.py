@@ -28,6 +28,7 @@ from fusion.quality import (
     compute_api_quality,
     compute_graph_quality,
     compute_align_quality,
+    compute_manifest_quality,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,65 @@ VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
 
 class FatalDatasetConfigError(RuntimeError):
     """Configuration/data schema error that must not be converted to a dummy sample."""
+
+def _precompute_category_maps_from_vocab(vocab_path: str | Path) -> dict | None:
+    """Pre-compute Manifest semantic category maps from vocab for old-PT fallback.
+
+    Old tri-modal .pt files do not contain ``manifest_permission_category_map``
+    or ``manifest_intent_category_map``.  Those maps are a pure function of the
+    Manifest vocab term list and the keyword→category table, so they can be
+    reconstructed at dataset init time without re-extracting APKs.
+    """
+    from fusion.manifest_features import (
+        load_manifest_vocab,
+        category_counts_from_strings,
+        DEFAULT_CATEGORIES,
+    )
+
+    try:
+        vocab = load_manifest_vocab(vocab_path, require_train_metadata=False, allow_empty=True)
+    except Exception as exc:
+        logger.warning("Cannot load manifest vocab for old-PT map fallback (%s): %s", vocab_path, exc)
+        return None
+
+    permission_vocab = list(vocab.get("permission_vocab") or [])
+    intent_vocab = list(vocab.get("intent_vocab") or [])
+    feature_vocab = list(vocab.get("feature_vocab") or [])
+    categories = list(vocab.get("categories") or DEFAULT_CATEGORIES)
+
+    perm_dim = len(permission_vocab)
+    intent_dim = len(intent_vocab)
+    feat_dim = len(feature_vocab)
+
+    if perm_dim + intent_dim + feat_dim + SEMANTIC_CATEGORY_DIM + 11 == 0:
+        return None
+
+    perm_map = (
+        torch.stack(
+            [category_counts_from_strings([token], categories) for token in permission_vocab],
+            dim=0,
+        ).float()
+        if permission_vocab
+        else torch.zeros((0, len(categories)), dtype=torch.float32)
+    )
+
+    intent_map = (
+        torch.stack(
+            [category_counts_from_strings([token], categories) for token in intent_vocab],
+            dim=0,
+        ).float()
+        if intent_vocab
+        else torch.zeros((0, len(categories)), dtype=torch.float32)
+    )
+
+    return {
+        "perm_map": perm_map,
+        "intent_map": intent_map,
+        "perm_dim": perm_dim,
+        "intent_dim": intent_dim,
+        "feat_dim": feat_dim,
+    }
+
 
 def _stable_seed(*parts: object) -> int:
     text = "|".join(str(p) for p in parts)
@@ -98,6 +158,18 @@ def _as_long_tensor(value, length: int | None = None, fill_value: int = 0) -> to
     return out
 
 
+def _as_category_map(value, rows: int, columns: int = SEMANTIC_CATEGORY_DIM) -> torch.Tensor:
+    if isinstance(value, torch.Tensor) and value.ndim == 2 and value.size(1) == columns:
+        out = value.detach().float()
+    else:
+        out = torch.zeros((0, columns), dtype=torch.float32)
+    if out.size(0) < rows:
+        out = torch.cat([out, torch.zeros((rows - out.size(0), columns), dtype=torch.float32)], dim=0)
+    elif out.size(0) > rows:
+        out = out[:rows]
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _first_present(sources: list[dict[str, Any]], key: str):
     for src in sources:
         if isinstance(src, dict) and key in src and src[key] is not None:
@@ -134,6 +206,28 @@ def _normalize_loaded_pt(raw) -> tuple[list[dict[str, Any]], list[dict[str, Any]
     return [], []
 
 
+def apply_dex_success_ratio(data: dict[str, Any], sources: list[dict[str, Any]]) -> None:
+    """Penalize code-side quality when only part of a multi-DEX APK parsed."""
+    direct_meta = _first_present(sources, "direct_build_meta")
+    if not isinstance(direct_meta, dict):
+        return
+    success_ratio = float(direct_meta.get("dex_success_ratio", 1.0))
+    if not math.isfinite(success_ratio):
+        success_ratio = 0.0
+    success_ratio = max(0.0, min(1.0, success_ratio))
+    if success_ratio >= 1.0:
+        return
+    data["q_api"] *= success_ratio
+    data["q_graph"] *= success_ratio
+    data["q_align"] = compute_align_quality(
+        data["q_api"],
+        data["q_graph"],
+        data["method_api_edge_index"],
+        int(data["real_num_nodes"]),
+        int(data["api_ids"].numel()),
+    )
+
+
 class RobustTriModalDataset(Dataset):
     """Standalone API + Graph + Manifest dataset for robust fusion."""
 
@@ -155,13 +249,24 @@ class RobustTriModalDataset(Dataset):
         manifest_intent_dim: int = 64,
         manifest_feature_dim: int = 32,
         drop_graph_behavior_hints: bool = False,
-        degrade_category_counts: bool = True,
         graph_semantic_source: str = "alignment",
         num_classes: int = 2,
         label_map: dict | None = None,
         strict_split_integrity: bool = True,
+        allow_pt_superset: bool = False,
+        require_manifest_semantic_maps: bool = False,
+        min_pt_schema_version: int = 0,
+        manifest_vocab_path: str = "",
         **_unused,
     ):
+        # Pre-compute semantic category maps from the Manifest vocab so that
+        # old tri-modal .pt files (which lack the maps) can still benefit from
+        # coherent semantic-count updates during perturbation.
+        self._vocab_maps: dict | None = None
+        if manifest_vocab_path:
+            self._vocab_maps = _precompute_category_maps_from_vocab(manifest_vocab_path)
+        else:
+            self._vocab_maps = None
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
             raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
         self.pt_dir = Path(pt_dir)
@@ -197,7 +302,6 @@ class RobustTriModalDataset(Dataset):
         self.manifest_intent_dim = int(manifest_intent_dim)
         self.manifest_feature_dim = int(manifest_feature_dim)
         self.drop_graph_behavior_hints = bool(drop_graph_behavior_hints)
-        self.degrade_category_counts = bool(degrade_category_counts)
         src = str(graph_semantic_source or "alignment").lower()
         if src not in VALID_GRAPH_SEMANTIC_SOURCES:
             raise ValueError(
@@ -206,6 +310,9 @@ class RobustTriModalDataset(Dataset):
             )
         self.graph_semantic_source = src
         self.strict_split_integrity = bool(strict_split_integrity)
+        self.allow_pt_superset = bool(allow_pt_superset)
+        self.require_manifest_semantic_maps = bool(require_manifest_semantic_maps)
+        self.min_pt_schema_version = max(0, int(min_pt_schema_version))
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -277,7 +384,8 @@ class RobustTriModalDataset(Dataset):
         pt_ids = set(pt_by_sid)
         csv_only = sorted(csv_ids - pt_ids)
         pt_only = sorted(pt_ids - csv_ids)
-        if csv_only or pt_only:
+        rejected_pt_only = pt_only if not self.allow_pt_superset else []
+        if csv_only or rejected_pt_only:
             message = (
                 f"Split integrity mismatch for CSV={csv_path} PT={self.pt_dir}: "
                 f"csv_only={len(csv_only)} examples={csv_only[:10]}; "
@@ -323,6 +431,8 @@ class RobustTriModalDataset(Dataset):
             y=torch.tensor(label, dtype=torch.long),
         )
         data.sensitive_mask = torch.zeros((1,), dtype=torch.uint8)
+        data.real_num_nodes = torch.tensor([0], dtype=torch.long)
+        data.real_node_mask = torch.zeros((1,), dtype=torch.bool)
         data.api_ids = torch.empty((0,), dtype=torch.long)
         data.api_type_ids = torch.empty((0,), dtype=torch.long)
         data.api_sensitive_mask = torch.empty((0,), dtype=torch.float32)
@@ -421,20 +531,29 @@ class RobustTriModalDataset(Dataset):
 
     def _process_dex(self, dex: dict[str, Any], node_offset: int, api_offset: int):
         x = self._sanitize_call_x(dex.get("call_x"))
-        if x.size(0) == 0:
+        orig_size = int(x.size(0))
+        if orig_size == 0:
+            # Ghost node: keeps GNN message-passing alive for dex files with
+            # zero call-graph nodes.  All-zero features carry no signal, but
+            # the node still participates in readout attention — for samples
+            # where EVERY dex is empty the graph embedding degenerates to a
+            # uniform average of ghosts.
             x = torch.zeros((1, self.feature_dim), dtype=torch.float32)
         n = int(x.size(0))
-        edge_index = self._sanitize_edge_index(dex.get("call_edge_index"), n)
+        edge_index = self._sanitize_edge_index(dex.get("call_edge_index"), orig_size)
         if edge_index.numel() > 0:
             edge_index = edge_index + node_offset
         sensitive = self._sanitize_mask(dex.get("call_sensitive_mask"), n, dtype=torch.uint8)
+        real_node_mask = torch.ones((n,), dtype=torch.bool)
+        if orig_size == 0:
+            real_node_mask.zero_()
 
         api_ids = _as_long_tensor(dex.get("api_ids")).clamp_min(0)
         num_api = int(api_ids.numel())
         api_type_ids = _as_long_tensor(dex.get("api_type_ids"), num_api, fill_value=0).clamp_min(0)
         api_sensitive = self._sanitize_mask(dex.get("api_sensitive_mask"), num_api, dtype=torch.float32).clamp(0.0, 1.0)
         api_method_index = _as_long_tensor(dex.get("api_method_index"), num_api, fill_value=-1)
-        valid_method = (api_method_index >= 0) & (api_method_index < n)
+        valid_method = (api_method_index >= 0) & (api_method_index < orig_size)
         api_method_index = torch.where(api_method_index >= 0, api_method_index + node_offset, api_method_index)
         api_method_index = torch.where(valid_method, api_method_index, torch.full_like(api_method_index, -1))
         api_in_graph = self._sanitize_mask(dex.get("api_in_graph_mask"), num_api, dtype=torch.float32).clamp(0.0, 1.0)
@@ -444,7 +563,7 @@ class RobustTriModalDataset(Dataset):
             local_edge = method_api_edge_index.long()
             valid = (
                 (local_edge[0] >= 0)
-                & (local_edge[0] < n)
+                & (local_edge[0] < orig_size)
                 & (local_edge[1] >= 0)
                 & (local_edge[1] < num_api)
             )
@@ -468,16 +587,19 @@ class RobustTriModalDataset(Dataset):
             "x": x,
             "edge_index": edge_index,
             "sensitive_mask": sensitive,
+            "real_node_mask": real_node_mask,
             "num_nodes": n,
+            "real_nodes": orig_size,
             "num_api": int(parts["api_ids"].numel()),
             **parts,
         }
 
     def _aggregate_api_graph(self, dex_list: list[dict[str, Any]]) -> dict[str, Any] | None:
-        xs, edges, sens = [], [], []
+        xs, edges, sens, real_masks = [], [], [], []
         api_ids, api_types, api_sensitive, api_methods, api_in_graph, method_edges = [], [], [], [], [], []
         node_offset = 0
         api_offset = 0
+        total_real_nodes = 0
         for dex in dex_list:
             if not isinstance(dex, dict):
                 continue
@@ -485,6 +607,7 @@ class RobustTriModalDataset(Dataset):
             xs.append(part["x"])
             edges.append(part["edge_index"])
             sens.append(part["sensitive_mask"])
+            real_masks.append(part["real_node_mask"])
             api_ids.append(part["api_ids"])
             api_types.append(part["api_type_ids"])
             api_sensitive.append(part["api_sensitive_mask"])
@@ -493,12 +616,14 @@ class RobustTriModalDataset(Dataset):
             method_edges.append(part["method_api_edge_index"])
             node_offset += int(part["num_nodes"])
             api_offset += int(part["num_api"])
+            total_real_nodes += int(part.get("real_nodes", int(part["num_nodes"])))
         if not xs:
             return None
 
         x = torch.cat(xs, dim=0)
         edge_index = torch.cat([e for e in edges if e.numel() > 0], dim=1) if any(e.numel() > 0 for e in edges) else torch.empty((2, 0), dtype=torch.long)
         sensitive_mask = torch.cat(sens, dim=0).to(torch.uint8)
+        real_node_mask = torch.cat(real_masks, dim=0).bool()
         final_api_ids = torch.cat([v for v in api_ids if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_ids) else torch.empty((0,), dtype=torch.long)
         final_api_types = torch.cat([v for v in api_types if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_types) else torch.empty((0,), dtype=torch.long)
         final_api_sensitive = torch.cat([v for v in api_sensitive if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_sensitive) else torch.empty((0,), dtype=torch.float32)
@@ -522,12 +647,14 @@ class RobustTriModalDataset(Dataset):
         final_method_edges = api_parts["method_api_edge_index"]
 
         q_api = compute_api_quality(final_api_ids, final_api_types, final_api_in_graph)
-        q_graph = compute_graph_quality(edge_index, int(x.size(0)))
+        q_graph = compute_graph_quality(edge_index, total_real_nodes, x, real_node_mask)
+        if total_real_nodes <= 0:
+            q_graph = 0.0  # all nodes are zero-feature ghosts — no real graph signal
         q_align = compute_align_quality(
             q_api,
             q_graph,
             final_method_edges,
-            int(x.size(0)),
+            total_real_nodes,
             int(final_api_ids.numel()),
         )
         api_semantic_counts = self._api_semantic_category_counts(final_api_types)
@@ -546,6 +673,8 @@ class RobustTriModalDataset(Dataset):
             "x": x,
             "edge_index": edge_index,
             "sensitive_mask": sensitive_mask,
+            "real_num_nodes": total_real_nodes,
+            "real_node_mask": real_node_mask,
             "api_ids": final_api_ids,
             "api_type_ids": final_api_types,
             "api_sensitive_mask": final_api_sensitive,
@@ -577,44 +706,120 @@ class RobustTriModalDataset(Dataset):
             )
         manifest_x = _as_float_tensor(manifest_x_raw, self.manifest_dim)
         manifest_counts = sanitize_semantic_counts(_first_present(sources, "manifest_category_counts"))
+        manifest_component_counts = sanitize_semantic_counts(
+            _first_present(sources, "manifest_component_category_counts")
+        )
         graph_raw = _first_present(sources, "graph_semantic_category_counts")
         if graph_raw is None:
             graph_raw = _first_present(sources, "graph_category_counts")
         graph_counts = sanitize_semantic_counts(graph_raw, require_exact=True)
         manifest_stats = _as_float_tensor(_first_present(sources, "manifest_stats"), self.manifest_stats_dim)
+        permission_dim = _first_int(sources, "manifest_permission_dim", self.manifest_permission_dim)
+        intent_dim = _first_int(sources, "manifest_intent_dim", self.manifest_intent_dim)
+        permission_map_raw = _first_present(sources, "manifest_permission_category_map")
+        intent_map_raw = _first_present(sources, "manifest_intent_category_map")
+        maps_available = (
+            isinstance(permission_map_raw, torch.Tensor)
+            and permission_map_raw.ndim == 2
+            and permission_map_raw.shape == (permission_dim, SEMANTIC_CATEGORY_DIM)
+            and isinstance(intent_map_raw, torch.Tensor)
+            and intent_map_raw.ndim == 2
+            and intent_map_raw.shape == (intent_dim, SEMANTIC_CATEGORY_DIM)
+        )
 
+        # ── old-PT fallback: reconstruct maps from vocab ──────────────────
+        vocab_feature_dim: int | None = None
+        if not maps_available and self._vocab_maps is not None:
+            vm = self._vocab_maps
+            # Old PTs do not store dims; use vocab-derived values.
+            if _first_present(sources, "manifest_permission_dim") is None and vm["perm_dim"] > 0:
+                permission_dim = vm["perm_dim"]
+            if _first_present(sources, "manifest_intent_dim") is None and vm["intent_dim"] > 0:
+                intent_dim = vm["intent_dim"]
+            if _first_present(sources, "manifest_feature_dim") is None and vm["feat_dim"] > 0:
+                vocab_feature_dim = vm["feat_dim"]
+            permission_map_raw = vm["perm_map"]
+            intent_map_raw = vm["intent_map"]
+            maps_available = (
+                isinstance(permission_map_raw, torch.Tensor)
+                and permission_map_raw.ndim == 2
+                and permission_map_raw.shape == (permission_dim, SEMANTIC_CATEGORY_DIM)
+                and isinstance(intent_map_raw, torch.Tensor)
+                and intent_map_raw.ndim == 2
+                and intent_map_raw.shape == (intent_dim, SEMANTIC_CATEGORY_DIM)
+            )
+        meta = _first_present(sources, "manifest_meta")
+        meta = meta if isinstance(meta, dict) else {}
         q_raw = _first_present(sources, "q_manifest")
         p_raw = _first_present(sources, "pert_manifest")
         if q_raw is None:
-            signal = float((manifest_x.abs().sum() + manifest_counts.abs().sum() + manifest_stats.abs().sum()).item())
-            q_manifest = 1.0 if has_manifest and signal > 0 else 0.0
+            q_manifest = compute_manifest_quality(
+                manifest_x,
+                manifest_counts,
+                manifest_stats,
+                meta,
+            ) if has_manifest else 0.0
         else:
             q_manifest = float(torch.as_tensor(q_raw).float().view(-1)[0].item())
+        if not math.isfinite(q_manifest):
+            q_manifest = 0.0
+        manifest_available = has_manifest and q_manifest > 0.0
+        if self.require_manifest_semantic_maps and manifest_available and not maps_available:
+            raise FatalDatasetConfigError(
+                "PT is missing Manifest term-to-category maps required by the configured "
+                "consistency evidence/loss. Regenerate PT files with the current direct builder."
+            )
         if p_raw is None:
-            pert_manifest = 0.0 if has_manifest else 1.0
+            pert_manifest = 0.0 if manifest_available else 1.0
         else:
             pert_manifest = float(torch.as_tensor(p_raw).float().view(-1)[0].item())
-        meta = _first_present(sources, "manifest_meta")
+        if not math.isfinite(pert_manifest):
+            pert_manifest = 1.0
+
+        # ── derive permission/intent IDs from manifest_x bits (old-PT fallback) ──
+        permission_ids_raw = _first_present(sources, "manifest_permission_ids")
+        if permission_ids_raw is None and manifest_available and permission_dim > 0:
+            perm_vec = manifest_x[:permission_dim]
+            active = (perm_vec > 0.5).nonzero(as_tuple=True)[0]
+            permission_ids_raw = active + 1  # +1: 0 = padding / unmatched
+
+        intent_ids_raw = _first_present(sources, "manifest_intent_ids")
+        if intent_ids_raw is None and manifest_available and intent_dim > 0:
+            intent_vec = manifest_x[permission_dim : permission_dim + intent_dim]
+            active = (intent_vec > 0.5).nonzero(as_tuple=True)[0]
+            intent_ids_raw = active + 1
+
         return {
             "manifest_x": manifest_x,
-            "manifest_permission_ids": _as_long_tensor(_first_present(sources, "manifest_permission_ids")),
-            "manifest_intent_ids": _as_long_tensor(_first_present(sources, "manifest_intent_ids")),
+            "manifest_permission_ids": _as_long_tensor(permission_ids_raw),
+            "manifest_intent_ids": _as_long_tensor(intent_ids_raw),
+            "manifest_permission_category_map": _as_category_map(
+                permission_map_raw,
+                permission_dim,
+            ),
+            "manifest_intent_category_map": _as_category_map(
+                intent_map_raw,
+                intent_dim,
+            ),
             "manifest_category_counts": manifest_counts,
+            "manifest_component_category_counts": manifest_component_counts,
             "manifest_stats": manifest_stats,
-            "manifest_meta": meta if isinstance(meta, dict) else {},
+            "manifest_meta": meta,
             "graph_semantic_category_counts": graph_counts,
             "graph_category_counts": graph_counts,
             "q_manifest": max(0.0, min(1.0, q_manifest)),
             "pert_manifest": max(0.0, min(1.0, pert_manifest)),
-            "manifest_aug_type": "none" if has_manifest else "missing",
-            "manifest_permission_dim": _first_int(sources, "manifest_permission_dim", self.manifest_permission_dim),
-            "manifest_intent_dim": _first_int(sources, "manifest_intent_dim", self.manifest_intent_dim),
-            "manifest_feature_dim": _first_int(sources, "manifest_feature_dim", self.manifest_feature_dim),
+            "manifest_aug_type": "none" if manifest_available else "missing",
+            "manifest_permission_dim": permission_dim,
+            "manifest_intent_dim": intent_dim,
+            "manifest_feature_dim": vocab_feature_dim if vocab_feature_dim is not None else _first_int(sources, "manifest_feature_dim", self.manifest_feature_dim),
         }
 
     def _to_data_object(self, data: dict[str, Any], label: int, sid: str, year: int) -> Data:
         obj = Data(x=data["x"], edge_index=data["edge_index"], y=torch.tensor(label, dtype=torch.long))
         obj.sensitive_mask = data["sensitive_mask"]
+        obj.real_num_nodes = torch.tensor([int(data.get("real_num_nodes", 0))], dtype=torch.long)
+        obj.real_node_mask = data["real_node_mask"].bool()
         obj.api_ids = data["api_ids"]
         obj.api_type_ids = data["api_type_ids"]
         obj.api_sensitive_mask = data["api_sensitive_mask"]
@@ -649,6 +854,32 @@ class RobustTriModalDataset(Dataset):
         pt_path, label, sid, year = self.samples[idx]
         try:
             raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+            if self.min_pt_schema_version > 0:
+                meta = raw.get("direct_build_meta", {}) if isinstance(raw, dict) else {}
+                try:
+                    version = int(meta.get("pt_schema_version", 0)) if isinstance(meta, dict) else 0
+                except (TypeError, ValueError):
+                    version = 0
+                if version < self.min_pt_schema_version:
+                    raise FatalDatasetConfigError(
+                        f"PT schema version {version} is below required version "
+                        f"{self.min_pt_schema_version}: {pt_path}. Regenerate PT files."
+                    )
+                if self.min_pt_schema_version >= 3:
+                    required_fields = (
+                        "manifest_permission_category_map",
+                        "manifest_intent_category_map",
+                        "manifest_component_category_counts",
+                    )
+                    missing_fields = [
+                        key for key in required_fields
+                        if not isinstance(raw, dict) or key not in raw
+                    ]
+                    if missing_fields:
+                        raise FatalDatasetConfigError(
+                            f"PT declares schema version {version} but is missing "
+                            f"required fields {missing_fields}: {pt_path}. Regenerate PT files."
+                        )
             dex_list, sources = _normalize_loaded_pt(raw)
             data = self._aggregate_api_graph(dex_list)
             if data is None:
@@ -658,12 +889,12 @@ class RobustTriModalDataset(Dataset):
             # carry — manifest_payload only provides a fallback for legacy
             # files.
             graph_counts_from_source = data.get("graph_semantic_category_counts")
+            apply_dex_success_ratio(data, sources)
             manifest_payload = self._manifest_payload(sources)
             data.update(manifest_payload)
             if isinstance(graph_counts_from_source, torch.Tensor):
                 data["graph_semantic_category_counts"] = graph_counts_from_source
                 data["graph_category_counts"] = graph_counts_from_source
-            data["degrade_category_counts"] = self.degrade_category_counts
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)
                 data = apply_perturbation(data, perturb_type, strength)
@@ -674,6 +905,8 @@ class RobustTriModalDataset(Dataset):
                     data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
             return self._to_data_object(data, label, sid, year)
         except FatalDatasetConfigError:
+            raise
+        except torch.cuda.OutOfMemoryError:
             raise
         except Exception as exc:
             return self._dummy(label, sid, year, f"{type(exc).__name__}: {exc}", pt_path)

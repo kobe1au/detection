@@ -222,22 +222,32 @@ def category_counts_from_record(record: dict[str, Any], categories: list[str] | 
     return counts
 
 
+# Normalisation divisors for manifest stats.  These are derived from coarse upper
+# bounds of the training-distribution so each stat lands roughly in [0, 1].
+# Revisit if the data source changes substantially (e.g. different app stores,
+# much larger apps).
+_STAT_NORM_PERMISSIONS = 6.0
+_STAT_NORM_COMPONENT_TYPE = 5.0
+_STAT_NORM_SDK = 35.0
+_STAT_NORM_TOTAL_COMPONENTS = 80.0
+
+
 def manifest_stats_from_record(record: dict[str, Any]) -> torch.Tensor:
     component_count = float(record.get("component_count", 0) or 0)
     exported_count = float(record.get("exported_component_count", 0) or 0)
     stats = torch.tensor(
         [
-            math.log1p(len(record.get("permissions") or [])) / 6.0,
-            math.log1p(len(record.get("activities") or [])) / 5.0,
-            math.log1p(len(record.get("services") or [])) / 5.0,
-            math.log1p(len(record.get("receivers") or [])) / 5.0,
-            math.log1p(len(record.get("providers") or [])) / 5.0,
-            math.log1p(len(record.get("uses_features") or [])) / 5.0,
-            min(float(record.get("min_sdk", 0) or 0) / 35.0, 1.0),
-            min(float(record.get("target_sdk", 0) or 0) / 35.0, 1.0),
+            math.log1p(len(record.get("permissions") or [])) / _STAT_NORM_PERMISSIONS,
+            math.log1p(len(record.get("activities") or [])) / _STAT_NORM_COMPONENT_TYPE,
+            math.log1p(len(record.get("services") or [])) / _STAT_NORM_COMPONENT_TYPE,
+            math.log1p(len(record.get("receivers") or [])) / _STAT_NORM_COMPONENT_TYPE,
+            math.log1p(len(record.get("providers") or [])) / _STAT_NORM_COMPONENT_TYPE,
+            math.log1p(len(record.get("uses_features") or [])) / _STAT_NORM_COMPONENT_TYPE,
+            min(float(record.get("min_sdk", 0) or 0) / _STAT_NORM_SDK, 1.0),
+            min(float(record.get("target_sdk", 0) or 0) / _STAT_NORM_SDK, 1.0),
             1.0 if record.get("debuggable") else 0.0,
             min(exported_count / max(component_count, 1.0), 1.0),
-            min(component_count / 80.0, 1.0),
+            min(component_count / _STAT_NORM_TOTAL_COMPONENTS, 1.0),
         ],
         dtype=torch.float32,
     )
@@ -363,6 +373,26 @@ def vectorize_manifest_record(
             feature_vec[idx] = 1.0
 
     category_counts = category_counts_from_record(record, categories)
+    component_values: list[str] = []
+    for key in ("activities", "services", "receivers", "providers"):
+        component_values.extend(record.get(key) or [])
+    component_category_counts = category_counts_from_strings(component_values, categories)
+    if "component_exposure" in categories:
+        component_category_counts[categories.index("component_exposure")] += float(
+            record.get("exported_component_count", 0) or 0
+        )
+    if "receiver" in categories:
+        component_category_counts[categories.index("receiver")] += float(
+            len(record.get("receivers") or [])
+        )
+    permission_category_map = torch.stack(
+        [category_counts_from_strings([token], categories) for token in permission_vocab],
+        dim=0,
+    ) if permission_vocab else torch.zeros((0, len(categories)), dtype=torch.float32)
+    intent_category_map = torch.stack(
+        [category_counts_from_strings([token], categories) for token in intent_vocab],
+        dim=0,
+    ) if intent_vocab else torch.zeros((0, len(categories)), dtype=torch.float32)
     category_norm = category_counts / category_counts.sum().clamp_min(1.0)
     stats = manifest_stats_from_record(record)
     parts = [perm_vec, intent_vec, feature_vec, category_norm, stats]
@@ -378,16 +408,42 @@ def vectorize_manifest_record(
     if manifest_x.numel() < manifest_dim:
         manifest_x = torch.cat([manifest_x, torch.zeros((manifest_dim - manifest_x.numel(),), dtype=torch.float32)])
 
-    has_manifest = not bool(record.get("parse_error")) and (
+    parse_error = str(record.get("parse_error") or "")
+    has_manifest = not parse_error and (
         len(permissions) + len(intents) + len(features) + int(record.get("component_count", 0) or 0) > 0
     )
-    q_manifest = 1.0 if has_manifest else 0.0
+    coverage_values = []
+    coverage_meta = {}
+    for name, tokens, index in (
+        ("permission", permissions, perm_index),
+        ("intent", intents, intent_index),
+        ("feature", features, feature_index),
+    ):
+        unique_tokens = set(tokens)
+        coverage = (
+            len(unique_tokens.intersection(index)) / len(unique_tokens)
+            if unique_tokens
+            else 1.0
+        )
+        coverage_meta[f"{name}_vocab_coverage"] = float(coverage)
+        if unique_tokens:
+            coverage_values.append(float(coverage))
+    if has_manifest and coverage_values:
+        # Parser success contributes the base score. Vocabulary coverage
+        # modulates quality but must not mark a valid, OOV-heavy Manifest as
+        # unavailable.
+        q_manifest = 0.5 + 0.5 * (sum(coverage_values) / len(coverage_values))
+    else:
+        q_manifest = 1.0 if has_manifest else 0.0
 
     return {
         "manifest_x": manifest_x,
         "manifest_permission_ids": torch.tensor(sorted(set(perm_ids)), dtype=torch.long),
         "manifest_intent_ids": torch.tensor(sorted(set(intent_ids)), dtype=torch.long),
         "manifest_category_counts": category_counts.float(),
+        "manifest_component_category_counts": component_category_counts.float(),
+        "manifest_permission_category_map": permission_category_map.float(),
+        "manifest_intent_category_map": intent_category_map.float(),
         "manifest_stats": stats.float(),
         "q_manifest": torch.tensor([q_manifest], dtype=torch.float32),
         "pert_manifest": torch.tensor([0.0 if has_manifest else 1.0], dtype=torch.float32),
@@ -403,7 +459,9 @@ def vectorize_manifest_record(
             "min_sdk": int(record.get("min_sdk", 0) or 0),
             "target_sdk": int(record.get("target_sdk", 0) or 0),
             "debuggable": bool(record.get("debuggable")),
-            "parse_error": record.get("parse_error", ""),
+            "parse_error": parse_error,
+            "quality_score": float(q_manifest),
+            **coverage_meta,
         },
         "manifest_permission_dim": len(permission_vocab),
         "manifest_intent_dim": len(intent_vocab),
