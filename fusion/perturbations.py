@@ -135,6 +135,8 @@ def apply_aeg_view(data: Data, *, view: str, strength: float = 0.5) -> Data:
     elif view == "manifest_noisy":
         _degrade_manifest(out, strength, noisy=True)
         out.cf_weight = torch.tensor([0.8 * strength], dtype=torch.float32)
+    elif view == "manifest_shuffled":
+        out.cf_weight = torch.tensor([0.9], dtype=torch.float32)
     elif view == "all_degraded":
         _degrade_api(out, strength)
         _degrade_graph(out, strength)

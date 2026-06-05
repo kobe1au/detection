@@ -5,3 +5,4 @@ train:
 
 loss:
   clean_degraded_contrast_weight: 0.0
+  source_degraded_contrast_weight: 0.0

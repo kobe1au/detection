@@ -63,6 +63,7 @@ class ManifestRecord:
     exported_component_count: int = 0
     component_count: int = 0
     parse_error: str = ""
+    components: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -83,6 +84,7 @@ class ManifestRecord:
             "exported_component_count": int(self.exported_component_count or 0),
             "component_count": int(self.component_count or 0),
             "parse_error": self.parse_error,
+            "components": self.components,
         }
 
 
@@ -110,17 +112,18 @@ def _android_attr(elem, name: str, default: str | None = None):
     return elem.attrib.get(ANDROID_NS + name, elem.attrib.get(name, default))
 
 
-def _xml_components_and_intents(manifest_xml) -> tuple[dict[str, list[str]], list[str], list[str], int]:
+def _xml_components_and_intents(manifest_xml) -> tuple[dict[str, list[str]], list[str], list[str], int, list[dict[str, Any]]]:
     components = {"activity": [], "service": [], "receiver": [], "provider": []}
     actions: list[str] = []
     categories: list[str] = []
+    component_details: list[dict[str, Any]] = []
     exported_count = 0
     if manifest_xml is None:
-        return components, actions, categories, exported_count
+        return components, actions, categories, exported_count, component_details
 
     app = manifest_xml.find("application")
     if app is None:
-        return components, actions, categories, exported_count
+        return components, actions, categories, exported_count, component_details
 
     for tag in components:
         for elem in app.findall(tag):
@@ -132,16 +135,30 @@ def _xml_components_and_intents(manifest_xml) -> tuple[dict[str, list[str]], lis
             exported = str(exported_raw).lower() == "true" if exported_raw is not None else bool(intent_filters)
             if exported:
                 exported_count += 1
+            cur_actions: list[str] = []
+            cur_categories: list[str] = []
             for intent_filter in intent_filters:
                 for action in intent_filter.findall("action"):
                     action_name = _android_attr(action, "name")
                     if action_name:
                         actions.append(str(action_name))
+                        cur_actions.append(str(action_name))
                 for category in intent_filter.findall("category"):
                     category_name = _android_attr(category, "name")
                     if category_name:
                         categories.append(str(category_name))
-    return components, actions, categories, exported_count
+                        cur_categories.append(str(category_name))
+            if name:
+                component_details.append(
+                    {
+                        "name": str(name).lower(),
+                        "type": tag,
+                        "intent_actions": _lower_tokens(cur_actions),
+                        "intent_categories": _lower_tokens(cur_categories),
+                        "exported": bool(exported),
+                    }
+                )
+    return components, actions, categories, exported_count, component_details
 
 
 def extract_manifest_record(apk_path: str | Path, sid: str | None = None) -> ManifestRecord:
@@ -169,10 +186,11 @@ def extract_manifest_record(apk_path: str | Path, sid: str | None = None) -> Man
             manifest_xml = apk.get_android_manifest_xml()
         except Exception:
             manifest_xml = None
-        xml_components, actions, categories, exported_count = _xml_components_and_intents(manifest_xml)
+        xml_components, actions, categories, exported_count, component_details = _xml_components_and_intents(manifest_xml)
         rec.intent_actions = _lower_tokens(actions)
         rec.intent_categories = _lower_tokens(categories)
         rec.exported_component_count = int(exported_count)
+        rec.components = component_details
 
         if not rec.activities:
             rec.activities = _lower_tokens(xml_components["activity"])
@@ -352,19 +370,23 @@ def vectorize_manifest_record(
 
     perm_vec = torch.zeros((len(permission_vocab),), dtype=torch.float32)
     perm_ids = []
+    perm_tokens = []
     for item in permissions:
         idx = perm_index.get(item)
         if idx is not None:
             perm_vec[idx] = 1.0
             perm_ids.append(idx + 1)
+            perm_tokens.append(item)
 
     intent_vec = torch.zeros((len(intent_vocab),), dtype=torch.float32)
     intent_ids = []
+    intent_tokens = []
     for item in intents:
         idx = intent_index.get(item)
         if idx is not None:
             intent_vec[idx] = 1.0
             intent_ids.append(idx + 1)
+            intent_tokens.append(item)
 
     feature_vec = torch.zeros((len(feature_vocab),), dtype=torch.float32)
     for item in features:
@@ -440,6 +462,8 @@ def vectorize_manifest_record(
         "manifest_x": manifest_x,
         "manifest_permission_ids": torch.tensor(sorted(set(perm_ids)), dtype=torch.long),
         "manifest_intent_ids": torch.tensor(sorted(set(intent_ids)), dtype=torch.long),
+        "manifest_permission_tokens": sorted(set(perm_tokens), key=lambda v: perm_index[v]),
+        "manifest_intent_tokens": sorted(set(intent_tokens), key=lambda v: intent_index[v]),
         "manifest_category_counts": category_counts.float(),
         "manifest_component_category_counts": component_category_counts.float(),
         "manifest_permission_category_map": permission_category_map.float(),

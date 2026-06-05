@@ -1,4 +1,5 @@
 data:
+  strict_integrity: true
   train:
     pt_dir: D:/pts_aeg/train
     csv: results/labels/train.csv
@@ -37,6 +38,7 @@ model:
 loss:
   ce_weight: 1.0
   clean_degraded_contrast_weight: 0.1
+  source_degraded_contrast_weight: 0.05
   cross_source_contrast_weight: 0.03
   counterfactual_kl_weight: 0.05
   temperature: 0.2
@@ -51,6 +53,8 @@ robust:
     - api_graph_degraded
     - manifest_degraded
     - manifest_noisy
+    - manifest_zeroed
+    - manifest_shuffled
     - all_degraded
 
 eval:
@@ -67,6 +71,10 @@ eval:
         view: manifest_noisy
         strength: 0.5
         weight: 0.3
+      - name: manifest_shuffled
+        view: manifest_shuffled
+        strength: 1.0
+        weight: 0.3
       - name: all_degraded
         view: all_degraded
         strength: 0.5
@@ -78,6 +86,8 @@ eval:
     - api_graph_degraded
     - manifest_degraded
     - manifest_noisy
+    - manifest_zeroed
+    - manifest_shuffled
     - all_degraded
     - api_missing
     - graph_missing

@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
-from fusion.constants import AEG_SCHEMA_VERSION
+from fusion.constants import AEG_SCHEMA_VERSION, SOURCE_TYPES, VIEW_TYPES
 from fusion.perturbations import apply_aeg_view
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
 
@@ -63,6 +63,8 @@ def _read_labels(path: str | Path | None) -> dict[str, int]:
                 raise AEGDatasetConfigError(f"Invalid label {raw_label!r} for {sid}") from exc
             if label not in {0, 1}:
                 raise AEGDatasetConfigError(f"Only binary labels are supported; got {label} for {sid}")
+            if sid in labels:
+                raise AEGDatasetConfigError(f"Duplicate label id in {path}: {sid}")
             labels[sid] = label
     return labels
 
@@ -175,6 +177,7 @@ class AEGDataset(Dataset):
         aug_strengths: list[float] | tuple[float, ...] | None = None,
         aug_prob: float = 0.5,
         seed: int = 42,
+        strict_integrity: bool = True,
     ) -> None:
         self.pt_dir = Path(pt_dir)
         if not self.pt_dir.exists():
@@ -188,6 +191,17 @@ class AEGDataset(Dataset):
         _ = seed
 
         pt_files = sorted(self.pt_dir.glob("*.pt"))
+        pt_ids = {path.stem.lower() for path in pt_files}
+        if self.labels and strict_integrity:
+            csv_ids = set(self.labels)
+            csv_only = sorted(csv_ids - pt_ids)
+            pt_only = sorted(pt_ids - csv_ids)
+            if csv_only or pt_only:
+                raise AEGDatasetConfigError(
+                    f"CSV/PT mismatch for {self.pt_dir}: "
+                    f"csv_only={len(csv_only)} examples={csv_only[:5]}, "
+                    f"pt_only={len(pt_only)} examples={pt_only[:5]}"
+                )
         samples: list[tuple[Path, int | None]] = []
         for path in pt_files:
             sid = path.stem.lower()
@@ -219,11 +233,52 @@ class AEGDataset(Dataset):
 def aeg_collate_fn(items: list[dict[str, Data]]) -> dict[str, Any]:
     clean_items = [item["clean"] for item in items]
     aug_items = [item.get("aug", item["clean"]) for item in items]
+    _apply_manifest_shuffle(clean_items, aug_items)
     return {
         "clean": Batch.from_data_list(clean_items),
         "aug": Batch.from_data_list(aug_items),
         "sid": [getattr(item, "sid", "") for item in clean_items],
     }
+
+
+def _copy_manifest_content(target: Data, donor: Data) -> None:
+    target_mask = target.node_source == SOURCE_TYPES["manifest"]
+    donor_mask = donor.node_source == SOURCE_TYPES["manifest"]
+    if not bool(target_mask.any()):
+        return
+    if not bool(donor_mask.any()):
+        target.x[target_mask] = 0.0
+        target.node_quality[target_mask] = 0.0
+        target.node_semantic[target_mask] = 0.0
+        target.q_manifest = torch.tensor([0.0], dtype=torch.float32)
+        return
+    target_idx = torch.where(target_mask)[0]
+    donor_idx = torch.where(donor_mask)[0]
+    repeat = donor_idx.repeat((int(target_idx.numel()) + int(donor_idx.numel()) - 1) // int(donor_idx.numel()))[: target_idx.numel()]
+    target.x[target_idx] = donor.x[repeat]
+    target.node_quality[target_idx] = donor.node_quality[repeat]
+    target.node_semantic[target_idx] = donor.node_semantic[repeat]
+    target.q_manifest = donor.q_manifest.clone()
+
+
+def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data]) -> None:
+    if len(aug_items) <= 1:
+        for aug in aug_items:
+            if int(aug.view_type_id.view(-1)[0].item()) == VIEW_TYPES["manifest_shuffled"]:
+                # A single-sample batch cannot supply a donor; use zeroed
+                # Manifest evidence instead of silently keeping the original.
+                mask = aug.node_source == SOURCE_TYPES["manifest"]
+                if bool(mask.any()):
+                    aug.x[mask] = 0.0
+                    aug.node_quality[mask] = 0.0
+                    aug.node_semantic[mask] = 0.0
+                aug.q_manifest = torch.tensor([0.0], dtype=torch.float32)
+        return
+    for idx, aug in enumerate(aug_items):
+        if int(aug.view_type_id.view(-1)[0].item()) != VIEW_TYPES["manifest_shuffled"]:
+            continue
+        donor = clean_items[(idx + 1) % len(clean_items)]
+        _copy_manifest_content(aug, donor)
 
 
 def split_label_stats(dataset: AEGDataset) -> dict[str, float]:

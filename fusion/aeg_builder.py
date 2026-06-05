@@ -11,6 +11,7 @@ from fusion.constants import (
     AEG_SCHEMA_VERSION,
     EDGE_TYPES,
     NODE_TYPES,
+    REVERSE_EDGE_TYPES,
     SOURCE_TYPES,
     STRING_HINT_KEYWORDS,
 )
@@ -166,11 +167,26 @@ def _api_type_semantic(type_id: int) -> torch.Tensor:
     return out
 
 
-def _component_records(record: dict[str, Any]) -> list[tuple[str, int]]:
-    out: list[tuple[str, int]] = []
+def _component_records(record: dict[str, Any]) -> list[tuple[str, int, list[str]]]:
+    typed = {"activity": 0, "service": 1, "receiver": 2, "provider": 3}
+    components = record.get("components")
+    if isinstance(components, list) and components:
+        out: list[tuple[str, int, list[str]]] = []
+        for item in components:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            comp_type = typed.get(str(item.get("type") or "").lower(), 0)
+            intents = [str(v).lower() for v in [*(item.get("intent_actions") or []), *(item.get("intent_categories") or [])] if v]
+            out.append((name, comp_type, intents))
+        return out
+
+    out = []
     for type_id, key in enumerate(("activities", "services", "receivers", "providers")):
         for name in record.get(key) or []:
-            out.append((str(name), type_id))
+            out.append((str(name), type_id, []))
     return out
 
 
@@ -198,13 +214,14 @@ class _GraphBuilder:
         self.node_x.append(_node_feature(self.node_feature_dim, feature))
         return idx
 
-    def add_edge(self, src: int, dst: int, edge_type: str, quality: float, source: str, *, bidirectional: bool = True) -> None:
+    def add_edge(self, src: int, dst: int, edge_type: str, quality: float, source: str, *, add_reverse: bool = True) -> None:
         if src < 0 or dst < 0:
             return
         edge = (int(src), int(dst), EDGE_TYPES[edge_type], float(max(0.0, min(1.0, quality))), SOURCE_TYPES[source])
         self.edges.append(edge)
-        if bidirectional and src != dst:
-            self.edges.append((edge[1], edge[0], edge[2], edge[3], edge[4]))
+        reverse_type = REVERSE_EDGE_TYPES.get(edge_type)
+        if add_reverse and reverse_type and src != dst:
+            self.edges.append((edge[1], edge[0], EDGE_TYPES[reverse_type], edge[3], edge[4]))
 
     def tensors(self) -> dict[str, torch.Tensor]:
         if self.edges:
@@ -324,24 +341,30 @@ def build_aeg_payload(
         builder.add_edge(apk_node, node, "APK_REQUESTS_PERMISSION", q_manifest, "manifest")
 
     intent_nodes = []
+    intent_token_to_node: dict[str, int] = {}
     intent_ids = _as_tensor(manifest_payload.get("manifest_intent_ids"), dtype=torch.long).view(-1)
+    intent_tokens = [str(v).lower() for v in (manifest_payload.get("manifest_intent_tokens") or [])]
     intent_map = _as_tensor(manifest_payload.get("manifest_intent_category_map"), dtype=torch.float32)
-    for intent_id in intent_ids.tolist():
+    for idx, intent_id in enumerate(intent_ids.tolist()):
         row = int(intent_id) - 1
         sem = intent_map[row] if intent_map.ndim == 2 and 0 <= row < intent_map.size(0) else torch.zeros(SEMANTIC_CATEGORY_DIM)
         node = builder.add_node("INTENT", "manifest", q_manifest, sem, [float(intent_id) / 512.0, q_manifest])
         intent_nodes.append(node)
+        if idx < len(intent_tokens):
+            intent_token_to_node[intent_tokens[idx]] = node
 
     component_nodes = []
     method_name_norm = [_normalize_name(v) for v in flat["method_names"]]
-    for comp_name, comp_type in _component_records(manifest_record):
+    for comp_name, comp_type, comp_intents in _component_records(manifest_record):
         sem = category_counts_from_strings([comp_name], list(SEMANTIC_CATEGORIES))
         feature = [float(comp_type) / 4.0, q_manifest]
         comp_node = builder.add_node("COMPONENT", "manifest", q_manifest, sem, feature)
         component_nodes.append(comp_node)
         builder.add_edge(apk_node, comp_node, "APK_HAS_COMPONENT", q_manifest, "manifest")
-        for intent_node in intent_nodes:
-            builder.add_edge(comp_node, intent_node, "COMPONENT_DECLARES_INTENT", q_manifest, "manifest")
+        for token in comp_intents:
+            intent_node = intent_token_to_node.get(str(token).lower())
+            if intent_node is not None:
+                builder.add_edge(comp_node, intent_node, "COMPONENT_DECLARES_INTENT", q_manifest, "manifest")
         comp_norm = _normalize_name(comp_name)
         if comp_norm:
             for method_idx, method_norm in enumerate(method_name_norm):

@@ -59,6 +59,11 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+
+
 def _binary_metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[str, float]:
     if not labels:
         return {}
@@ -149,6 +154,7 @@ def _make_dataset(cfg: dict[str, Any], split: str, *, aug: bool = False, view: s
         aug_views=[view] if view else list(robust_cfg.get("train_views", ["api_degraded", "graph_degraded", "api_graph_degraded", "manifest_degraded", "all_degraded"])),
         aug_strengths=[float(strength)] if strength is not None else list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
         seed=int((cfg.get("train", {}) or {}).get("seed", 42)),
+        strict_integrity=bool(data_cfg.get("strict_integrity", True)),
     )
 
 
@@ -156,6 +162,8 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
     train_cfg = cfg.get("train", {}) or {}
     batch_size = int(train_cfg.get("batch_size" if train else "eval_batch_size", train_cfg.get("batch_size", 24)))
     workers = int(train_cfg.get("num_workers", 0))
+    generator = torch.Generator()
+    generator.manual_seed(int(train_cfg.get("seed", 42)) + (0 if train else 100_000))
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -163,8 +171,24 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
         num_workers=workers,
         pin_memory=bool(train_cfg.get("pin_memory", False)),
         persistent_workers=workers > 0,
+        generator=generator,
+        worker_init_fn=_seed_worker if workers > 0 else None,
         collate_fn=aeg_collate_fn,
     )
+
+
+def _validate_split_isolation(*datasets: AEGDataset) -> None:
+    seen: dict[str, str] = {}
+    conflicts: list[tuple[str, str, str]] = []
+    for dataset in datasets:
+        for path, _label in dataset.samples:
+            sid = path.stem.lower()
+            prev = seen.get(sid)
+            if prev is not None and prev != dataset.split:
+                conflicts.append((sid, prev, dataset.split))
+            seen[sid] = dataset.split
+    if conflicts:
+        raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -254,12 +278,20 @@ def evaluate(
                     "code_manifest_conflict": float(extra["code_manifest_conflict"][idx].item()),
                 }
                 if isinstance(attn, torch.Tensor) and attn.ndim == 2 and idx < attn.size(0):
+                    attn_names = [
+                        "attn_method",
+                        "attn_api_family",
+                        "attn_permission",
+                        "attn_component",
+                        "attn_risk",
+                        "attn_string_hint",
+                        "attn_global",
+                    ]
                     row.update(
                         {
-                            "attn_code": float(attn[idx, 0].item()),
-                            "attn_manifest": float(attn[idx, 1].item()),
-                            "attn_risk": float(attn[idx, 2].item()),
-                            "attn_global": float(attn[idx, 3].item()),
+                            name: float(attn[idx, col].item())
+                            for col, name in enumerate(attn_names)
+                            if col < attn.size(1)
                         }
                     )
                 rows.append(row)
@@ -356,6 +388,7 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
     train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
     val_ds = _make_dataset(cfg, "val", aug=False)
     test_ds = _make_dataset(cfg, "test", aug=False)
+    _validate_split_isolation(train_ds, val_ds, test_ds)
     LOGGER.info("Train stats: %s", split_label_stats(train_ds))
     LOGGER.info("Val stats: %s", split_label_stats(val_ds))
     LOGGER.info("Test stats: %s", split_label_stats(test_ds))

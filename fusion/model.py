@@ -55,6 +55,7 @@ class RelationalGraphLayer(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
         self.rel_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(NUM_EDGE_TYPES)])
+        self.edge_source_emb = nn.Embedding(NUM_SOURCE_TYPES, hidden_dim)
         self.update = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
@@ -68,6 +69,7 @@ class RelationalGraphLayer(nn.Module):
         h: torch.Tensor,
         edge_index: torch.Tensor,
         edge_type: torch.Tensor,
+        edge_source: torch.Tensor,
         edge_quality: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if edge_index.numel() == 0:
@@ -87,8 +89,9 @@ class RelationalGraphLayer(nn.Module):
                 continue
             src = src_all[mask]
             dst = dst_all[mask]
+            src_type = edge_source[mask].long().clamp(0, NUM_SOURCE_TYPES - 1)
             weight = edge_quality[mask].clamp_min(0.0).unsqueeze(-1)
-            msg = proj(h[src]) * weight
+            msg = proj(h[src] + self.edge_source_emb(src_type)) * weight
             agg.index_add_(0, dst, msg)
             deg.index_add_(0, dst, weight)
         agg = agg / deg.clamp_min(1.0)
@@ -109,6 +112,7 @@ class LatentReliabilityFusion(nn.Module):
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.source_score_bias = nn.Embedding(NUM_SOURCE_TYPES, 1)
         self.out = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -123,6 +127,8 @@ class LatentReliabilityFusion(nn.Module):
         tokens: torch.Tensor,
         token_reliability: torch.Tensor,
         conflict: torch.Tensor,
+        token_source: torch.Tensor,
+        manifest_token_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, _, dim = tokens.shape
         query = self.q_proj(self.latents).unsqueeze(0).expand(bsz, -1, -1)
@@ -132,11 +138,14 @@ class LatentReliabilityFusion(nn.Module):
 
         rel = token_reliability.clamp_min(1e-4).to(dtype=scores.dtype)
         scores = scores + self.reliability_bias_weight * torch.log(rel).unsqueeze(1)
-        # Token order is [code, manifest, risk, global]. Only manifest receives
-        # an explicit conflict penalty, which suppresses shortcut reliance when
-        # declaration evidence disagrees with code evidence.
-        if scores.size(-1) > 1:
-            scores[:, :, 1] = scores[:, :, 1] - self.conflict_bias_weight * conflict.view(-1, 1)
+        source_bias = self.source_score_bias(token_source.long().clamp(0, NUM_SOURCE_TYPES - 1)).view(1, 1, -1)
+        scores = scores + source_bias
+        manifest_mask = manifest_token_mask.to(device=scores.device, dtype=torch.bool).view(1, 1, -1)
+        scores = torch.where(
+            manifest_mask,
+            scores - self.conflict_bias_weight * conflict.view(-1, 1, 1),
+            scores,
+        )
 
         attn = torch.softmax(scores, dim=-1)
         fused_latents = torch.einsum("bls,bsd->bld", attn, value)
@@ -210,17 +219,28 @@ class AEGModel(nn.Module):
         h = self._initial_node_state(data)
         edge_type = data.edge_type.long().to(data.x.device)
         edge_quality = data.edge_quality.float().to(data.x.device)
+        edge_source = data.edge_source.long().to(data.x.device)
         for layer in self.layers:
-            h = layer(h, data.edge_index.to(data.x.device), edge_type, edge_quality)
+            h = layer(h, data.edge_index.to(data.x.device), edge_type, edge_source, edge_quality)
 
         source_code = data.node_source == SOURCE_TYPES["code"]
         source_manifest = data.node_source == SOURCE_TYPES["manifest"]
+        method_nodes = data.node_type == NODE_TYPES["METHOD"]
+        api_family_nodes = data.node_type == NODE_TYPES["API_FAMILY"]
+        permission_nodes = data.node_type == NODE_TYPES["PERMISSION"]
+        component_nodes = data.node_type == NODE_TYPES["COMPONENT"]
         risk_nodes = data.node_type == NODE_TYPES["RISK_SEMANTIC"]
+        string_hint_nodes = data.node_type == NODE_TYPES["STRING_HINT"]
 
-        code_emb = _masked_mean(h, source_code, data.batch, num_graphs)
-        manifest_emb = _masked_mean(h, source_manifest, data.batch, num_graphs)
+        method_emb = _masked_mean(h, method_nodes, data.batch, num_graphs)
+        api_family_emb = _masked_mean(h, api_family_nodes, data.batch, num_graphs)
+        permission_emb = _masked_mean(h, permission_nodes, data.batch, num_graphs)
+        component_emb = _masked_mean(h, component_nodes, data.batch, num_graphs)
         risk_emb = _masked_mean(h, risk_nodes, data.batch, num_graphs)
+        string_hint_emb = _masked_mean(h, string_hint_nodes, data.batch, num_graphs)
         global_emb = global_mean_pool(h, data.batch, size=num_graphs)
+        code_emb = 0.5 * (method_emb + api_family_emb)
+        manifest_emb = 0.5 * (permission_emb + component_emb)
 
         code_sem = _masked_semantic_mean(data, source_code, num_graphs)
         manifest_sem = _masked_semantic_mean(data, source_manifest, num_graphs)
@@ -234,15 +254,40 @@ class AEGModel(nn.Module):
         code_rel = (q_api.clamp_min(0.0) * q_graph.clamp_min(0.0)).sqrt()
         risk_rel = torch.stack([code_rel, q_manifest, q_align.clamp_min(0.0)], dim=-1).amax(dim=-1)
         global_rel = torch.stack([code_rel, q_manifest], dim=-1).amax(dim=-1)
-        token_rel = torch.stack([code_rel, q_manifest, risk_rel, global_rel], dim=-1).clamp(0.0, 1.0)
-        tokens = torch.stack([code_emb, manifest_emb, risk_emb, global_emb], dim=1)
-        fused, attention_mass = self.fusion(tokens, token_rel, conflict)
+        token_rel = torch.stack(
+            [q_graph, q_api, q_manifest, q_manifest, risk_rel, q_api, global_rel],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+        tokens = torch.stack(
+            [method_emb, api_family_emb, permission_emb, component_emb, risk_emb, string_hint_emb, global_emb],
+            dim=1,
+        )
+        token_source = torch.tensor(
+            [
+                SOURCE_TYPES["code"],
+                SOURCE_TYPES["code"],
+                SOURCE_TYPES["manifest"],
+                SOURCE_TYPES["manifest"],
+                SOURCE_TYPES["derived"],
+                SOURCE_TYPES["derived"],
+                SOURCE_TYPES["derived"],
+            ],
+            dtype=torch.long,
+            device=data.x.device,
+        )
+        manifest_token_mask = torch.tensor([False, False, True, True, False, False, False], device=data.x.device)
+        fused, attention_mass = self.fusion(tokens, token_rel, conflict, token_source, manifest_token_mask)
         logits = self.classifier(fused)
         extra = {
             "fused_emb": fused,
+            "method_emb": method_emb,
+            "api_family_emb": api_family_emb,
+            "permission_emb": permission_emb,
+            "component_emb": component_emb,
             "code_emb": code_emb,
             "manifest_emb": manifest_emb,
             "risk_emb": risk_emb,
+            "string_hint_emb": string_hint_emb,
             "global_emb": global_emb,
             "attention_mass": attention_mass.detach(),
             "code_manifest_conflict": conflict.detach(),
