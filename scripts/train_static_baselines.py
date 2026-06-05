@@ -29,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fusion.dataset import RobustTriModalDataset
 from fusion.perturbations import EVAL_PERTURB_TYPES
-from fusion.train import build_dataset, load_config
+from fusion.train import build_dataset, enforce_failed_ratio, load_config, validate_split_partitions
 
 
 REFERENCE_METHODS = (
@@ -175,9 +175,11 @@ def _load_split_features(
     sids: list[str] = []
     labels: list[int] = []
     features: list[Any] = []
+    num_failed = 0
     for idx in tqdm(range(len(dataset)), desc=f"{split}:{method}", leave=False):
         data = dataset[idx]
         if bool(getattr(data, "is_dummy", False)):
+            num_failed += 1
             continue
         sids.append(str(getattr(data, "sid", f"{split}_{idx}")))
         labels.append(int(data.y.detach().cpu().view(-1)[0].item()))
@@ -196,6 +198,11 @@ def _load_split_features(
             features.append(_dense_semantic_features(data, include_manifest=True))
         else:
             raise ValueError(f"Unsupported reference method: {method}")
+    enforce_failed_ratio(
+        {"num_eval": len(labels), "num_failed": num_failed},
+        cfg,
+        f"static_baseline_{split}_{method}",
+    )
     return sids, labels, features
 
 
@@ -295,6 +302,13 @@ def _write_prediction_rows(path: Path, split: str, sids: list[str], labels: list
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     cfg = load_config(args.config)
+    if bool(args.robust_test) and not bool(args.run_test):
+        raise ValueError("--robust-test requires --run-test; robust tests are evaluated on the test split.")
+    if bool(args.run_test) and not bool(cfg.get("eval", {}).get("run_test", True)):
+        raise ValueError(
+            "The selected config has eval.run_test=false. Use a final-evaluation config or set --run-test only after tuning is finished."
+        )
+    validate_split_partitions(cfg, include_test=bool(args.run_test))
     methods = args.methods or list(REFERENCE_METHODS)
     unknown = sorted(set(methods) - set(REFERENCE_METHODS))
     if unknown:
@@ -309,7 +323,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         _train_sids, train_labels, train_features = _load_split_features(cfg, "train", method)
         fitted = _fit_reference_model(method, train_features, train_labels)
         method_results: dict[str, Any] = {}
-        for split in ("val", "test"):
+        eval_splits = ["val"] + (["test"] if args.run_test else [])
+        for split in eval_splits:
             sids, labels, features = _load_split_features(cfg, split, method)
             probs, preds = _predict_reference_model(fitted, features)
             metrics = _binary_metrics(labels, probs, preds)
@@ -356,6 +371,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", nargs="+", default=["config/experiments/tri_modal_robust/base_tri_modal_robust.yaml"])
     parser.add_argument("--methods", nargs="+", choices=REFERENCE_METHODS, default=list(REFERENCE_METHODS))
     parser.add_argument("--out-dir", default="results/static_reference_baselines")
+    parser.add_argument("--run-test", action="store_true", help="Evaluate the held-out test split. Keep disabled during tuning.")
     parser.add_argument("--robust-test", action="store_true", help="Evaluate selected synthetic perturbation tests on test split.")
     parser.add_argument("--perturb-tests", nargs="+", default=["api_graph_degraded", "manifest_degraded", "all_degraded", "api_missing", "graph_missing", "manifest_missing"])
     parser.add_argument("--perturb-strengths", nargs="+", type=float, default=[0.5])

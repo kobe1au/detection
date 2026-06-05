@@ -126,12 +126,38 @@ After selecting the final parameters, run the complete test protocol from `full/
 instead of `optuna_base.yaml`:
 
 ```bash
-python -m fusion.train --config \
-  config/experiments/tri_modal_robust/full/ours.yaml \
-  results/optuna/robust_v2/best_i2_override.yaml \
-  results/optuna/robust_v2/best_i3_override.yaml \
-  results/optuna/robust_v2/best_aug_override.yaml
+python scripts/make_post_optuna_configs.py \
+  --tag robust_v2 \
+  --best-i2 results/optuna/robust_v2/best_i2_override.yaml \
+  --best-i3 results/optuna/robust_v2/best_i3_override.yaml \
+  --best-aug results/optuna/robust_v2/best_aug_override.yaml
+
+python run.py post_optuna/robust_v2/full --dry-run
+python run.py post_optuna/robust_v2/full
 ```
+
+The generated `post_optuna/<tag>` configs lock the safe override order:
+base method, best selected parameters, then the final ablation override. This prevents
+best gate parameters from overwriting fixed/reliability gate ablations.
+Use the generated configs for the final paper tables:
+
+```bash
+python run.py post_optuna/robust_v2/i1 --dry-run
+python run.py post_optuna/robust_v2/i2 --dry-run
+python run.py post_optuna/robust_v2/i3 --dry-run
+python run.py post_optuna/robust_v2/full --dry-run
+python run.py post_optuna/robust_v2/seed --dry-run
+
+python run.py post_optuna/robust_v2/i1
+python run.py post_optuna/robust_v2/i2
+python run.py post_optuna/robust_v2/i3
+python run.py post_optuna/robust_v2/full
+python run.py post_optuna/robust_v2/seed
+```
+
+The original `i1/`, `i2/`, `i3/`, and `full/` configs remain useful for development
+and sanity checks.  They are not the frozen post-tuning protocol once Optuna has been
+used.
 
 ## External-Style Reference Baselines
 
@@ -142,6 +168,7 @@ They provide classical/static comparison points for the final method:
 python scripts/train_static_baselines.py \
   --config config/experiments/tri_modal_robust/base_tri_modal_robust.yaml \
   --out-dir results/static_reference_baselines \
+  --run-test \
   --robust-test
 ```
 
@@ -166,7 +193,7 @@ override:
 
 ```bash
 python -m fusion.train --config \
-  config/experiments/tri_modal_robust/full/ours.yaml \
+  config/experiments/tri_modal_robust/post_optuna/robust_v2/full/full_ours.yaml \
   results/robust_slices/extra_eval_slices.yaml
 ```
 

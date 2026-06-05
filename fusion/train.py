@@ -214,6 +214,8 @@ def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
                 "graph_semantic_source",
                 "max_api_events_per_sample",
                 "min_pt_schema_version",
+                "allow_legacy_pt_compat",
+                "manifest_vocab_path",
                 "label_map",
             )
         },

@@ -225,6 +225,8 @@ def main() -> None:
         "stage": args.stage,
         "base_configs": list(args.config),
         "base_cfg": base_cfg,
+        "objective_seeds": [int(seed) for seed in args.seeds],
+        "sampler": "grid" if args.stage == "aug" else "tpe",
     }
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")

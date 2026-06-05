@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 from pathlib import Path
+import yaml
 
 
 ROOT = Path(__file__).resolve().parent
@@ -87,6 +88,8 @@ GROUPS = {
         "full/ours_no_branch_aux.yaml",
         "full/ours_graph_zero.yaml",
         "full/ours_graph_full_api.yaml",
+    ],
+    "oracle_ablation": [
         "full/ours_oracle_perturbation_evidence.yaml",
     ],
     "seed": [
@@ -100,9 +103,12 @@ GROUPS = {
 def available_configs() -> dict[str, Path]:
     configs: dict[str, Path] = {}
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
+        rel_parts = path.relative_to(CONFIG_DIR).parts
         if path.name in {"base_tri_modal_robust.yaml", "optuna_base.yaml"}:
             continue
-        if "tune" in path.relative_to(CONFIG_DIR).parts:
+        if "tune" in rel_parts:
+            continue
+        if "post_optuna" in rel_parts:
             continue
         if "oracle" in path.stem:
             continue
@@ -130,6 +136,27 @@ def resolve_targets(target: str) -> list[Path]:
         )
     if target in GROUPS:
         return [CONFIG_DIR / item for item in GROUPS[target]]
+    if target.startswith("post_optuna/"):
+        parts = target.split("/")
+        if len(parts) == 2:
+            groups_path = CONFIG_DIR / target / "groups.yaml"
+            selected_group = "full"
+        elif len(parts) == 3:
+            groups_path = CONFIG_DIR / "post_optuna" / parts[1] / "groups.yaml"
+            selected_group = parts[2]
+        else:
+            raise ValueError("Post-Optuna targets must be post_optuna/<tag> or post_optuna/<tag>/<group>")
+        if not groups_path.exists():
+            raise ValueError(f"Post-Optuna group file not found: {groups_path}")
+        groups = yaml.safe_load(groups_path.read_text(encoding="utf-8")) or {}
+        group_map = groups.get("groups") or {}
+        if selected_group == "all":
+            paths = [item for values in group_map.values() for item in values]
+        else:
+            if selected_group not in group_map:
+                raise ValueError(f"Unknown post-Optuna group '{selected_group}'. Known: {sorted(group_map)}")
+            paths = group_map[selected_group]
+        return [CONFIG_DIR / item for item in paths]
     if target == "all":
         seen: set[Path] = set()
         out: list[Path] = []
