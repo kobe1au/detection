@@ -5,3 +5,10 @@ graph:
   # graph nodes but weaken API/Graph evidence separation, so they are not used
   # in the canonical AEG extraction config.
   use_behavior_hints: true
+
+aeg:
+  # Behavior hints are appended after the base method feature:
+  # 2 * graph.vocab_size + 3 + 4 = 519 when graph.vocab_size is 256.
+  # Keep this ablation dimension large enough so the hint channels survive
+  # AEG node feature truncation.
+  node_feature_dim: 519

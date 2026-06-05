@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import argparse
 from pathlib import Path
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -11,9 +13,9 @@ from fusion.constants import AEG_SCHEMA_VERSION, EDGE_TYPES, NODE_TYPES, VIEW_TY
 from fusion.dataset import AEGDataset, aeg_collate_fn, payload_to_data
 from fusion.losses import _source_contrast_weights, compute_aeg_loss
 from fusion.manifest_features import build_manifest_vocab, vectorize_manifest_record
-from fusion.model import AEGModel
+from fusion.model import AEGModel, build_model
 from fusion.perturbations import apply_aeg_view
-from fusion.train import load_config
+from fusion.train import _validate_split_isolation, load_config
 
 
 def _manifest_record() -> dict:
@@ -237,10 +239,54 @@ def test_aeg_config_loads():
     assert cfg["loss"]["clean_degraded_contrast_weight"] > 0.0
 
 
+def test_build_model_uses_payload_node_width_over_yaml_hint():
+    cfg = {"model": {"node_input_dim": 128, "hidden_dim": 16, "layers": 1, "num_latents": 2}}
+    model = build_model(cfg, node_input_dim=519)
+    assert model.input_proj.in_features == 519
+
+
 def test_extract_behavior_hint_config_is_explicit_ablation():
-    from scripts.build_aeg_pts_direct import _load_config
+    from scripts.build_aeg_pts_direct import _load_config, _parse_config
 
     base = _load_config(Path("config/extract_aeg.yaml"))
     ablation = _load_config(Path("config/extract_aeg_behavior_hints.yaml"))
     assert base["graph"]["use_behavior_hints"] is False
     assert ablation["graph"]["use_behavior_hints"] is True
+    required_dim = int(ablation["graph"]["vocab_size"]) * 2 + 3 + 4
+    assert int(ablation["aeg"]["node_feature_dim"]) >= required_dim
+
+    broken = _load_config(Path("config/extract_aeg.yaml"))
+    broken["graph"]["use_behavior_hints"] = True
+    broken["aeg"]["node_feature_dim"] = 128
+    args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=False)
+    with pytest.raises(ValueError, match="use_behavior_hints=true"):
+        _parse_config(broken, args)
+
+
+def test_package_name_overlap_across_splits_is_rejected(tmp_path: Path):
+    payload_train = _payload()
+    payload_val = _payload()
+    payload_val["sid"] = "b" * 64
+    payload_val["sha256"] = "b" * 64
+    payload_train["package_name"] = "com.example.same"
+    payload_val["package_name"] = "com.example.same"
+
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    torch.save(payload_train, train_dir / f"{payload_train['sid']}.pt")
+    torch.save(payload_val, val_dir / f"{payload_val['sid']}.pt")
+
+    train_csv = tmp_path / "train.csv"
+    val_csv = tmp_path / "val.csv"
+    for csv_path, payload, label in ((train_csv, payload_train, 1), (val_csv, payload_val, 0)):
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["id", "label"])
+            writer.writeheader()
+            writer.writerow({"id": payload["sid"], "label": label})
+
+    train_ds = AEGDataset(train_dir, train_csv, split="train")
+    val_ds = AEGDataset(val_dir, val_csv, split="val")
+    with pytest.raises(ValueError, match="Package name overlap"):
+        _validate_split_isolation(train_ds, val_ds, check_package=True)

@@ -59,9 +59,15 @@ The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are reco
 The canonical extraction config disables API-derived graph behavior hints
 (`graph.use_behavior_hints=false`) so API evidence is not leaked into graph
 method features during `api_missing` or `api_degraded` evaluations. Use
-`config/extract_aeg_behavior_hints.yaml` only as an explicit ablation.
+`config/extract_aeg_behavior_hints.yaml` only as an explicit ablation. That
+ablation sets `aeg.node_feature_dim=519` because hint channels are appended
+after the base `2 * graph.vocab_size + 3` method feature; smaller dimensions
+would truncate the hint channels and make the ablation ineffective.
 
 Training uses strict CSV/PT integrity by default. If `results/labels/{train,val,test}.csv` contains ids without corresponding AEG `.pt` files, or a PT folder contains extra samples not in its CSV, training fails instead of silently changing the split size.
+Training also rejects repeated `package_name` values across train/val/test by
+default (`data.enforce_package_isolation=true`) to reduce package-level split
+leakage.
 
 ## Train
 

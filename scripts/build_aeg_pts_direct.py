@@ -95,6 +95,8 @@ def _build_fingerprint(cfg: dict[str, Any], vocab: dict[str, Any]) -> str:
         "fallback_max_methods",
         "fallback_policy",
         "use_graph_behavior_hints",
+        "graph_behavior_hint_start",
+        "graph_behavior_hint_dim",
         "num_api_buckets",
         "max_api_events_per_dex",
         "max_api_events_per_method",
@@ -208,6 +210,19 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
             "Manifest vocab will be built/rebuilt, but resume=true may skip existing .pt files. "
             "Use --no-resume when building/rebuilding vocab."
         )
+    node_feature_dim = int(aeg.get("node_feature_dim", 128))
+    vocab_size = int(graph.get("vocab_size", 256))
+    use_graph_behavior_hints = bool(graph.get("use_behavior_hints", False))
+    graph_behavior_hint_start = vocab_size * 2 + 3
+    graph_behavior_hint_dim = 4 if use_graph_behavior_hints else 0
+    if use_graph_behavior_hints:
+        required_dim = graph_behavior_hint_start + graph_behavior_hint_dim
+        if node_feature_dim < required_dim:
+            raise ValueError(
+                "graph.use_behavior_hints=true requires aeg.node_feature_dim >= "
+                f"{required_dim} (2 * graph.vocab_size + 3 + 4); got {node_feature_dim}. "
+                "Use config/extract_aeg_behavior_hints.yaml or disable behavior hints."
+            )
     return {
         "splits": splits,
         "split_dirs": split_dirs,
@@ -221,13 +236,15 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
         "max_intents": int(manifest.get("max_intents", 64)),
         "max_features": int(manifest.get("max_features", 32)),
         "allow_empty_vocab": bool(manifest.get("allow_empty_vocab", False)),
-        "node_feature_dim": int(aeg.get("node_feature_dim", 128)),
-        "vocab_size": int(graph.get("vocab_size", 256)),
+        "node_feature_dim": node_feature_dim,
+        "vocab_size": vocab_size,
         "sensitive_hops": int(graph.get("sensitive_hops", 1)),
         "max_methods_per_dex": int(graph.get("max_methods_per_dex", 4096)),
         "fallback_max_methods": int(graph.get("fallback_max_methods", 512)),
         "fallback_policy": str(graph.get("fallback_policy", "api_rich")),
-        "use_graph_behavior_hints": bool(graph.get("use_behavior_hints", False)),
+        "use_graph_behavior_hints": use_graph_behavior_hints,
+        "graph_behavior_hint_start": graph_behavior_hint_start,
+        "graph_behavior_hint_dim": graph_behavior_hint_dim,
         "num_api_buckets": int(api.get("num_hash_buckets", 8192)),
         "max_api_events_per_dex": int(api.get("max_events_per_dex", 1024)),
         "max_api_events_per_method": int(api.get("max_events_per_method", 32)),
@@ -374,8 +391,8 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
             "num_dex_failed": failed,
             "aeg_build_fingerprint": cfg.get("build_fingerprint", ""),
             "use_graph_behavior_hints": bool(cfg.get("use_graph_behavior_hints", False)),
-            "graph_behavior_hint_start": int(cfg["vocab_size"]) * 2 + 3,
-            "graph_behavior_hint_dim": 4 if bool(cfg.get("use_graph_behavior_hints", False)) else 0,
+            "graph_behavior_hint_start": int(cfg["graph_behavior_hint_start"]),
+            "graph_behavior_hint_dim": int(cfg["graph_behavior_hint_dim"]),
         }
         payload = build_aeg_payload(
             sid=job["sha256"],

@@ -177,9 +177,25 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
     )
 
 
-def _validate_split_isolation(*datasets: AEGDataset) -> None:
+def _sample_package_name(path: Path, cache: dict[Path, str]) -> str:
+    key = path.resolve()
+    if key in cache:
+        return cache[key]
+    try:
+        payload = torch.load(key, map_location="cpu")
+        package = str(payload.get("package_name") or "").strip().lower()
+    except Exception:
+        package = ""
+    cache[key] = package
+    return package
+
+
+def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True) -> None:
     seen: dict[str, str] = {}
     conflicts: list[tuple[str, str, str]] = []
+    package_seen: dict[str, tuple[str, str]] = {}
+    package_conflicts: list[tuple[str, str, str, str, str]] = []
+    package_cache: dict[Path, str] = {}
     for dataset in datasets:
         for path, _label in dataset.samples:
             sid = path.stem.lower()
@@ -187,8 +203,21 @@ def _validate_split_isolation(*datasets: AEGDataset) -> None:
             if prev is not None and prev != dataset.split:
                 conflicts.append((sid, prev, dataset.split))
             seen[sid] = dataset.split
+            if check_package:
+                package = _sample_package_name(path, package_cache)
+                if package:
+                    package_prev = package_seen.get(package)
+                    if package_prev is not None and package_prev[0] != dataset.split:
+                        package_conflicts.append((package, package_prev[1], sid, package_prev[0], dataset.split))
+                    else:
+                        package_seen.setdefault(package, (dataset.split, sid))
     if conflicts:
         raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
+    if package_conflicts:
+        raise ValueError(
+            "Package name overlap across splits: "
+            f"count={len(package_conflicts)} examples={package_conflicts[:5]}"
+        )
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -391,7 +420,13 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
     train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
     val_ds = _make_dataset(cfg, "val", aug=False)
     test_ds = _make_dataset(cfg, "test", aug=False)
-    _validate_split_isolation(train_ds, val_ds, test_ds)
+    data_cfg = cfg.get("data", {}) or {}
+    _validate_split_isolation(
+        train_ds,
+        val_ds,
+        test_ds,
+        check_package=bool(data_cfg.get("enforce_package_isolation", True)),
+    )
     LOGGER.info("Train stats: %s", split_label_stats(train_ds))
     LOGGER.info("Val stats: %s", split_label_stats(val_ds))
     LOGGER.info("Test stats: %s", split_label_stats(test_ds))

@@ -313,7 +313,10 @@ class AEGModel(nn.Module):
 def build_model(cfg: dict[str, Any], node_input_dim: int) -> AEGModel:
     model_cfg = cfg.get("model", {}) or {}
     return AEGModel(
-        node_input_dim=int(model_cfg.get("node_input_dim", node_input_dim)),
+        # The PT schema is the source of truth for node feature width. Keeping
+        # YAML-only dimensions authoritative would break extraction ablations
+        # such as behavior hints, where node_x can legitimately be wider.
+        node_input_dim=int(node_input_dim),
         hidden_dim=int(model_cfg.get("hidden_dim", 128)),
         layers=int(model_cfg.get("layers", 2)),
         dropout=float(model_cfg.get("dropout", 0.15)),
