@@ -373,17 +373,23 @@ def build_aeg_payload(
                 if comp_norm and comp_norm in method_norm:
                     builder.add_edge(comp_node, method_nodes[method_idx], "COMPONENT_MATCHES_METHOD", q_align, "alignment")
 
+    manifest_counts = sanitize_semantic_counts(manifest_payload.get("manifest_category_counts"))
+    code_risk_active = method_sem.sum(dim=0) > 0
+    manifest_risk_active = manifest_counts > 0
     risk_nodes = []
     for idx, category in enumerate(SEMANTIC_CATEGORIES):
         sem = torch.zeros((SEMANTIC_CATEGORY_DIM,), dtype=torch.float32)
         sem[idx] = 1.0
-        risk_node = builder.add_node("RISK_SEMANTIC", "derived", max(q_api, q_manifest), sem, [idx / max(1, SEMANTIC_CATEGORY_DIM - 1)])
+        risk_quality = max(
+            q_api if bool(code_risk_active[idx]) else 0.0,
+            q_manifest if bool(manifest_risk_active[idx]) else 0.0,
+        )
+        risk_node = builder.add_node("RISK_SEMANTIC", "derived", risk_quality, sem, [idx / max(1, SEMANTIC_CATEGORY_DIM - 1)])
         risk_nodes.append(risk_node)
 
     for method_idx, sem in enumerate(method_sem):
         for cat_idx in torch.where(sem > 0)[0].tolist():
             builder.add_edge(method_nodes[method_idx], risk_nodes[cat_idx], "METHOD_HAS_RISK", q_api, "derived")
-    manifest_counts = sanitize_semantic_counts(manifest_payload.get("manifest_category_counts"))
     for cat_idx in torch.where(manifest_counts > 0)[0].tolist():
         builder.add_edge(apk_node, risk_nodes[cat_idx], "MANIFEST_HAS_RISK", q_manifest, "derived")
 

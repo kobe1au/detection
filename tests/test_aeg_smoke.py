@@ -72,6 +72,11 @@ def test_aeg_builder_dataset_model_loss(tmp_path: Path):
     assert payload["schema_version"] == AEG_SCHEMA_VERSION
     assert payload["node_x"].ndim == 2
     assert payload["edge_index"].size(0) == 2
+    risk_mask = payload["node_type"] == NODE_TYPES["RISK_SEMANTIC"]
+    assert bool(risk_mask.any())
+    risk_quality = payload["node_quality"][risk_mask]
+    assert bool((risk_quality > 0).any())
+    assert bool((risk_quality == 0).any())
 
     pt_dir = tmp_path / "train"
     pt_dir.mkdir()
@@ -126,7 +131,12 @@ def test_manifest_shuffle_is_type_aware(tmp_path: Path):
     data_b = payload_to_data(payload_b, label=0)
     aug = apply_aeg_view(data_a, view="manifest_shuffled", strength=1.0)
     before_type = aug.node_type.clone()
-    batch = aeg_collate_fn([{"clean": data_a, "aug": aug}, {"clean": data_b, "aug": apply_aeg_view(data_b, view="clean", strength=0.0)}])
+    batch = aeg_collate_fn(
+        [
+            {"clean": data_a, "aug": aug, "manifest_donor": data_b},
+            {"clean": data_b, "aug": apply_aeg_view(data_b, view="clean", strength=0.0)},
+        ]
+    )
     shuffled = batch["aug"].to_data_list()[0]
     assert torch.equal(shuffled.node_type, before_type)
     manifest_types = {NODE_TYPES["PERMISSION"], NODE_TYPES["INTENT"], NODE_TYPES["COMPONENT"]}
@@ -134,6 +144,32 @@ def test_manifest_shuffle_is_type_aware(tmp_path: Path):
         mask = (shuffled.node_source == 1) & (shuffled.node_type == node_type)
         if bool(mask.any()):
             assert torch.all(shuffled.node_type[mask] == node_type)
+
+
+def test_manifest_shuffle_uses_dataset_donor_with_batch_size_one(tmp_path: Path):
+    payload_a = _payload()
+    payload_b = _payload()
+    payload_b["sid"] = "b" * 64
+    payload_b["sha256"] = "b" * 64
+    payload_b["q_manifest"] = torch.tensor([0.25], dtype=torch.float32)
+    pt_dir = tmp_path / "train"
+    pt_dir.mkdir()
+    torch.save(payload_a, pt_dir / f"{payload_a['sid']}.pt")
+    torch.save(payload_b, pt_dir / f"{payload_b['sid']}.pt")
+    csv_path = tmp_path / "train.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "label"])
+        writer.writeheader()
+        writer.writerow({"id": payload_a["sid"], "label": 1})
+        writer.writerow({"id": payload_b["sid"], "label": 0})
+
+    ds = AEGDataset(pt_dir, csv_path, train_aug=True, aug_views=["manifest_shuffled"], aug_strengths=[1.0], aug_prob=1.0)
+    item = ds[0]
+    assert getattr(item["manifest_donor"], "sid", "") == payload_b["sid"]
+    batch = aeg_collate_fn([item])
+    aug = batch["aug"].to_data_list()[0]
+    assert batch["manifest_donor_sid"][0] == payload_b["sid"]
+    assert abs(float(aug.q_manifest.item()) - 0.25) < 1e-6
 
 
 def test_corrupted_source_contrast_weights_drop_untrusted_source():

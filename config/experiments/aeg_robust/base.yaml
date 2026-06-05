@@ -56,6 +56,9 @@ robust:
     - manifest_zeroed
     - manifest_shuffled
     - all_degraded
+    - api_missing
+    - graph_missing
+    - manifest_missing
 
 eval:
   robust_eval: true

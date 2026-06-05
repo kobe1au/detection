@@ -250,6 +250,7 @@ class AEGDataset(Dataset):
         if not samples:
             raise AEGDatasetConfigError(f"No AEG PT samples found in {self.pt_dir}")
         self.samples = samples
+        self.manifest_donor_indices = _build_manifest_donor_indices(samples)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -259,23 +260,32 @@ class AEGDataset(Dataset):
         payload = torch.load(path, map_location="cpu")
         clean = payload_to_data(payload, label=label)
         out = {"clean": clean}
+        selected_view = "clean"
         if self.train_aug and float(torch.rand(()).item()) < self.aug_prob and self.aug_views:
-            view = self.aug_views[int(torch.randint(len(self.aug_views), (1,)).item())]
+            selected_view = self.aug_views[int(torch.randint(len(self.aug_views), (1,)).item())]
             strength = self.aug_strengths[int(torch.randint(len(self.aug_strengths), (1,)).item())]
-            out["aug"] = apply_aeg_view(clean, view=view, strength=strength)
+            out["aug"] = apply_aeg_view(clean, view=selected_view, strength=strength)
         else:
             out["aug"] = apply_aeg_view(clean, view="clean", strength=0.0)
+        if selected_view == "manifest_shuffled":
+            donor_idx = self.manifest_donor_indices[idx] if idx < len(self.manifest_donor_indices) else None
+            if donor_idx is not None:
+                donor_path, donor_label = self.samples[donor_idx]
+                donor_payload = torch.load(donor_path, map_location="cpu")
+                out["manifest_donor"] = payload_to_data(donor_payload, label=donor_label)
         return out
 
 
 def aeg_collate_fn(items: list[dict[str, Data]]) -> dict[str, Any]:
     clean_items = [item["clean"] for item in items]
     aug_items = [item.get("aug", item["clean"]) for item in items]
-    _apply_manifest_shuffle(clean_items, aug_items)
+    donor_items = [item.get("manifest_donor") for item in items]
+    _apply_manifest_shuffle(clean_items, aug_items, donor_items)
     return {
         "clean": Batch.from_data_list(clean_items),
         "aug": Batch.from_data_list(aug_items),
         "sid": [getattr(item, "sid", "") for item in clean_items],
+        "manifest_donor_sid": [getattr(item.get("manifest_donor"), "sid", "") if item.get("manifest_donor") is not None else "" for item in items],
     }
 
 
@@ -324,19 +334,38 @@ def _zero_shuffled_manifest_edges(data: Data) -> None:
         data.edge_quality[mask] = 0.0
 
 
-def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data]) -> None:
-    if len(aug_items) <= 1:
-        for aug in aug_items:
-            if int(aug.view_type_id.view(-1)[0].item()) == VIEW_TYPES["manifest_shuffled"]:
-                # A single-sample batch cannot supply a donor; use zeroed
-                # Manifest evidence instead of silently keeping the original.
-                _zero_manifest_nodes(aug)
-        return
+def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data], donor_items: list[Data | None] | None = None) -> None:
     for idx, aug in enumerate(aug_items):
         if int(aug.view_type_id.view(-1)[0].item()) != VIEW_TYPES["manifest_shuffled"]:
             continue
-        donor = clean_items[(idx + 1) % len(clean_items)]
-        _copy_manifest_content(aug, donor)
+        donor = donor_items[idx] if donor_items is not None and idx < len(donor_items) else None
+        if donor is None:
+            # A one-sample split cannot supply a donor; use zeroed Manifest
+            # evidence instead of silently keeping the original.
+            _zero_manifest_nodes(aug)
+        else:
+            _copy_manifest_content(aug, donor)
+
+
+def _build_manifest_donor_indices(samples: list[tuple[Path, int | None]]) -> list[int | None]:
+    n = len(samples)
+    if n <= 1:
+        return [None] * n
+    donors: list[int | None] = []
+    labels = [label for _path, label in samples]
+    for idx, label in enumerate(labels):
+        donor_idx: int | None = None
+        if label is not None:
+            for offset in range(1, n):
+                cand = (idx + offset) % n
+                cand_label = labels[cand]
+                if cand_label is not None and cand_label != label:
+                    donor_idx = cand
+                    break
+        if donor_idx is None:
+            donor_idx = (idx + 1) % n
+        donors.append(donor_idx)
+    return donors
 
 
 def split_label_stats(dataset: AEGDataset) -> dict[str, float]:
