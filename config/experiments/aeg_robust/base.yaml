@@ -1,0 +1,84 @@
+data:
+  train:
+    pt_dir: D:/pts_aeg/train
+    csv: results/labels/train.csv
+  val:
+    pt_dir: D:/pts_aeg/val
+    csv: results/labels/val.csv
+  test:
+    pt_dir: D:/pts_aeg/test
+    csv: results/labels/test.csv
+
+train:
+  seed: 42
+  output_dir: results/aeg_robust/base
+  device: auto
+  epochs: 60
+  patience: 8
+  batch_size: 24
+  eval_batch_size: 48
+  num_workers: 4
+  pin_memory: false
+  lr: 0.0003
+  weight_decay: 0.01
+  grad_clip: 1.0
+  checkpoint_metric: robust_composite
+
+model:
+  node_input_dim: 128
+  hidden_dim: 128
+  layers: 2
+  dropout: 0.15
+  num_latents: 16
+  reliability_bias_weight: 1.0
+  conflict_bias_weight: 0.5
+  num_classes: 2
+
+loss:
+  ce_weight: 1.0
+  clean_degraded_contrast_weight: 0.1
+  cross_source_contrast_weight: 0.03
+  counterfactual_kl_weight: 0.05
+  temperature: 0.2
+
+robust:
+  train_aug: true
+  perturb_prob: 0.5
+  perturb_strengths: [0.1, 0.3, 0.5]
+  train_views:
+    - api_degraded
+    - graph_degraded
+    - api_graph_degraded
+    - manifest_degraded
+    - manifest_noisy
+    - all_degraded
+
+eval:
+  robust_eval: true
+  robust_val:
+    enabled: true
+    clean_weight: 0.5
+    scenarios:
+      - name: api_graph_degraded
+        view: api_graph_degraded
+        strength: 0.5
+        weight: 0.4
+      - name: manifest_noisy
+        view: manifest_noisy
+        strength: 0.5
+        weight: 0.3
+      - name: all_degraded
+        view: all_degraded
+        strength: 0.5
+        weight: 0.3
+  perturb_strengths: [0.3, 0.5, 0.7]
+  robust_views:
+    - api_degraded
+    - graph_degraded
+    - api_graph_degraded
+    - manifest_degraded
+    - manifest_noisy
+    - all_degraded
+    - api_missing
+    - graph_missing
+    - manifest_missing

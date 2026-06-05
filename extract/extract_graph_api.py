@@ -1,12 +1,11 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Build graph + API-sequence features from APK files.
+Low-level DEX/API/call-graph extractor used by the AEG builder.
 
-Each output file is:
-  {out_root}/{split}/{sha256}.pt
-
-The .pt content is a list, one dict per dex:
+This module is intentionally not the project training-data entry point. Use
+`scripts/build_aeg_pts_direct.py` to build schema-v4 APK evidence graph `.pt`
+files. The per-DEX dict produced here contains:
   {
     "dex_name": str,
 
@@ -38,24 +37,19 @@ Design:
 
 from __future__ import annotations
 
-import argparse
 import hashlib
-import json
 import logging
 import os
 import re
 import sys
 import warnings
 import zipfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
 import torch
-import yaml
-from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -965,237 +959,8 @@ def build_graph_api_for_dex(
     return result
 
 
-def process_apk(
-    apk_path: Path,
-    out_dir: Path,
-    split: str,
-    cfg: Dict[str, Any],
-) -> Tuple[bool, str]:
-    safe_mkdir(out_dir)
-
-    sha = sha256_file(apk_path)
-    out_path = out_dir / f"{sha}.pt"
-
-    if cfg["resume"] and out_path.exists():
-        return True, ""
-
-    try:
-        dex_entries = list_dex_entries(apk_path)
-        if not dex_entries:
-            return False, "no classes*.dex"
-
-        results: List[Dict[str, Any]] = []
-
-        with zipfile.ZipFile(apk_path, "r") as zf:
-            for entry in dex_entries:
-                dex_name = os.path.basename(entry)
-
-                try:
-                    dex_bytes = zf.read(entry)
-                    dvm = DEX(dex_bytes)
-
-                    item = build_graph_api_for_dex(
-                        dvm=dvm,
-                        raw_bytes=dex_bytes,
-                        vocab_size=cfg["vocab_size"],
-                        keep_method_names=cfg["keep_method_names"],
-                        keep_api_tokens=cfg["keep_api_tokens"],
-                        sensitive_hops=cfg["sensitive_hops"],
-                        max_methods_per_dex=cfg["max_methods_per_dex"],
-                        fallback_max_methods=cfg["fallback_max_methods"],
-                        num_api_buckets=cfg["num_api_buckets"],
-                        max_api_events_per_dex=cfg["max_api_events_per_dex"],
-                        max_api_events_per_method=cfg["max_api_events_per_method"],
-                        api_event_scope=cfg["api_event_scope"],
-                        framework_only=cfg["framework_only"],
-                        include_descriptor=cfg["include_descriptor"],
-                        fallback_policy=cfg["fallback_policy"],
-                        use_graph_behavior_hints=cfg["use_graph_behavior_hints"],
-                    )
-
-                    item["dex_name"] = dex_name
-                    item["meta"].update({
-                        "sha256_apk": sha,
-                        "apk_name": apk_path.name,
-                        "dex_name": dex_name,
-                        "split": split,
-                        "representation": {
-                            "graph_branch": "sensitive_method_call_graph",
-                            "api_branch": "framework_api_behavior_sequence",
-                            "alignment_anchor": "method_api_edge_index",
-                        },
-                    })
-
-                    results.append(item)
-
-                except Exception as exc:
-                    print(f"[WARN] DEX failed: {dex_name} | {exc}", file=sys.stderr, flush=True)
-
-        if not results:
-            return False, "all dex entries failed"
-
-        atomic_torch_save(results, out_path)
-        return True, ""
-
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-
-def collect_apks(apk_root: Path, splits: Sequence[str]) -> List[Tuple[str, Path]]:
-    items: List[Tuple[str, Path]] = []
-
-    for split in splits:
-        split_dir = apk_root / split
-        if not split_dir.exists():
-            continue
-
-        for path in sorted(split_dir.glob("*.apk")):
-            items.append((split, path))
-
-    return items
-
-
-def load_config(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-
-    if not isinstance(cfg, dict):
-        raise ValueError("Config root must be a mapping")
-
-    return cfg
-
-
-def parse_config(raw: Dict[str, Any]) -> Dict[str, Any]:
-    data = raw.get("data", {})
-    hp = raw.get("hyperparameters", {})
-    graph = raw.get("graph", {})
-    api = raw.get("api", {})
-    storage = raw.get("storage", {})
-    execution = raw.get("execution", {})
-
-    cfg = {
-        "apk_root": Path(data["apk_root"]),
-        "out_root": Path(data["out_root"]),
-        "splits": list(data.get("splits", ["train", "val", "test"])),
-
-        "vocab_size": int(hp.get("vocab_size", 256)),
-
-        "sensitive_hops": int(graph.get("sensitive_hops", 1)),
-        "max_methods_per_dex": int(graph.get("max_methods_per_dex", 4096)),
-        "fallback_max_methods": int(graph.get("fallback_max_methods", 512)),
-        "fallback_policy": str(graph.get("fallback_policy", "api_rich")),
-        "use_graph_behavior_hints": bool(graph.get("use_behavior_hints", True)),
-
-        "num_api_buckets": int(api.get("num_hash_buckets", 8192)),
-        "max_api_events_per_dex": int(api.get("max_events_per_dex", 1024)),
-        "max_api_events_per_method": int(api.get("max_events_per_method", 32)),
-        "api_event_scope": str(api.get("event_scope", "all_methods")),
-        "framework_only": bool(api.get("framework_only", True)),
-        "include_descriptor": bool(api.get("include_descriptor", False)),
-
-        "keep_method_names": bool(storage.get("keep_method_names", False)),
-        "keep_api_tokens": bool(storage.get("keep_api_tokens", False)),
-
-        "workers": int(execution.get("workers", 1)),
-        "resume": bool(execution.get("resume", True)),
-    }
-
-    if cfg["vocab_size"] <= 0:
-        raise ValueError("hyperparameters.vocab_size must be positive")
-    if cfg["sensitive_hops"] < 0:
-        raise ValueError("graph.sensitive_hops must be >= 0")
-    if cfg["max_methods_per_dex"] <= 0:
-        raise ValueError("graph.max_methods_per_dex must be positive")
-    if cfg["fallback_max_methods"] <= 0:
-        raise ValueError("graph.fallback_max_methods must be positive")
-    if cfg["fallback_policy"] not in {"api_rich", "all_capped", "empty_dex"}:
-        raise ValueError("graph.fallback_policy must be one of: api_rich, all_capped, empty_dex")
-
-    if cfg["num_api_buckets"] <= 0:
-        raise ValueError("api.num_hash_buckets must be positive")
-    if cfg["max_api_events_per_dex"] <= 0:
-        raise ValueError("api.max_events_per_dex must be positive")
-    if cfg["max_api_events_per_method"] <= 0:
-        raise ValueError("api.max_events_per_method must be positive")
-    if cfg["api_event_scope"] not in {"all_methods", "graph_methods"}:
-        raise ValueError("api.event_scope must be one of: all_methods, graph_methods")
-
-    if cfg["workers"] <= 0:
-        raise ValueError("execution.workers must be >= 1")
-
-    return cfg
-
-
-def _worker(job: Tuple[str, str, str, Dict[str, Any]]) -> Tuple[bool, str, str, str]:
-    split, apk_path_str, out_root_str, cfg = job
-    apk_path = Path(apk_path_str)
-    out_dir = Path(out_root_str) / split
-    ok, err = process_apk(apk_path, out_dir, split, cfg)
-    return ok, split, apk_path.name, err
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Extract graph + API sequence .pt features")
-    parser.add_argument("--config", type=str, required=True)
-    args = parser.parse_args()
-
-    cfg = parse_config(load_config(Path(args.config)))
-    safe_mkdir(cfg["out_root"])
-
-    items = collect_apks(cfg["apk_root"], cfg["splits"])
-    if not items:
-        print("No APKs found. Check apk_root and splits.")
-        return
-
-    print("Graph+API extraction config:")
-    printable = {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.items()}
-    print(json.dumps(printable, ensure_ascii=False, indent=2))
-    print(f"Found {len(items)} APKs")
-
-    jobs = [
-        (split, str(apk_path), str(cfg["out_root"]), cfg)
-        for split, apk_path in items
-    ]
-
-    ok = 0
-    fail = 0
-    failed: List[Dict[str, str]] = []
-
-    if cfg["workers"] == 1:
-        iterator = tqdm(jobs, desc="Build graph+API .pt", unit="apk")
-        for job in iterator:
-            succ, split, name, err = _worker(job)
-            if succ:
-                ok += 1
-            else:
-                fail += 1
-                failed.append({"split": split, "apk": name, "reason": err})
-    else:
-        with ProcessPoolExecutor(max_workers=cfg["workers"]) as ex:
-            future_map = {ex.submit(_worker, job): job for job in jobs}
-
-            for fut in tqdm(as_completed(future_map), total=len(jobs), desc="Build graph+API .pt", unit="apk"):
-                job = future_map[fut]
-
-                try:
-                    succ, split, name, err = fut.result()
-                except Exception as exc:
-                    succ, split, name = False, job[0], Path(job[1]).name
-                    err = f"{type(exc).__name__}: {exc}"
-
-                if succ:
-                    ok += 1
-                else:
-                    fail += 1
-                    failed.append({"split": split, "apk": name, "reason": err})
-
-    print(f"done. ok={ok}, fail={fail}")
-
-    if failed:
-        failed_path = cfg["out_root"] / "failed_graph_api.json"
-        failed_path.write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"failed list -> {failed_path}")
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "extract/extract_graph_api.py is a low-level library in the AEG mainline. "
+        "Use scripts/build_aeg_pts_direct.py --config config/extract_aeg.yaml instead."
+    )

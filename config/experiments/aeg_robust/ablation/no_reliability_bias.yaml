@@ -1,0 +1,7 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/ablation/no_reliability_bias
+
+model:
+  reliability_bias_weight: 0.0

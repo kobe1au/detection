@@ -1,0 +1,7 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/ablation/no_clean_degraded_contrast
+
+loss:
+  clean_degraded_contrast_weight: 0.0

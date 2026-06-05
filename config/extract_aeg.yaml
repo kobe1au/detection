@@ -1,0 +1,48 @@
+data:
+  splits: [train, val, test]
+  # Prefer split_dirs when train/val/test APKs live on different drives.
+  split_dirs:
+    train: D:/resource/train
+    val: D:/resource/val
+    test: D:/resource/test
+  out_root: D:/pts_aeg
+  out_dirs:
+    train: D:/pts_aeg/train
+    val: D:/pts_aeg/val
+    test: D:/pts_aeg/test
+  hash_files: true
+
+graph:
+  vocab_size: 256
+  sensitive_hops: 1
+  max_methods_per_dex: 4096
+  fallback_max_methods: 512
+  fallback_policy: api_rich
+  use_behavior_hints: true
+
+api:
+  num_hash_buckets: 8192
+  max_events_per_dex: 1024
+  max_events_per_method: 32
+  event_scope: all_methods
+  framework_only: true
+  include_descriptor: false
+
+manifest:
+  vocab_path: config/manifest_vocab_aeg.yaml
+  rebuild_vocab: false
+  manifest_dim: 256
+  max_permissions: 128
+  max_intents: 64
+  max_features: 32
+  allow_empty_vocab: false
+
+aeg:
+  node_feature_dim: 128
+  keep_method_names: true
+  keep_api_tokens: true
+
+execution:
+  workers: 4
+  resume: true
+  fail_on_error: false

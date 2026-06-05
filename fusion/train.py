@@ -1,1006 +1,446 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import json
 import logging
 import math
-import os
 import random
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 import yaml
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    f1_score,
-    recall_score,
-    roc_auc_score,
-)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from fusion.losses import compute_robust_loss
-from fusion.dataset import (
-    RobustTriModalDataset,
-    prepare_robust_batch,
-    robust_collate_fn,
-)
-from fusion.model import TriModalRobustModel
-from fusion.perturbations import EVAL_PERTURB_TYPES
-from fusion.utils import build_grad_scaler, get_amp_context
+from fusion.dataset import AEGDataset, aeg_collate_fn, split_label_stats
+from fusion.losses import compute_aeg_loss
+from fusion.model import build_model
 
 
-logger = logging.getLogger("tri_modal_robust")
-
-DEFAULT_ROBUST_VAL_SCENARIOS = (
-    {"name": "api_graph_degraded_s0.5", "perturb_type": "api_graph_degraded", "strength": 0.5, "weight": 0.25},
-    {"name": "manifest_degraded_s0.5", "perturb_type": "manifest_degraded", "strength": 0.5, "weight": 0.15},
-    {"name": "all_degraded_s0.5", "perturb_type": "all_degraded", "strength": 0.5, "weight": 0.10},
-    {"name": "api_missing", "perturb_type": "api_missing", "strength": 1.0, "weight": 1.0 / 30.0},
-    {"name": "graph_missing", "perturb_type": "graph_missing", "strength": 1.0, "weight": 1.0 / 30.0},
-    {"name": "manifest_missing", "perturb_type": "manifest_missing", "strength": 1.0, "weight": 1.0 / 30.0},
-)
+LOGGER = logging.getLogger(__name__)
 
 
-class EmptyExtraEvalSetError(RuntimeError):
-    """Raised when an optional external eval set has no usable samples."""
+def deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in (update or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_update(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
-GATE_DIAGNOSTIC_KEYS = (
-    "q_api",
-    "q_graph",
-    "q_manifest",
-    "q_align",
-    "pert_api",
-    "pert_graph",
-    "pert_manifest",
-    "r_api",
-    "r_graph",
-    "r_manifest",
-    "api_graph_consistency",
-    "api_manifest_consistency",
-    "graph_manifest_consistency",
-    "manifest_to_code_conflict",
-    "code_to_manifest_conflict",
-    "api_graph_disagreement",
-    "api_confidence",
-    "graph_confidence",
-    "manifest_confidence",
-    "joint_confidence",
-    "api_alive",
-    "graph_alive",
-    "manifest_alive",
-    "gate_uses_perturbation_evidence",
-)
+def load_yaml(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    cfg = load_yaml(path)
+    bases = cfg.pop("base", None) or cfg.pop("bases", None) or []
+    if isinstance(bases, (str, Path)):
+        bases = [bases]
+    merged: dict[str, Any] = {}
+    for base in bases:
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        merged = deep_update(merged, load_config(base_path))
+    return deep_update(merged, cfg)
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def configure_determinism(enabled: bool) -> None:
-    torch.backends.cudnn.benchmark = not enabled
-    torch.backends.cudnn.deterministic = enabled
-    torch.use_deterministic_algorithms(enabled, warn_only=True)
-
-
-def select_device(value: str) -> torch.device:
-    value = str(value or "auto").lower()
-    if value == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if value == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("train.device=cuda requested but CUDA is unavailable")
-    return torch.device(value)
-
-
-def deep_update(base: dict, override: dict) -> dict:
-    out = copy.deepcopy(base)
-    for key, value in (override or {}).items():
-        if isinstance(out.get(key), dict) and isinstance(value, dict):
-            out[key] = deep_update(out[key], value)
-        else:
-            out[key] = copy.deepcopy(value)
-    return out
-
-
-def load_yaml(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def load_config_path(path: str | Path, seen: set[Path] | None = None) -> dict:
-    path = Path(path)
-    seen = set(seen or ())
-    resolved = path.resolve()
-    if resolved in seen:
-        raise ValueError(f"Recursive config defaults detected: {path}")
-    seen.add(resolved)
-    raw = load_yaml(path)
-    defaults = raw.pop("defaults", []) or []
-    if isinstance(defaults, (str, Path)):
-        defaults = [defaults]
-    cfg: dict[str, Any] = {}
-    for item in defaults:
-        item_path = Path(item)
-        if not item_path.is_absolute():
-            item_path = path.parent / item_path
-        cfg = deep_update(cfg, load_config_path(item_path, seen))
-    return deep_update(cfg, raw)
-
-
-def load_config(paths: list[str]) -> dict:
-    cfg: dict[str, Any] = {}
-    for path in paths:
-        cfg = deep_update(cfg, load_config_path(path))
-    return cfg
-
-
-def resolve(root: str | Path, path: str | Path) -> str:
-    path = str(path)
-    if os.path.isabs(path):
-        return path
-    return str(Path(root) / path)
-
-
-def _read_split_identities(csv_path: str | Path, expected_split: str) -> tuple[set[str], set[str]]:
-    ids: set[str] = set()
-    packages: set[str] = set()
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        fields = set(reader.fieldnames or [])
-        id_col = next((name for name in ("id", "ID", "Id", "sha256") if name in fields), None)
-        pkg_col = next((name for name in ("pkg_name", "package_name", "package") if name in fields), None)
-        if id_col is None:
-            raise ValueError(f"CSV {csv_path} must contain id or sha256")
-        for row_idx, row in enumerate(reader, start=2):
-            sid = str(row.get(id_col, "") or "").strip().lower()
-            if not sid:
-                raise ValueError(f"CSV {csv_path} has empty {id_col} at row {row_idx}")
-            ids.add(sid)
-            if "split" in fields:
-                split_value = str(row.get("split", "") or "").strip().lower()
-                if split_value and split_value != expected_split:
-                    raise ValueError(
-                        f"CSV {csv_path} row {row_idx} declares split={split_value!r}, "
-                        f"expected {expected_split!r}"
-                    )
-            if pkg_col is not None:
-                package = str(row.get(pkg_col, "") or "").strip().lower()
-                if package and package not in {"nan", "none", "null"}:
-                    packages.add(package)
-    return ids, packages
-
-
-def validate_split_partitions(cfg: dict, include_test: bool) -> None:
-    data_cfg = cfg.get("data", {})
-    if not bool(data_cfg.get("strict_partition_isolation", True)):
-        return
-    data_root = data_cfg.get("root", "")
-    split_names = ["train", "val"] + (["test"] if include_test else [])
-    identities: dict[str, tuple[set[str], set[str]]] = {}
-    for split in split_names:
-        csv_path = resolve(data_root, data_cfg[f"{split}_csv"])
-        identities[split] = _read_split_identities(csv_path, split)
-
-    for i, left in enumerate(split_names):
-        for right in split_names[i + 1 :]:
-            id_overlap = sorted(identities[left][0] & identities[right][0])
-            pkg_overlap = sorted(identities[left][1] & identities[right][1])
-            if id_overlap or pkg_overlap:
-                raise ValueError(
-                    f"Split leakage between {left} and {right}: "
-                    f"id_overlap={len(id_overlap)} examples={id_overlap[:10]}; "
-                    f"package_overlap={len(pkg_overlap)} examples={pkg_overlap[:10]}"
-                )
-
-
-def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
-    data_cfg = cfg.get("data", {}) or {}
-    return {
-        "model": copy.deepcopy(cfg.get("model", {}) or {}),
-        "data": {
-            key: copy.deepcopy(data_cfg.get(key))
-            for key in (
-                "graph_semantic_source",
-                "max_api_events_per_sample",
-                "min_pt_schema_version",
-                "allow_legacy_pt_compat",
-                "manifest_vocab_path",
-                "label_map",
-            )
-        },
-    }
-
-
-def validate_eval_checkpoint_config(
-    current_cfg: dict,
-    checkpoint_cfg: Any,
-    *,
-    allow_mismatch: bool = False,
-) -> None:
-    if allow_mismatch:
-        return
-    if not isinstance(checkpoint_cfg, dict):
-        raise ValueError(
-            "Evaluation checkpoint does not contain its training config. "
-            "Set eval.allow_checkpoint_config_mismatch=true only for an explicitly audited legacy checkpoint."
-        )
-    current = _checkpoint_semantic_signature(current_cfg)
-    saved = _checkpoint_semantic_signature(checkpoint_cfg)
-    if current != saved:
-        raise ValueError(
-            "Evaluation config changes model/data semantics relative to the checkpoint. "
-            "Use the checkpoint's training config and override only eval paths/settings, or set "
-            "eval.allow_checkpoint_config_mismatch=true for an explicitly labelled compatibility audit."
-        )
-
-
-def _dataset_common_kwargs(
-    cfg: dict,
-    is_train: bool,
-    perturb_type: str | None = None,
-    perturb_strength: float = 0.0,
-) -> dict[str, Any]:
-    data_cfg = cfg["data"]
-    robust_cfg = cfg.get("robust", {})
-    model_cfg = cfg.get("model", {})
-    manifest_cfg = model_cfg.get("manifest_encoder", {})
-    gate_cfg = model_cfg.get("gate", {}) or {}
-    loss_cfg = cfg.get("loss", {}) or {}
-    require_manifest_semantic_maps = bool(
-        gate_cfg.get("use_consistency_evidence", False)
-        or gate_cfg.get("use_conflict_evidence", False)
-        or float(loss_cfg.get("cross_source_consistency_weight", 0.0)) > 0.0
-        or float(loss_cfg.get("semantic_reconstruction_weight", 0.0)) > 0.0
-    )
-    data_root = data_cfg.get("root", "")
-    # Resolve the manifest vocab path so old PTs can derive semantic maps at
-    # dataset init time.  Explicitly set data.manifest_vocab_path="" to disable.
-    manifest_vocab_path = str(data_cfg.get("manifest_vocab_path", ""))
-    if manifest_vocab_path == "" and "manifest_vocab_path" not in data_cfg:
-        manifest_vocab_path = "config/manifest_vocab.yaml"
-    if manifest_vocab_path:
-        manifest_vocab_path = resolve(data_root, manifest_vocab_path)
-    return {
-        "is_train": is_train,
-        "robust_aug": bool(robust_cfg.get("train_aug", False)) if is_train else False,
-        "perturb_prob": float(robust_cfg.get("perturb_prob", 0.5)),
-        "perturb_strengths": list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
-        "eval_perturb_type": perturb_type,
-        "eval_perturb_strength": perturb_strength,
-        "manifest_dim": int(manifest_cfg.get("in_dim", 256)),
-        "manifest_category_dim": int(manifest_cfg.get("category_dim", 12)),
-        "manifest_stats_dim": int(manifest_cfg.get("stats_dim", 11)),
-        "manifest_permission_dim": int(manifest_cfg.get("permission_dim", 128)),
-        "manifest_intent_dim": int(manifest_cfg.get("intent_dim", 64)),
-        "manifest_feature_dim": int(manifest_cfg.get("feature_dim", 32)),
-        "max_api_events_per_sample": data_cfg.get("max_api_events_per_sample"),
-        "drop_graph_behavior_hints": bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
-        "graph_semantic_source": str(data_cfg.get("graph_semantic_source", "alignment")),
-        "num_classes": int(model_cfg.get("num_classes", 2)),
-        "label_map": data_cfg.get("label_map"),
-        "strict_split_integrity": bool(data_cfg.get("strict_split_integrity", True)),
-        "allow_pt_superset": False,
-        "require_manifest_semantic_maps": require_manifest_semantic_maps,
-        "allow_legacy_pt_compat": bool(data_cfg.get("allow_legacy_pt_compat", False)),
-        "min_pt_schema_version": int(data_cfg.get("min_pt_schema_version", 0)),
-        "manifest_vocab_path": manifest_vocab_path,
-    }
-
-
-def build_dataset_from_paths(
-    cfg: dict,
-    pt_dir: str | Path,
-    csv_path: str | Path,
-    is_train: bool,
-    perturb_type: str | None = None,
-    perturb_strength: float = 0.0,
-    dataset_overrides: dict[str, Any] | None = None,
-):
-    kwargs = _dataset_common_kwargs(
-        cfg,
-        is_train=is_train,
-        perturb_type=perturb_type,
-        perturb_strength=perturb_strength,
-    )
-    kwargs.update(dataset_overrides or {})
-    try:
-        return RobustTriModalDataset(
-            pt_dir=str(pt_dir),
-            csv_path=str(csv_path),
-            **kwargs,
-        )
-    except RuntimeError as exc:
-        msg = str(exc)
-        if "No matching .pt samples found" in msg:
-            raise EmptyExtraEvalSetError(msg) from exc
-        raise
-
-
-def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | None = None, perturb_strength: float = 0.0):
-    data_cfg = cfg["data"]
-    data_root = data_cfg.get("root", "")
-    pt_dir = resolve(data_root, data_cfg[f"{split}_pt_dir"])
-    csv_path = resolve(data_root, data_cfg[f"{split}_csv"])
-    return build_dataset_from_paths(
-        cfg,
-        pt_dir,
-        csv_path,
-        is_train=is_train,
-        perturb_type=perturb_type,
-        perturb_strength=perturb_strength,
-    )
-
-
-def build_loader(cfg: dict, dataset, is_train: bool):
-    train_cfg = cfg["train"]
-    worker_key = "num_workers" if is_train else "eval_num_workers"
-    workers = int(train_cfg.get(worker_key, train_cfg.get("num_workers", 0)))
-    pin_memory = bool(train_cfg.get("pin_memory", False))
-    if pin_memory and not bool(train_cfg.get("allow_pyg_pin_memory", False)):
-        logger.warning(
-            "train.pin_memory=true is unsafe for PyG Data/Batch on some CUDA runtimes; "
-            "forcing pin_memory=false. Set train.allow_pyg_pin_memory=true to override."
-        )
-        pin_memory = False
-    return DataLoader(
-        dataset,
-        batch_size=int(train_cfg.get("batch_size" if is_train else "eval_batch_size", train_cfg.get("batch_size", 32))),
-        shuffle=is_train,
-        num_workers=workers,
-        pin_memory=pin_memory,
-        persistent_workers=bool(train_cfg.get("persistent_workers", False)) and workers > 0,
-        collate_fn=robust_collate_fn,
-    )
-
-
-def enforce_failed_ratio(
-    metrics: dict[str, Any],
-    cfg: dict,
-    split_name: str,
-    max_failed_ratio: float | None = None,
-) -> None:
-    total = int(metrics.get("num_eval", 0)) + int(metrics.get("num_failed", 0))
-    if total <= 0:
-        raise RuntimeError(f"{split_name}: no valid or failed samples were seen")
-    failed_ratio = float(metrics.get("num_failed", 0)) / float(total)
-    if max_failed_ratio is None:
-        max_failed_ratio = float(cfg.get("data", {}).get("max_failed_ratio", 0.0))
-    else:
-        max_failed_ratio = float(max_failed_ratio)
-    if failed_ratio > max_failed_ratio:
-        raise RuntimeError(
-            f"{split_name}: failed sample ratio {failed_ratio:.4f} exceeds "
-            f"data.max_failed_ratio={max_failed_ratio:.4f}"
-        )
-
-
-def _normalize_robust_val_scenarios(raw: Any) -> list[dict[str, Any]]:
-    scenarios = list(DEFAULT_ROBUST_VAL_SCENARIOS) if raw is None else raw
-    if not isinstance(scenarios, list):
-        raise ValueError("eval.robust_val.scenarios must be a list")
-    out: list[dict[str, Any]] = []
-    names: set[str] = set()
-    for idx, item in enumerate(scenarios):
-        if not isinstance(item, dict):
-            raise ValueError(f"eval.robust_val.scenarios[{idx}] must be a mapping")
-        perturb_type = str(item.get("perturb_type") or "").strip()
-        if not perturb_type or perturb_type == "clean":
-            raise ValueError(f"eval.robust_val.scenarios[{idx}] requires a non-clean perturb_type")
-        if perturb_type not in EVAL_PERTURB_TYPES:
-            raise ValueError(
-                f"eval.robust_val.scenarios[{idx}] has unsupported perturb_type={perturb_type!r}"
-            )
-        strength = float(item.get("strength", 0.5))
-        weight = float(item.get("weight", 0.0))
-        if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
-            raise ValueError(f"eval.robust_val.scenarios[{idx}].strength must be within [0, 1]")
-        if not math.isfinite(weight) or weight < 0.0:
-            raise ValueError(f"eval.robust_val.scenarios[{idx}].weight must be non-negative")
-        name = str(item.get("name") or f"{perturb_type}_s{strength:g}").strip()
-        if not name:
-            raise ValueError(f"eval.robust_val.scenarios[{idx}].name must not be empty")
-        if name in names:
-            raise ValueError(f"Duplicate eval.robust_val scenario name: {name}")
-        names.add(name)
-        out.append(
-            {
-                "name": name,
-                "perturb_type": perturb_type,
-                "strength": strength,
-                "weight": weight,
-            }
-        )
-    if not out:
-        raise ValueError("eval.robust_val.scenarios must not be empty")
-    return out
-
-
-def build_robust_val_loaders(cfg: dict) -> list[dict[str, Any]]:
-    robust_val_cfg = cfg.get("eval", {}).get("robust_val", {}) or {}
-    if not bool(robust_val_cfg.get("enabled", False)):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in _normalize_robust_val_scenarios(robust_val_cfg.get("scenarios")):
-        dataset = build_dataset(
-            cfg,
-            "val",
-            is_train=False,
-            perturb_type=item["perturb_type"],
-            perturb_strength=item["strength"],
-        )
-        out.append({**item, "loader": build_loader(cfg, dataset, is_train=False)})
-    return out
-
-
-@torch.no_grad()
-def evaluate_robust_validation(
-    model,
-    loaders: list[dict[str, Any]],
-    device,
-    use_amp: bool,
-    cfg: dict,
-) -> dict[str, dict[str, float]]:
-    results: dict[str, dict[str, float]] = {}
-    for item in loaders:
-        name = str(item["name"])
-        metrics, _ = evaluate(model, item["loader"], device, use_amp, f"val_{name}", dump_rows=False)
-        enforce_failed_ratio(metrics, cfg, f"val_{name}")
-        results[name] = metrics
-    return results
-
-
-def checkpoint_score(
-    cfg: dict,
-    clean_metrics: dict[str, float],
-    robust_metrics: dict[str, dict[str, float]],
-    robust_val_loaders: list[dict[str, Any]],
-) -> tuple[float, str]:
-    metric_name = str(cfg.get("train", {}).get("checkpoint_metric", "clean_macro_f1")).strip().lower()
-    clean_f1 = float(clean_metrics["macro_f1"])
-    if metric_name in {"clean", "clean_macro_f1", "macro_f1", "val_macro_f1"}:
-        return clean_f1, "clean_macro_f1"
-    if metric_name != "robust_composite":
-        raise ValueError(f"Unsupported train.checkpoint_metric: {metric_name}")
-    if not robust_val_loaders:
-        raise ValueError("train.checkpoint_metric=robust_composite requires eval.robust_val.enabled=true")
-
-    robust_val_cfg = cfg.get("eval", {}).get("robust_val", {}) or {}
-    clean_weight = float(robust_val_cfg.get("clean_weight", 0.4))
-    if not math.isfinite(clean_weight) or clean_weight < 0.0:
-        raise ValueError("eval.robust_val.clean_weight must be non-negative")
-    weighted_sum = clean_weight * clean_f1
-    weight_sum = clean_weight
-    for item in robust_val_loaders:
-        weight = float(item["weight"])
-        if weight <= 0.0:
-            continue
-        name = str(item["name"])
-        if name not in robust_metrics:
-            raise KeyError(f"Missing robust validation metrics for scenario: {name}")
-        weighted_sum += weight * float(robust_metrics[name]["macro_f1"])
-        weight_sum += weight
-    if weight_sum <= 0.0:
-        raise ValueError("Robust validation composite weights must sum to a positive value")
-    return weighted_sum / weight_sum, "robust_composite"
-
-
-def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
-    model_cfg = cfg.get("model", {})
-    api_cfg = model_cfg.get("api_encoder", {})
-    graph_cfg = model_cfg.get("graph_encoder", {})
-    manifest_cfg = model_cfg.get("manifest_encoder", {})
-    gate_cfg = model_cfg.get("gate", {})
-    return TriModalRobustModel(
-        in_feat_dim=feature_dim,
-        num_classes=int(model_cfg.get("num_classes", 2)),
-        fusion_mode=str(model_cfg.get("fusion_mode", "tri_modal_ours")),
-        api_num_hash_buckets=int(api_cfg.get("num_hash_buckets", 8192)),
-        api_type_vocab_size=int(api_cfg.get("type_vocab_size", 16)),
-        api_emb_dim=int(api_cfg.get("emb_dim", 128)),
-        api_hidden_dim=int(api_cfg.get("hidden_dim", 256)),
-        api_dropout=float(api_cfg.get("dropout", 0.15)),
-        api_encoder_type=str(api_cfg.get("type", "transformer")),
-        api_layers=int(api_cfg.get("layers", 2)),
-        api_heads=int(api_cfg.get("heads", 4)),
-        api_max_seq_len=int(api_cfg.get("max_seq_len", 1024)),
-        graph_emb_dim=int(graph_cfg.get("emb_dim", 128)),
-        graph_hidden=int(graph_cfg.get("hidden", 128)),
-        graph_heads=int(graph_cfg.get("heads", 4)),
-        graph_layers=int(graph_cfg.get("layers", 2)),
-        graph_encoder_type=str(graph_cfg.get("type", "gatv2")),
-        max_nodes_gnn=int(model_cfg.get("max_nodes_gnn", graph_cfg.get("max_nodes", 12288))),
-        use_graph_behavior_hint=bool(graph_cfg.get("use_behavior_hint", False)),
-        manifest_in_dim=int(manifest_cfg.get("in_dim", 256)),
-        manifest_emb_dim=int(manifest_cfg.get("emb_dim", 128)),
-        manifest_hidden_dim=int(manifest_cfg.get("hidden_dim", 256)),
-        manifest_dropout=float(manifest_cfg.get("dropout", 0.1)),
-        joint_emb_dim=int(model_cfg.get("joint_emb_dim", 128)),
-        gate_hidden_dim=int(gate_cfg.get("hidden_dim", 128)),
-        gate_detach=bool(gate_cfg.get("detach", True)),
-        use_consistency_evidence=bool(gate_cfg.get("use_consistency_evidence", True)),
-        use_conflict_evidence=bool(gate_cfg.get("use_conflict_evidence", True)),
-        use_perturbation_evidence=bool(gate_cfg.get("use_perturbation_evidence", False)),
-        apply_alive_mask_to_learned_gate=bool(gate_cfg.get("apply_alive_mask", True)),
-    )
-
-
-def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[str, float]:
+def _binary_metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[str, float]:
     if not labels:
-        return {
-            "acc": 0.0,
-            "f1": 0.0,
-            "macro_f1": 0.0,
-            "f1_pos": 0.0,
-            "recall": 0.0,
-            "macro_recall": 0.0,
-            "recall_pos": 0.0,
-            "auc": 0.0,
-            "ap": 0.0,
-            "brier": 0.0,
-            "ece_10": 0.0,
-            "mean_confidence": 0.0,
-            "confidence_accuracy_gap": 0.0,
-        }
-    y = np.asarray(labels, dtype=np.float64)
-    p = np.asarray(probs, dtype=np.float64)
-    pred_arr = np.asarray(preds, dtype=np.int64)
-    confidence = np.maximum(p, 1.0 - p)
-    correct = (pred_arr == y.astype(np.int64)).astype(np.float64)
-    brier = float(np.mean((p - y) ** 2))
-    ece = 0.0
-    for lo, hi in zip(np.linspace(0.0, 1.0, 11)[:-1], np.linspace(0.0, 1.0, 11)[1:]):
-        if hi >= 1.0:
-            mask = (confidence >= lo) & (confidence <= hi)
-        else:
-            mask = (confidence >= lo) & (confidence < hi)
-        if not np.any(mask):
-            continue
-        ece += float(mask.mean()) * abs(float(confidence[mask].mean()) - float(correct[mask].mean()))
-    macro_f1 = float(f1_score(labels, preds, average="macro", zero_division=0))
-    f1_pos = float(f1_score(labels, preds, average="binary", pos_label=1, zero_division=0))
-    macro_recall = float(recall_score(labels, preds, average="macro", zero_division=0))
-    recall_pos = float(recall_score(labels, preds, average="binary", pos_label=1, zero_division=0))
+        return {}
+    tp = sum(1 for y, p in zip(labels, preds) if y == 1 and p == 1)
+    tn = sum(1 for y, p in zip(labels, preds) if y == 0 and p == 0)
+    fp = sum(1 for y, p in zip(labels, preds) if y == 0 and p == 1)
+    fn = sum(1 for y, p in zip(labels, preds) if y == 1 and p == 0)
+    acc = (tp + tn) / max(1, len(labels))
+
+    def _safe(num: float, den: float) -> float:
+        return float(num / den) if den > 0 else 0.0
+
+    precision_pos = _safe(tp, tp + fp)
+    recall_pos = _safe(tp, tp + fn)
+    f1_pos = _safe(2 * precision_pos * recall_pos, precision_pos + recall_pos)
+    precision_neg = _safe(tn, tn + fn)
+    recall_neg = _safe(tn, tn + fp)
+    f1_neg = _safe(2 * precision_neg * recall_neg, precision_neg + recall_neg)
+    macro_f1 = 0.5 * (f1_pos + f1_neg)
+    brier = sum((p - y) ** 2 for y, p in zip(labels, probs)) / max(1, len(labels))
+    ece = _ece(labels, probs, preds, bins=10)
     out = {
-        "acc": float(accuracy_score(labels, preds)),
-        "f1": macro_f1,
+        "acc": acc,
         "macro_f1": macro_f1,
+        "f1": macro_f1,
         "f1_pos": f1_pos,
-        "recall": macro_recall,
-        "macro_recall": macro_recall,
+        "precision_pos": precision_pos,
         "recall_pos": recall_pos,
+        "macro_recall": 0.5 * (recall_pos + recall_neg),
         "brier": brier,
-        "ece_10": float(ece),
-        "mean_confidence": float(confidence.mean()),
-        "confidence_accuracy_gap": float(confidence.mean() - correct.mean()),
+        "ece_10": ece,
+        "mean_confidence": sum(max(p, 1.0 - p) for p in probs) / max(1, len(probs)),
     }
-    if len(set(labels)) > 1:
+    try:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
         out["auc"] = float(roc_auc_score(labels, probs))
         out["ap"] = float(average_precision_score(labels, probs))
-    else:
-        out["auc"] = 0.0
-        out["ap"] = 0.0
+    except Exception:
+        out["auc"] = math.nan
+        out["ap"] = math.nan
     return out
 
 
-@torch.no_grad()
-def evaluate(model, loader, device, use_amp: bool, split_name: str, dump_rows: bool = False):
-    model.eval()
-    labels_all: list[int] = []
-    probs_all: list[float] = []
-    preds_all: list[int] = []
-    rows: list[dict[str, Any]] = []
-    num_failed = 0
-
-    for batch in tqdm(loader, desc=split_name, leave=False):
-        graph, labels, sids, _quality, failed = prepare_robust_batch(batch, device)
-        num_failed += failed
-        if graph is None:
+def _ece(labels: list[int], probs: list[float], preds: list[int], *, bins: int = 10) -> float:
+    total = len(labels)
+    if total <= 0:
+        return 0.0
+    confidences = [max(p, 1.0 - p) for p in probs]
+    correct = [1.0 if y == pred else 0.0 for y, pred in zip(labels, preds)]
+    ece = 0.0
+    for idx in range(bins):
+        lo = idx / bins
+        hi = (idx + 1) / bins
+        mask = [lo <= c < hi if idx < bins - 1 else lo <= c <= hi for c in confidences]
+        n = sum(mask)
+        if n == 0:
             continue
-        with get_amp_context(device, use_amp):
-            logits, extra = model(graph, return_features=False)
-        prob = torch.softmax(logits.float(), dim=-1)[:, 1]
-        pred = logits.argmax(dim=-1)
-        labels_all.extend(labels.detach().cpu().long().tolist())
-        probs_all.extend(prob.detach().cpu().tolist())
-        preds_all.extend(pred.detach().cpu().long().tolist())
-
-        if dump_rows:
-            gate = extra.get("gate_weights")
-            for i, sid in enumerate(sids or []):
-                row = {
-                    "split": split_name,
-                    "sid": sid,
-                    "label": int(labels[i].detach().cpu().item()),
-                    "prob_malware": float(prob[i].detach().cpu().item()),
-                    "pred": int(pred[i].detach().cpu().item()),
-                    "final_confidence": float(torch.softmax(logits.float(), dim=-1)[i].max().detach().cpu().item()),
-                    "correct": int(pred[i].detach().cpu().item() == labels[i].detach().cpu().item()),
-                    "year": int(batch.get("years")[i].detach().cpu().item()) if batch.get("years") is not None else 0,
-                }
-                for row_key, batch_key in (
-                    ("api_aug_type", "api_aug_types"),
-                    ("graph_aug_type", "graph_aug_types"),
-                    ("manifest_aug_type", "manifest_aug_types"),
-                ):
-                    values = batch.get(batch_key) or []
-                    row[row_key] = str(values[i]) if i < len(values) else "none"
-                if isinstance(gate, torch.Tensor) and gate.size(0) > i:
-                    gate_i = gate[i].detach().cpu()
-                    row.update({
-                        "w_api": float(gate_i[0].item()),
-                        "w_graph": float(gate_i[1].item()),
-                        "w_manifest": float(gate_i[2].item()),
-                        "w_joint": float(gate_i[3].item()),
-                    })
-                for key in GATE_DIAGNOSTIC_KEYS:
-                    value = extra.get(key)
-                    if isinstance(value, torch.Tensor) and value.numel() > i:
-                        row[key] = float(value.view(-1)[i].detach().cpu().item())
-                rows.append(row)
-
-    metrics = _metrics(labels_all, probs_all, preds_all)
-    metrics["num_failed"] = int(num_failed)
-    metrics["num_eval"] = int(len(labels_all))
-    return metrics, rows
+        conf = sum(c for c, m in zip(confidences, mask) if m) / n
+        acc = sum(c for c, m in zip(correct, mask) if m) / n
+        ece += (n / total) * abs(acc - conf)
+    return float(ece)
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
+def _device(cfg: dict[str, Any]) -> torch.device:
+    requested = str((cfg.get("train", {}) or {}).get("device", "auto"))
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(requested)
+
+
+def _make_dataset(cfg: dict[str, Any], split: str, *, aug: bool = False, view: str | None = None, strength: float | None = None) -> AEGDataset:
+    data_cfg = cfg.get("data", {}) or {}
+    split_cfg = data_cfg.get(split, {}) or {}
+    pt_dir = split_cfg.get("pt_dir") or data_cfg.get(f"{split}_pt_dir")
+    csv_path = split_cfg.get("csv") or split_cfg.get("label_csv") or data_cfg.get(f"{split}_csv")
+    if not pt_dir:
+        raise ValueError(f"data.{split}.pt_dir is required")
+    if not csv_path:
+        raise ValueError(f"data.{split}.csv is required")
+    robust_cfg = cfg.get("robust", {}) or {}
+    return AEGDataset(
+        pt_dir,
+        csv_path,
+        split=split,
+        train_aug=aug,
+        aug_prob=1.0 if view else float(robust_cfg.get("perturb_prob", 0.5)),
+        aug_views=[view] if view else list(robust_cfg.get("train_views", ["api_degraded", "graph_degraded", "api_graph_degraded", "manifest_degraded", "all_degraded"])),
+        aug_strengths=[float(strength)] if strength is not None else list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
+        seed=int((cfg.get("train", {}) or {}).get("seed", 42)),
+    )
+
+
+def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoader:
+    train_cfg = cfg.get("train", {}) or {}
+    batch_size = int(train_cfg.get("batch_size" if train else "eval_batch_size", train_cfg.get("batch_size", 24)))
+    workers = int(train_cfg.get("num_workers", 0))
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=train,
+        num_workers=workers,
+        pin_memory=bool(train_cfg.get("pin_memory", False)),
+        persistent_workers=workers > 0,
+        collate_fn=aeg_collate_fn,
+    )
+
+
+def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    out = dict(batch)
+    out["clean"] = batch["clean"].to(device)
+    out["aug"] = batch["aug"].to(device)
+    return out
+
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    cfg: dict[str, Any],
+    epoch: int,
+) -> dict[str, float]:
     model.train()
-    use_amp = bool(cfg["train"].get("use_amp", True))
-    grad_accum = int(cfg["train"].get("grad_accum_steps", 1))
-    loss_cfg = dict(cfg.get("loss", {}))
-    loss_cfg["label_smoothing"] = float(cfg["train"].get("label_smoothing", loss_cfg.get("label_smoothing", 0.0)))
-    optimizer.zero_grad(set_to_none=True)
-    total_loss = 0.0
+    use_aug = bool((cfg.get("robust", {}) or {}).get("train_aug", True))
+    grad_clip = float((cfg.get("train", {}) or {}).get("grad_clip", 1.0))
+    totals: dict[str, float] = {}
     steps = 0
-    failed_seen = 0
-    valid_seen = 0
-
     for batch in tqdm(loader, desc=f"train {epoch}", leave=False):
-        graph, labels, _, _quality, failed = prepare_robust_batch(batch, device)
-        failed_seen += int(failed)
-        if graph is None:
-            continue
-        valid_seen += int(labels.size(0))
-        with get_amp_context(device, use_amp):
-            logits, extra = model(graph, return_features=False)
-            loss, _ = compute_robust_loss(logits, labels, extra, loss_cfg)
-            loss = loss / max(grad_accum, 1)
-        steps += 1
-        scaler.scale(loss).backward()
-        if steps % grad_accum == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["train"].get("grad_clip", 1.0)))
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-        total_loss += float(loss.detach().item()) * max(grad_accum, 1)
-
-    if steps > 0 and steps % grad_accum != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["train"].get("grad_clip", 1.0)))
-        scaler.step(optimizer)
-        scaler.update()
+        batch = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-    enforce_failed_ratio({"num_eval": valid_seen, "num_failed": failed_seen}, cfg, f"train_epoch_{epoch}")
-    return total_loss / max(steps, 1)
+        clean_logits, clean_extra = model(batch["clean"])
+        aug_logits = aug_extra = None
+        if use_aug:
+            aug_logits, aug_extra = model(batch["aug"])
+        loss, parts = compute_aeg_loss(
+            clean_logits,
+            batch["clean"].y.view(-1),
+            clean_extra,
+            aug_logits=aug_logits,
+            aug_extra=aug_extra,
+            loss_cfg=cfg.get("loss", {}) or {},
+        )
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        for key, value in parts.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+        steps += 1
+    return {key: value / max(1, steps) for key, value in totals.items()}
 
 
-def write_gate_dump(path: Path, rows: list[dict[str, Any]]) -> None:
+@torch.no_grad()
+def evaluate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    split_name: str,
+    batch_key: str = "clean",
+    dump_rows: bool = False,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    model.eval()
+    labels: list[int] = []
+    probs: list[float] = []
+    preds: list[int] = []
+    rows: list[dict[str, Any]] = []
+    for batch in tqdm(loader, desc=split_name, leave=False):
+        data = batch[batch_key].to(device)
+        logits, extra = model(data)
+        prob = torch.softmax(logits, dim=-1)[:, 1].detach().cpu()
+        pred = logits.argmax(dim=-1).detach().cpu()
+        y = data.y.view(-1).detach().cpu()
+        labels.extend([int(v) for v in y.tolist()])
+        probs.extend([float(v) for v in prob.tolist()])
+        preds.extend([int(v) for v in pred.tolist()])
+        if dump_rows:
+            attn = extra.get("attention_mass")
+            for idx in range(y.numel()):
+                row = {
+                    "sid": batch["sid"][idx] if idx < len(batch["sid"]) else "",
+                    "label": int(y[idx].item()),
+                    "pred": int(pred[idx].item()),
+                    "prob_malware": float(prob[idx].item()),
+                    "q_api": float(extra["q_api"][idx].item()),
+                    "q_graph": float(extra["q_graph"][idx].item()),
+                    "q_manifest": float(extra["q_manifest"][idx].item()),
+                    "q_align": float(extra["q_align"][idx].item()),
+                    "code_reliability": float(extra["code_reliability"][idx].item()),
+                    "manifest_reliability": float(extra["manifest_reliability"][idx].item()),
+                    "code_manifest_similarity": float(extra["code_manifest_similarity"][idx].item()),
+                    "code_manifest_conflict": float(extra["code_manifest_conflict"][idx].item()),
+                }
+                if isinstance(attn, torch.Tensor) and attn.ndim == 2 and idx < attn.size(0):
+                    row.update(
+                        {
+                            "attn_code": float(attn[idx, 0].item()),
+                            "attn_manifest": float(attn[idx, 1].item()),
+                            "attn_risk": float(attn[idx, 2].item()),
+                            "attn_global": float(attn[idx, 3].item()),
+                        }
+                    )
+                rows.append(row)
+    return _binary_metrics(labels, probs, preds), rows
+
+
+def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = sorted({key for row in rows for key in row.keys()})
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def _normalize_extra_eval_sets(raw_sets: Any) -> list[dict[str, Any]]:
-    if not raw_sets:
+def _robust_eval_loaders(cfg: dict[str, Any], split: str) -> list[tuple[str, DataLoader]]:
+    eval_cfg = cfg.get("eval", {}) or {}
+    views = list(eval_cfg.get("robust_views", ["api_degraded", "graph_degraded", "api_graph_degraded", "manifest_degraded", "all_degraded", "api_missing", "graph_missing", "manifest_missing"]))
+    strengths = list(eval_cfg.get("perturb_strengths", [0.5]))
+    loaders: list[tuple[str, DataLoader]] = []
+    for view in views:
+        if view.endswith("_missing") or view in {"manifest_zeroed"}:
+            ds = _make_dataset(cfg, split, aug=True, view=view, strength=1.0)
+            loaders.append((view, _loader(cfg, ds, train=False)))
+        else:
+            for strength in strengths:
+                ds = _make_dataset(cfg, split, aug=True, view=view, strength=float(strength))
+                loaders.append((f"{view}@{float(strength):.2f}", _loader(cfg, ds, train=False)))
+    return loaders
+
+
+def _robust_val_loaders(cfg: dict[str, Any]) -> list[tuple[str, float, DataLoader]]:
+    val_cfg = ((cfg.get("eval", {}) or {}).get("robust_val", {}) or {})
+    if not bool(val_cfg.get("enabled", False)):
         return []
-    if isinstance(raw_sets, dict):
-        return [
-            {"name": str(name), **(value if isinstance(value, dict) else {})}
-            for name, value in raw_sets.items()
-        ]
-    if isinstance(raw_sets, list):
-        out = []
-        for idx, item in enumerate(raw_sets):
-            if not isinstance(item, dict):
-                raise ValueError(f"eval.extra_sets[{idx}] must be a mapping")
-            out.append(dict(item))
-        return out
-    raise ValueError("eval.extra_sets must be a list or mapping")
+    scenarios = val_cfg.get("scenarios") or [
+        {"name": "api_graph_degraded", "view": "api_graph_degraded", "strength": 0.5, "weight": 0.4},
+        {"name": "manifest_noisy", "view": "manifest_noisy", "strength": 0.5, "weight": 0.3},
+        {"name": "all_degraded", "view": "all_degraded", "strength": 0.5, "weight": 0.3},
+    ]
+    loaders: list[tuple[str, float, DataLoader]] = []
+    seen: set[str] = set()
+    for item in scenarios:
+        view = str(item.get("view") or item.get("name") or "")
+        if not view:
+            raise ValueError("eval.robust_val.scenarios entries require view")
+        strength = float(item.get("strength", 1.0 if view.endswith("_missing") else 0.5))
+        name = str(item.get("name") or f"{view}@{strength:.2f}")
+        if name in seen:
+            raise ValueError(f"Duplicate robust validation scenario name: {name}")
+        seen.add(name)
+        weight = float(item.get("weight", 1.0))
+        if weight < 0:
+            raise ValueError(f"Robust validation scenario {name} has negative weight")
+        ds = _make_dataset(cfg, "val", aug=True, view=view, strength=strength)
+        loaders.append((name, weight, _loader(cfg, ds, train=False)))
+    return loaders
 
 
-def _extra_eval_paths(cfg: dict, item: dict[str, Any]) -> tuple[str, str]:
-    root = str(item.get("root", cfg.get("data", {}).get("root", "")) or "")
-    pt_value = item.get("pt_dir") or item.get("test_pt_dir")
-    csv_value = item.get("csv") or item.get("csv_path") or item.get("test_csv")
-    if not pt_value:
-        raise ValueError(f"extra eval set {item.get('name', '<unnamed>')} is missing pt_dir")
-    if not csv_value:
-        raise ValueError(f"extra eval set {item.get('name', '<unnamed>')} is missing csv")
-    return resolve(root, pt_value), resolve(root, csv_value)
+def _checkpoint_score(
+    cfg: dict[str, Any],
+    clean_metrics: dict[str, float],
+    robust_metrics: dict[str, dict[str, float]],
+    robust_loaders: list[tuple[str, float, DataLoader]],
+) -> float:
+    train_cfg = cfg.get("train", {}) or {}
+    metric = str(train_cfg.get("checkpoint_metric", "macro_f1"))
+    if metric != "robust_composite":
+        return float(clean_metrics.get(metric, clean_metrics.get("macro_f1", 0.0)))
+    if not robust_loaders:
+        raise ValueError("train.checkpoint_metric=robust_composite requires eval.robust_val.enabled=true")
+    val_cfg = ((cfg.get("eval", {}) or {}).get("robust_val", {}) or {})
+    clean_weight = float(val_cfg.get("clean_weight", 0.5))
+    if clean_weight < 0:
+        raise ValueError("eval.robust_val.clean_weight must be non-negative")
+    total_weight = clean_weight
+    score = clean_weight * float(clean_metrics.get("macro_f1", 0.0))
+    for name, weight, _loader_obj in robust_loaders:
+        total_weight += weight
+        score += weight * float((robust_metrics.get(name) or {}).get("macro_f1", 0.0))
+    return score / max(total_weight, 1e-8)
 
 
-def _write_metrics_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def run(cfg: dict) -> dict[str, Any]:
-    logging.basicConfig(level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO))
-    train_cfg = cfg["train"]
-    data_cfg = cfg["data"]
-    eval_cfg = cfg.get("eval", {})
+def run(cfg: dict[str, Any]) -> dict[str, Any]:
+    logging.basicConfig(level=logging.INFO)
+    train_cfg = cfg.get("train", {}) or {}
     seed = int(train_cfg.get("seed", 42))
     set_seed(seed)
-    configure_determinism(bool(train_cfg.get("deterministic", False)))
-    device = select_device(str(train_cfg.get("device", "auto")))
-    use_amp = bool(train_cfg.get("use_amp", True))
-    run_test = bool(eval_cfg.get("run_test", True))
-    run_robust_test = bool(eval_cfg.get("run_robust_test", True))
-    eval_only = bool(eval_cfg.get("eval_only", False))
-    tuning_mode = bool(train_cfg.get("tuning_mode", False))
-    gate_cfg = cfg.get("model", {}).get("gate", {}) or {}
-    if bool(gate_cfg.get("use_perturbation_evidence", False)) and not bool(
-        gate_cfg.get("oracle_perturbation_ablation", False)
-    ):
-        raise ValueError(
-            "model.gate.use_perturbation_evidence=true exposes synthetic perturbation strength to the gate. "
-            "Set model.gate.oracle_perturbation_ablation=true only for an explicitly labelled oracle ablation."
-        )
-    if run_robust_test and not run_test:
-        raise ValueError("eval.run_robust_test=true requires eval.run_test=true")
-    if tuning_mode:
-        if run_test or run_robust_test:
-            raise ValueError("train.tuning_mode=true forbids test evaluation")
-        if _normalize_extra_eval_sets(eval_cfg.get("extra_sets")):
-            raise ValueError("train.tuning_mode=true forbids eval.extra_sets")
-        if not bool((eval_cfg.get("robust_val", {}) or {}).get("enabled", False)):
-            raise ValueError("train.tuning_mode=true requires eval.robust_val.enabled=true")
-        if str(train_cfg.get("checkpoint_metric", "")).strip().lower() != "robust_composite":
-            raise ValueError("train.tuning_mode=true requires train.checkpoint_metric=robust_composite")
-    if eval_only:
-        if tuning_mode:
-            raise ValueError("eval.eval_only=true is incompatible with train.tuning_mode=true")
-        if not str(eval_cfg.get("checkpoint_path") or "").strip():
-            raise ValueError("eval.eval_only=true requires eval.checkpoint_path")
-
-    validate_split_partitions(cfg, include_test=run_test)
-    val_ds = build_dataset(cfg, "val", is_train=False)
-    val_loader = build_loader(cfg, val_ds, is_train=False)
-    train_ds = None
-    train_loader = None
-    if not eval_only:
-        train_ds = build_dataset(cfg, "train", is_train=True)
-        train_loader = build_loader(cfg, train_ds, is_train=True)
-    robust_val_loaders = build_robust_val_loaders(cfg)
-    test_loader = None
-    if run_test:
-        test_ds = build_dataset(cfg, "test", is_train=False)
-        test_loader = build_loader(cfg, test_ds, is_train=False)
-
-    feature_dim = train_ds.feature_dim if train_ds is not None else val_ds.feature_dim
-    model = build_model(cfg, feature_dim).to(device)
-
-    exp_name = str(train_cfg.get("exp_name", "tri_modal_robust"))
-    if eval_only:
-        exp_name = str(eval_cfg.get("output_name") or f"{exp_name}_eval_only")
-    out_dir = Path(data_cfg.get("out_dir", "experiments")) / exp_name / str(seed)
+    device = _device(cfg)
+    out_dir = Path(train_cfg.get("output_dir", "results/aeg_robust/run"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-    if eval_only:
-        best_path = Path(str(eval_cfg["checkpoint_path"]))
-        if not best_path.is_absolute():
-            best_path = Path.cwd() / best_path
-        if not best_path.exists():
-            raise FileNotFoundError(f"Evaluation checkpoint not found: {best_path}")
-        ckpt = torch.load(best_path, map_location=device, weights_only=True)
-        validate_eval_checkpoint_config(
-            cfg,
-            ckpt.get("cfg"),
-            allow_mismatch=bool(eval_cfg.get("allow_checkpoint_config_mismatch", False)),
+
+    train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
+    val_ds = _make_dataset(cfg, "val", aug=False)
+    test_ds = _make_dataset(cfg, "test", aug=False)
+    LOGGER.info("Train stats: %s", split_label_stats(train_ds))
+    LOGGER.info("Val stats: %s", split_label_stats(val_ds))
+    LOGGER.info("Test stats: %s", split_label_stats(test_ds))
+
+    train_loader = _loader(cfg, train_ds, train=True)
+    val_loader = _loader(cfg, val_ds, train=False)
+    test_loader = _loader(cfg, test_ds, train=False)
+    robust_val_loaders = _robust_val_loaders(cfg)
+    first_payload = torch.load(train_ds.samples[0][0], map_location="cpu")
+    node_input_dim = int(first_payload["node_x"].size(1))
+    model = build_model(cfg, node_input_dim).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(train_cfg.get("lr", 3e-4)),
+        weight_decay=float(train_cfg.get("weight_decay", 1e-2)),
+    )
+
+    best_score = -1.0
+    best_epoch = 0
+    patience = int(train_cfg.get("patience", 8))
+    history: list[dict[str, Any]] = []
+    for epoch in range(1, int(train_cfg.get("epochs", 60)) + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, cfg, epoch)
+        val_metrics, _ = evaluate(model, val_loader, device, split_name="val")
+        val_robust_metrics: dict[str, dict[str, float]] = {}
+        for name, _weight, loader_obj in robust_val_loaders:
+            metrics, _ = evaluate(model, loader_obj, device, split_name=f"val_{name}", batch_key="aug")
+            val_robust_metrics[name] = metrics
+        score = _checkpoint_score(cfg, val_metrics, val_robust_metrics, robust_val_loaders)
+        row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_loss.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
+        for name, metrics in val_robust_metrics.items():
+            for key, value in metrics.items():
+                row[f"val_{name}_{key}"] = value
+        row["checkpoint_score"] = score
+        history.append(row)
+        LOGGER.info(
+            "epoch=%s val_macro_f1=%.4f checkpoint_score=%.4f train_loss=%.4f",
+            epoch,
+            val_metrics.get("macro_f1", 0.0),
+            score,
+            train_loss.get("loss", 0.0),
         )
-        model.load_state_dict(ckpt["model"])
-        best_score = float(ckpt.get("checkpoint_score", -1.0))
-        best_val_f1 = float((ckpt.get("val") or {}).get("macro_f1", -1.0))
-        checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
-        logger.info("eval-only mode loaded checkpoint: %s", best_path)
-    else:
-        assert train_loader is not None
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(train_cfg.get("lr", 3e-4)),
-            weight_decay=float(train_cfg.get("weight_decay", 0.01)),
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, int(train_cfg.get("epochs", 1))),
-            eta_min=float(train_cfg.get("eta_min", 1e-6)),
-        )
-        scaler = build_grad_scaler(device, use_amp)
-        best_score = -1.0
-        best_val_f1 = -1.0
-        checkpoint_metric_name = ""
-        best_path = out_dir / "best_tri_modal_robust.pt"
-        patience = int(train_cfg.get("patience", 10))
-        stale = 0
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
+            torch.save({"model": model.state_dict(), "cfg": cfg, "epoch": epoch, "score": best_score}, out_dir / "best.pt")
+        elif epoch - best_epoch >= patience:
+            LOGGER.info("Early stopping at epoch %s; best epoch %s", epoch, best_epoch)
+            break
 
-        for epoch in range(1, int(train_cfg.get("epochs", 1)) + 1):
-            train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch)
-            val_metrics, _ = evaluate(model, val_loader, device, use_amp, "val", dump_rows=False)
-            enforce_failed_ratio(val_metrics, cfg, "val")
-            val_robust_metrics = evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
-            score, checkpoint_metric_name = checkpoint_score(
-                cfg,
-                val_metrics,
-                val_robust_metrics,
-                robust_val_loaders,
-            )
-            scheduler.step()
-            logger.info(
-                "epoch=%s train_loss=%.4f val_macro_f1=%.4f val_auc=%.4f val_acc=%.4f checkpoint_score=%.4f",
-                epoch,
-                train_loss,
-                val_metrics["f1"],
-                val_metrics["auc"],
-                val_metrics["acc"],
-                score,
-            )
-            if score > best_score + float(train_cfg.get("min_delta", 1e-4)):
-                best_score = score
-                best_val_f1 = float(val_metrics["macro_f1"])
-                stale = 0
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "cfg": cfg,
-                        "val": val_metrics,
-                        "val_robust": val_robust_metrics,
-                        "checkpoint_score": score,
-                        "checkpoint_metric": checkpoint_metric_name,
-                        "epoch": epoch,
-                    },
-                    best_path,
-                )
-            else:
-                stale += 1
-                if stale >= patience:
-                    break
+    ckpt = torch.load(out_dir / "best.pt", map_location=device)
+    model.load_state_dict(ckpt["model"])
+    val_metrics, val_rows = evaluate(model, val_loader, device, split_name="val_best", dump_rows=True)
+    test_metrics, test_rows = evaluate(model, test_loader, device, split_name="test", dump_rows=True)
+    summary: dict[str, Any] = {"best_epoch": best_epoch, "best_score": best_score, "val": val_metrics, "test": test_metrics}
 
-        if best_path.exists():
-            ckpt = torch.load(best_path, map_location=device, weights_only=True)
-            model.load_state_dict(ckpt["model"])
+    robust_results: dict[str, dict[str, float]] = {}
+    if bool((cfg.get("eval", {}) or {}).get("robust_eval", True)):
+        for name, loader in _robust_eval_loaders(cfg, "test"):
+            metrics, rows = evaluate(model, loader, device, split_name=f"test_{name}", batch_key="aug", dump_rows=True)
+            robust_results[name] = metrics
+            _write_rows(out_dir / f"diagnostics_test_{name.replace('@', '_')}.csv", rows)
+    summary["robust_test"] = robust_results
 
-    val_metrics, val_rows = evaluate(model, val_loader, device, use_amp, "val_clean", dump_rows=True)
-    enforce_failed_ratio(val_metrics, cfg, "val_clean")
-    val_robust_results = evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
-
-    test_metrics: dict[str, Any] = {}
-    test_rows: list[dict[str, Any]] = []
-    robust_results: dict[str, Any] = {}
-    if run_test:
-        assert test_loader is not None
-        test_metrics, test_rows = evaluate(model, test_loader, device, use_amp, "test_clean", dump_rows=True)
-        enforce_failed_ratio(test_metrics, cfg, "test_clean")
-        if run_robust_test:
-            perturb_tests = list(eval_cfg.get("perturb_tests", ["clean"]))
-            if eval_cfg.get("perturb_strengths") is not None:
-                perturb_strengths = [float(v) for v in eval_cfg.get("perturb_strengths") or []]
-            else:
-                perturb_strengths = [float(eval_cfg.get("perturb_strength", 0.5))]
-            perturb_strengths = perturb_strengths or [0.5]
-            for perturb in perturb_tests:
-                if perturb == "clean":
-                    robust_results[perturb] = test_metrics
-                    continue
-                # *_missing / modality_dropout_* perturbations ignore strength;
-                # running them once per strength wastes time on identical results.
-                is_strength_invariant = perturb.endswith("_missing") or perturb.startswith("modality_dropout_")
-                strengths = [1.0] if is_strength_invariant else perturb_strengths
-                for strength in strengths:
-                    result_key = perturb if len(strengths) == 1 else f"{perturb}_s{strength:g}"
-                    robust_ds = build_dataset(cfg, "test", is_train=False, perturb_type=perturb, perturb_strength=strength)
-                    robust_loader = build_loader(cfg, robust_ds, is_train=False)
-                    metrics, rows = evaluate(model, robust_loader, device, use_amp, f"test_{result_key}", dump_rows=True)
-                    enforce_failed_ratio(metrics, cfg, f"test_{result_key}")
-                    robust_results[result_key] = metrics
-                    test_rows.extend(rows)
-
-    all_rows = val_rows + test_rows
-
-    extra_results = {}
-    extra_rows: list[dict[str, Any]] = []
-    for idx, extra in enumerate(_normalize_extra_eval_sets(eval_cfg.get("extra_sets"))):
-        name = str(extra.get("name") or f"extra_{idx}")
-        pt_dir, csv_path = _extra_eval_paths(cfg, extra)
-        perturb_type = extra.get("perturb_type")
-        perturb_strength = float(extra.get("perturb_strength", 0.0))
-        try:
-            extra_ds = build_dataset_from_paths(
-                cfg,
-                pt_dir=pt_dir,
-                csv_path=csv_path,
-                is_train=False,
-                perturb_type=str(perturb_type) if perturb_type else None,
-                perturb_strength=perturb_strength,
-                dataset_overrides={
-                    "allow_pt_superset": bool(extra.get("allow_pt_superset", True)),
-                    "strict_split_integrity": bool(extra.get("strict_split_integrity", True)),
-                },
-            )
-        except EmptyExtraEvalSetError as exc:
-            if bool(extra.get("skip_if_empty", True)):
-                extra_results[name] = {
-                    "skipped": True,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                    "pt_dir": str(pt_dir),
-                    "csv": str(csv_path),
-                }
-                continue
-            raise
-        extra_loader = build_loader(cfg, extra_ds, is_train=False)
-        split_name = str(extra.get("split_name") or name)
-        metrics, rows = evaluate(model, extra_loader, device, use_amp, split_name, dump_rows=True)
-        enforce_failed_ratio(metrics, cfg, split_name, max_failed_ratio=extra.get("max_failed_ratio"))
-        metrics = {
-            **metrics,
-            "pt_dir": str(pt_dir),
-            "csv": str(csv_path),
-            "perturb_type": str(perturb_type or ""),
-            "perturb_strength": perturb_strength,
-        }
-        extra_results[name] = metrics
-        # all_rows already has val+test; extra_rows keeps extra-eval separate
-        # so gate_diagnostics.csv and gate_diagnostics_extra_eval.csv are disjoint.
-        extra_rows.extend(rows)
-
-    write_gate_dump(out_dir / "gate_diagnostics.csv", all_rows)
-    write_gate_dump(out_dir / "gate_diagnostics_extra_eval.csv", extra_rows)
-    if extra_results:
-        _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
-    summary = {
-        "eval_only": eval_only,
-        "checkpoint_path": str(best_path),
-        "best_checkpoint_score": best_score,
-        "best_val_f1": best_val_f1,
-        "best_val_macro_f1": best_val_f1,
-        "checkpoint_metric": checkpoint_metric_name,
-        "val": val_metrics,
-        "val_robust": val_robust_results,
-        "test": test_metrics,
-        "robust": robust_results,
-        "extra_eval": extra_results,
-    }
-    with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(summary, f, sort_keys=False)
-    logger.info("finished: %s", out_dir)
+    _write_rows(out_dir / "diagnostics_val.csv", val_rows)
+    _write_rows(out_dir / "diagnostics_test_clean.csv", test_rows)
+    with (out_dir / "history.csv").open("w", encoding="utf-8", newline="") as f:
+        if history:
+            writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+            writer.writeheader()
+            writer.writerows(history)
+    with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
     return summary
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train source-aware AEG robust Android malware detector.")
+    parser.add_argument("--config", required=True, help="YAML config path.")
+    return parser.parse_args()
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train API+Graph+Manifest robust tri-modal fusion.")
-    parser.add_argument("--config", nargs="+", required=True, help="One or more YAML configs, applied left to right.")
-    args = parser.parse_args()
-    cfg = load_config(args.config)
-    run(cfg)
+    args = parse_args()
+    run(load_config(args.config))
 
 
 if __name__ == "__main__":
