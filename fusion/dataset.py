@@ -24,12 +24,19 @@ from fusion.semantic_categories import (
     graph_semantic_counts_from_method_api_edges,
     sanitize_semantic_counts,
 )
+from fusion.quality import (
+    compute_api_quality,
+    compute_graph_quality,
+    compute_align_quality,
+)
 
 logger = logging.getLogger(__name__)
 
 
 VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
 
+class FatalDatasetConfigError(RuntimeError):
+    """Configuration/data schema error that must not be converted to a dummy sample."""
 
 def _stable_seed(*parts: object) -> int:
     text = "|".join(str(p) for p in parts)
@@ -411,34 +418,6 @@ class RobustTriModalDataset(Dataset):
     def _api_semantic_category_counts(api_type_ids: torch.Tensor) -> torch.Tensor:
         return api_semantic_counts_from_type_ids(api_type_ids)
 
-    @staticmethod
-    def _api_quality(api_ids, api_type_ids, api_sensitive, api_in_graph) -> float:
-        n = int(api_ids.numel()) if isinstance(api_ids, torch.Tensor) else 0
-        if n <= 0:
-            return 0.0
-        count_score = min(1.0, n / 128.0)
-        diversity_score = min(1.0, float(api_ids.unique().numel()) / max(n, 1) * 2.0)
-        coverage_score = float(api_in_graph.float().mean().item()) if api_in_graph.numel() == n else 0.0
-        type_score = float((api_type_ids.long() > 0).float().mean().item()) if api_type_ids.numel() == n else 0.0
-        return max(0.0, min(1.0, 0.35 * count_score + 0.25 * diversity_score + 0.25 * coverage_score + 0.15 * type_score))
-
-    @staticmethod
-    def _graph_quality(edge_index: torch.Tensor, num_nodes: int, sensitive_mask: torch.Tensor) -> float:
-        if num_nodes <= 0:
-            return 0.0
-        node_score = min(1.0, num_nodes / 32.0)
-        edge_score = min(1.0, edge_index.size(1) / max(num_nodes, 1)) if edge_index.ndim == 2 else 0.0
-        return max(0.0, min(1.0, 0.5 * node_score + 0.5 * edge_score))
-
-    @staticmethod
-    def _align_quality(q_api: float, q_graph: float, method_api_edge_index: torch.Tensor, num_nodes: int, num_api: int) -> float:
-        if num_nodes <= 0 or num_api <= 0 or method_api_edge_index.numel() == 0:
-            return 0.0
-        node_cover = method_api_edge_index[0].unique().numel() / max(num_nodes, 1)
-        api_cover = method_api_edge_index[1].unique().numel() / max(num_api, 1)
-        edge_cover = 0.5 * float(node_cover) + 0.5 * float(api_cover)
-        code_quality = (max(0.0, min(1.0, q_api)) * max(0.0, min(1.0, q_graph))) ** 0.5
-        return max(0.0, min(1.0, edge_cover * code_quality))
 
     def _process_dex(self, dex: dict[str, Any], node_offset: int, api_offset: int):
         x = self._sanitize_call_x(dex.get("call_x"))
@@ -542,9 +521,15 @@ class RobustTriModalDataset(Dataset):
         final_api_in_graph = api_parts["api_in_graph_mask"]
         final_method_edges = api_parts["method_api_edge_index"]
 
-        q_api = self._api_quality(final_api_ids, final_api_types, final_api_sensitive, final_api_in_graph)
-        q_graph = self._graph_quality(edge_index, int(x.size(0)), sensitive_mask)
-        q_align = self._align_quality(q_api, q_graph, final_method_edges, int(x.size(0)), int(final_api_ids.numel()))
+        q_api = compute_api_quality(final_api_ids, final_api_types, final_api_in_graph)
+        q_graph = compute_graph_quality(edge_index, int(x.size(0)))
+        q_align = compute_align_quality(
+            q_api,
+            q_graph,
+            final_method_edges,
+            int(x.size(0)),
+            int(final_api_ids.numel()),
+        )
         api_semantic_counts = self._api_semantic_category_counts(final_api_types)
         if self.graph_semantic_source == "alignment":
             graph_semantic_counts = graph_semantic_counts_from_method_api_edges(
@@ -586,7 +571,7 @@ class RobustTriModalDataset(Dataset):
         has_manifest = manifest_x_raw is not None or _first_present(sources, "manifest_category_counts") is not None
         raw_manifest_dim = _flat_numel(manifest_x_raw)
         if raw_manifest_dim > self.manifest_dim:
-            raise ValueError(
+            raise FatalDatasetConfigError(
                 f"manifest_x dimension {raw_manifest_dim} exceeds configured manifest_dim={self.manifest_dim}; "
                 "regenerate tri-modal .pt files or increase model.manifest_encoder.in_dim"
             )
@@ -688,6 +673,8 @@ class RobustTriModalDataset(Dataset):
                 with _temporary_random_seed(seed):
                     data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
             return self._to_data_object(data, label, sid, year)
+        except FatalDatasetConfigError:
+            raise
         except Exception as exc:
             return self._dummy(label, sid, year, f"{type(exc).__name__}: {exc}", pt_path)
 

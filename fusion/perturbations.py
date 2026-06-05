@@ -10,6 +10,12 @@ from fusion.semantic_categories import (
     api_semantic_counts_from_type_ids,
 )
 
+from fusion.quality import (
+    refresh_api_quality,
+    refresh_graph_quality,
+    refresh_align_quality,
+)
+
 
 API_PERTURBATIONS = {
     "api_event_dropout",
@@ -87,73 +93,8 @@ def _set_min_pert(data: dict, key: str, strength: float) -> None:
     data[key] = max(current, _clamp_strength(strength))
 
 
-def refresh_api_quality(data: dict) -> None:
-    api_ids = data.get("api_ids")
-    if not isinstance(api_ids, torch.Tensor) or api_ids.numel() <= 0:
-        data["q_api"] = 0.0
-        return
-    api_ids = api_ids.view(-1)
-    n = int(api_ids.numel())
-    api_type_ids = data.get("api_type_ids")
-    api_in_graph = data.get("api_in_graph_mask")
-    count_score = min(1.0, n / 128.0)
-    diversity_score = min(1.0, float(api_ids.unique().numel()) / max(n, 1) * 2.0)
-    coverage_score = (
-        float(api_in_graph.float().view(-1).mean().item())
-        if isinstance(api_in_graph, torch.Tensor) and api_in_graph.numel() == n
-        else 0.0
-    )
-    type_score = (
-        float((api_type_ids.long().view(-1) > 0).float().mean().item())
-        if isinstance(api_type_ids, torch.Tensor) and api_type_ids.numel() == n
-        else 0.0
-    )
-    data["q_api"] = max(
-        0.0,
-        min(1.0, 0.35 * count_score + 0.25 * diversity_score + 0.25 * coverage_score + 0.15 * type_score),
-    )
-
-
-def refresh_graph_quality(data: dict) -> None:
-    x = data.get("x")
-    edge_index = data.get("edge_index")
-    num_nodes = int(x.size(0)) if isinstance(x, torch.Tensor) and x.ndim == 2 else 0
-    if num_nodes <= 0:
-        data["q_graph"] = 0.0
-        return
-    num_edges = (
-        int(edge_index.size(1))
-        if isinstance(edge_index, torch.Tensor) and edge_index.ndim == 2 and edge_index.size(0) == 2
-        else 0
-    )
-    node_score = min(1.0, num_nodes / 32.0)
-    edge_score = min(1.0, num_edges / max(num_nodes, 1))
-    data["q_graph"] = max(0.0, min(1.0, 0.5 * node_score + 0.5 * edge_score))
-
-
 def refresh_align_quality_after_code_perturb(data: dict) -> None:
-    q_api = _scalar_float(data.get("q_api"), 0.0)
-    q_graph = _scalar_float(data.get("q_graph"), 0.0)
-    api_ids = data.get("api_ids")
-    x = data.get("x")
-    edge = data.get("method_api_edge_index")
-    num_api = int(api_ids.numel()) if isinstance(api_ids, torch.Tensor) else 0
-    num_nodes = int(x.size(0)) if isinstance(x, torch.Tensor) and x.ndim == 2 else 0
-    if (
-        num_api <= 0
-        or num_nodes <= 0
-        or not isinstance(edge, torch.Tensor)
-        or edge.ndim != 2
-        or edge.size(0) != 2
-        or edge.numel() == 0
-    ):
-        data["q_align"] = 0.0
-        return
-    node_cover = float(edge[0].unique().numel()) / max(num_nodes, 1)
-    api_cover = float(edge[1].unique().numel()) / max(num_api, 1)
-    edge_cover = 0.5 * node_cover + 0.5 * api_cover
-    code_quality = (max(0.0, min(1.0, q_api)) * max(0.0, min(1.0, q_graph))) ** 0.5
-    data["q_align"] = max(0.0, min(1.0, edge_cover * code_quality))
+   refresh_align_quality(data)
 
 
 def _should_degrade_category_counts(data: dict) -> bool:
