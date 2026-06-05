@@ -9,13 +9,37 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
-from fusion.constants import AEG_SCHEMA_VERSION, SOURCE_TYPES, VIEW_TYPES
+from fusion.constants import (
+    AEG_SCHEMA_VERSION,
+    AEG_SCHEMA_TABLE_FINGERPRINT,
+    AEG_SCHEMA_TABLES,
+    EDGE_TYPES,
+    NODE_TYPES,
+    SOURCE_TYPES,
+    VIEW_TYPES,
+)
 from fusion.perturbations import apply_aeg_view
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
 
 
 class AEGDatasetConfigError(RuntimeError):
     pass
+
+
+SHUFFLED_MANIFEST_STALE_EDGE_TYPES = {
+    EDGE_TYPES["APK_REQUESTS_PERMISSION"],
+    EDGE_TYPES["PERMISSION_REQUESTED_BY_APK"],
+    EDGE_TYPES["APK_HAS_COMPONENT"],
+    EDGE_TYPES["COMPONENT_IN_APK"],
+    EDGE_TYPES["COMPONENT_DECLARES_INTENT"],
+    EDGE_TYPES["INTENT_DECLARED_BY_COMPONENT"],
+    EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"],
+    EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
+    EDGE_TYPES["COMPONENT_MATCHES_METHOD"],
+    EDGE_TYPES["METHOD_MATCHES_COMPONENT"],
+    EDGE_TYPES["MANIFEST_HAS_RISK"],
+    EDGE_TYPES["RISK_DECLARED_BY_MANIFEST"],
+}
 
 
 def _norm_id(value: Any) -> str:
@@ -119,6 +143,20 @@ def payload_to_data(payload: dict[str, Any], *, label: int | None = None) -> Dat
             f"Expected AEG schema_version={AEG_SCHEMA_VERSION}, got {schema}. "
             "Regenerate PT files with scripts/build_aeg_pts_direct.py."
         )
+    if payload.get("aeg_schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
+        meta = payload.get("aeg_meta") or {}
+        if meta.get("schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
+            raise AEGDatasetConfigError(
+                f"AEG schema table fingerprint mismatch for {payload.get('sid', '<unknown>')}. "
+                "Regenerate PT files because node/edge/source/view type tables changed."
+            )
+    meta = payload.get("aeg_meta") or {}
+    for key, expected in AEG_SCHEMA_TABLES.items():
+        if key in meta and dict(meta[key]) != expected:
+            raise AEGDatasetConfigError(
+                f"AEG {key} table mismatch for {payload.get('sid', '<unknown>')}. "
+                "Regenerate PT files with the current code."
+            )
 
     node_x = _tensor(payload, "node_x", torch.float32)
     if node_x.ndim != 2 or node_x.size(0) == 0:
@@ -247,18 +285,43 @@ def _copy_manifest_content(target: Data, donor: Data) -> None:
     if not bool(target_mask.any()):
         return
     if not bool(donor_mask.any()):
-        target.x[target_mask] = 0.0
-        target.node_quality[target_mask] = 0.0
-        target.node_semantic[target_mask] = 0.0
-        target.q_manifest = torch.tensor([0.0], dtype=torch.float32)
+        _zero_manifest_nodes(target)
         return
-    target_idx = torch.where(target_mask)[0]
-    donor_idx = torch.where(donor_mask)[0]
-    repeat = donor_idx.repeat((int(target_idx.numel()) + int(donor_idx.numel()) - 1) // int(donor_idx.numel()))[: target_idx.numel()]
-    target.x[target_idx] = donor.x[repeat]
-    target.node_quality[target_idx] = donor.node_quality[repeat]
-    target.node_semantic[target_idx] = donor.node_semantic[repeat]
+    for node_type in (NODE_TYPES["PERMISSION"], NODE_TYPES["INTENT"], NODE_TYPES["COMPONENT"]):
+        target_idx = torch.where(target_mask & (target.node_type == node_type))[0]
+        if target_idx.numel() == 0:
+            continue
+        donor_idx = torch.where(donor_mask & (donor.node_type == node_type))[0]
+        if donor_idx.numel() == 0:
+            target.x[target_idx] = 0.0
+            target.node_quality[target_idx] = 0.0
+            target.node_semantic[target_idx] = 0.0
+            continue
+        repeat = donor_idx.repeat((int(target_idx.numel()) + int(donor_idx.numel()) - 1) // int(donor_idx.numel()))[: target_idx.numel()]
+        target.x[target_idx] = donor.x[repeat]
+        target.node_quality[target_idx] = donor.node_quality[repeat]
+        target.node_semantic[target_idx] = donor.node_semantic[repeat]
     target.q_manifest = donor.q_manifest.clone()
+    _zero_shuffled_manifest_edges(target)
+
+
+def _zero_manifest_nodes(data: Data) -> None:
+    mask = data.node_source == SOURCE_TYPES["manifest"]
+    if bool(mask.any()):
+        data.x[mask] = 0.0
+        data.node_quality[mask] = 0.0
+        data.node_semantic[mask] = 0.0
+    data.q_manifest = torch.tensor([0.0], dtype=torch.float32)
+    _zero_shuffled_manifest_edges(data)
+
+
+def _zero_shuffled_manifest_edges(data: Data) -> None:
+    if not hasattr(data, "edge_quality") or not hasattr(data, "edge_type") or data.edge_type.numel() == 0:
+        return
+    edge_type_tensor = torch.tensor(sorted(SHUFFLED_MANIFEST_STALE_EDGE_TYPES), dtype=torch.long, device=data.edge_type.device)
+    mask = torch.isin(data.edge_type, edge_type_tensor)
+    if bool(mask.any()):
+        data.edge_quality[mask] = 0.0
 
 
 def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data]) -> None:
@@ -267,12 +330,7 @@ def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data]) -> N
             if int(aug.view_type_id.view(-1)[0].item()) == VIEW_TYPES["manifest_shuffled"]:
                 # A single-sample batch cannot supply a donor; use zeroed
                 # Manifest evidence instead of silently keeping the original.
-                mask = aug.node_source == SOURCE_TYPES["manifest"]
-                if bool(mask.any()):
-                    aug.x[mask] = 0.0
-                    aug.node_quality[mask] = 0.0
-                    aug.node_semantic[mask] = 0.0
-                aug.q_manifest = torch.tensor([0.0], dtype=torch.float32)
+                _zero_manifest_nodes(aug)
         return
     for idx, aug in enumerate(aug_items):
         if int(aug.view_type_id.view(-1)[0].item()) != VIEW_TYPES["manifest_shuffled"]:

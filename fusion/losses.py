@@ -96,6 +96,52 @@ def _conditional_cf_weight(clean_extra: dict[str, torch.Tensor], aug_extra: dict
     return (base * conditional.clamp(0.0, 1.0)).clamp(0.0, 1.0)
 
 
+def _extra_vector(extra: dict[str, torch.Tensor], key: str, ref: torch.Tensor, default: float) -> torch.Tensor:
+    value = extra.get(key)
+    if isinstance(value, torch.Tensor):
+        out = value.to(device=ref.device, dtype=ref.dtype).view(-1)
+        if out.numel() == ref.size(0):
+            return out
+    return ref.new_full((ref.size(0),), float(default))
+
+
+def _source_contrast_weights(
+    clean_extra: dict[str, torch.Tensor],
+    aug_extra: dict[str, torch.Tensor],
+    ref: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    clean_code = _extra_vector(clean_extra, "code_reliability", ref, 1.0)
+    aug_code = _extra_vector(aug_extra, "code_reliability", ref, 1.0)
+    clean_manifest = _extra_vector(clean_extra, "manifest_reliability", ref, 1.0)
+    aug_manifest = _extra_vector(aug_extra, "manifest_reliability", ref, 1.0)
+    code_weight = torch.minimum(clean_code, aug_code).clamp(0.0, 1.0)
+    manifest_weight = torch.minimum(clean_manifest, aug_manifest).clamp(0.0, 1.0)
+
+    view = aug_extra.get("view_type_id")
+    if isinstance(view, torch.Tensor):
+        view = view.to(device=ref.device).view(-1).long()
+        manifest_unalignable = torch.tensor(
+            [
+                VIEW_TYPES["manifest_zeroed"],
+                VIEW_TYPES["manifest_noisy"],
+                VIEW_TYPES["manifest_shuffled"],
+                VIEW_TYPES["manifest_missing"],
+            ],
+            device=ref.device,
+        )
+        code_unalignable = torch.tensor(
+            [
+                VIEW_TYPES["api_missing"],
+                VIEW_TYPES["graph_missing"],
+            ],
+            device=ref.device,
+        )
+        manifest_weight = torch.where(torch.isin(view, manifest_unalignable), torch.zeros_like(manifest_weight), manifest_weight)
+        code_weight = torch.where(torch.isin(view, code_unalignable), torch.zeros_like(code_weight), code_weight)
+    risk_weight = torch.maximum(code_weight, manifest_weight).clamp(0.0, 1.0)
+    return code_weight, manifest_weight, risk_weight
+
+
 def compute_aeg_loss(
     clean_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -120,14 +166,13 @@ def compute_aeg_loss(
     cf_kl = clean_logits.new_tensor(0.0)
     if aug_logits is not None and aug_extra is not None:
         clean_aug = _info_nce(clean_extra["fused_emb"], aug_extra["fused_emb"], temperature)
-        code_weight = clean_extra.get("code_reliability", clean_logits.new_ones((clean_logits.size(0),))).to(clean_logits.device).view(-1)
-        manifest_weight = clean_extra.get("manifest_reliability", clean_logits.new_ones((clean_logits.size(0),))).to(clean_logits.device).view(-1)
+        code_weight, manifest_weight, risk_weight = _source_contrast_weights(clean_extra, aug_extra, clean_logits)
         source_terms = [
             _info_nce(clean_extra["method_emb"], aug_extra["method_emb"], temperature, code_weight),
             _info_nce(clean_extra["api_family_emb"], aug_extra["api_family_emb"], temperature, code_weight),
             _info_nce(clean_extra["permission_emb"], aug_extra["permission_emb"], temperature, manifest_weight),
             _info_nce(clean_extra["component_emb"], aug_extra["component_emb"], temperature, manifest_weight),
-            _info_nce(clean_extra["risk_emb"], aug_extra["risk_emb"], temperature),
+            _info_nce(clean_extra["risk_emb"], aug_extra["risk_emb"], temperature, risk_weight),
         ]
         source_aug = torch.stack(source_terms).mean()
         cf_weight = _conditional_cf_weight(clean_extra, aug_extra, clean_logits)

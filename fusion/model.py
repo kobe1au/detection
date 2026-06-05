@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
-from torch_geometric.nn import global_mean_pool
 
 from fusion.constants import NUM_EDGE_TYPES, NUM_NODE_TYPES, NUM_SOURCE_TYPES, NODE_TYPES, SOURCE_TYPES
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
@@ -210,7 +209,8 @@ class AEGModel(nn.Module):
             + self.quality_proj(quality)
             + self.semantic_proj(semantic)
         )
-        return self.dropout(h)
+        alive = (quality > 0).to(dtype=h.dtype)
+        return self.dropout(h) * alive
 
     def forward(self, data: Batch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if not hasattr(data, "batch"):
@@ -220,17 +220,23 @@ class AEGModel(nn.Module):
         edge_type = data.edge_type.long().to(data.x.device)
         edge_quality = data.edge_quality.float().to(data.x.device)
         edge_source = data.edge_source.long().to(data.x.device)
+        node_alive = data.node_quality.float().to(data.x.device).view(-1, 1).clamp(0.0, 1.0)
+        node_alive_mask = (node_alive.view(-1) > 0)
+        edge_index = data.edge_index.to(data.x.device)
+        if edge_index.numel() > 0 and edge_quality.numel() == edge_index.size(1):
+            src, dst = edge_index.long()
+            edge_quality = edge_quality * node_alive.view(-1)[src] * node_alive.view(-1)[dst]
         for layer in self.layers:
-            h = layer(h, data.edge_index.to(data.x.device), edge_type, edge_source, edge_quality)
+            h = layer(h, edge_index, edge_type, edge_source, edge_quality) * node_alive
 
-        source_code = data.node_source == SOURCE_TYPES["code"]
-        source_manifest = data.node_source == SOURCE_TYPES["manifest"]
-        method_nodes = data.node_type == NODE_TYPES["METHOD"]
-        api_family_nodes = data.node_type == NODE_TYPES["API_FAMILY"]
-        permission_nodes = data.node_type == NODE_TYPES["PERMISSION"]
-        component_nodes = data.node_type == NODE_TYPES["COMPONENT"]
-        risk_nodes = data.node_type == NODE_TYPES["RISK_SEMANTIC"]
-        string_hint_nodes = data.node_type == NODE_TYPES["STRING_HINT"]
+        source_code = (data.node_source == SOURCE_TYPES["code"]) & node_alive_mask
+        source_manifest = (data.node_source == SOURCE_TYPES["manifest"]) & node_alive_mask
+        method_nodes = (data.node_type == NODE_TYPES["METHOD"]) & node_alive_mask
+        api_family_nodes = (data.node_type == NODE_TYPES["API_FAMILY"]) & node_alive_mask
+        permission_nodes = (data.node_type == NODE_TYPES["PERMISSION"]) & node_alive_mask
+        component_nodes = (data.node_type == NODE_TYPES["COMPONENT"]) & node_alive_mask
+        risk_nodes = (data.node_type == NODE_TYPES["RISK_SEMANTIC"]) & node_alive_mask
+        string_hint_nodes = (data.node_type == NODE_TYPES["STRING_HINT"]) & node_alive_mask
 
         method_emb = _masked_mean(h, method_nodes, data.batch, num_graphs)
         api_family_emb = _masked_mean(h, api_family_nodes, data.batch, num_graphs)
@@ -238,7 +244,7 @@ class AEGModel(nn.Module):
         component_emb = _masked_mean(h, component_nodes, data.batch, num_graphs)
         risk_emb = _masked_mean(h, risk_nodes, data.batch, num_graphs)
         string_hint_emb = _masked_mean(h, string_hint_nodes, data.batch, num_graphs)
-        global_emb = global_mean_pool(h, data.batch, size=num_graphs)
+        global_emb = _masked_mean(h, node_alive_mask, data.batch, num_graphs)
         code_emb = 0.5 * (method_emb + api_family_emb)
         manifest_emb = 0.5 * (permission_emb + component_emb)
 

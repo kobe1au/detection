@@ -18,7 +18,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fusion.constants import AEG_SCHEMA_VERSION  # noqa: E402
+from fusion.constants import (  # noqa: E402
+    AEG_SCHEMA_TABLE_FINGERPRINT,
+    AEG_SCHEMA_TABLES,
+    AEG_SCHEMA_VERSION,
+    stable_table_hash,
+)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -37,6 +42,57 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _sha256_text_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _build_fingerprint(cfg: dict[str, Any], vocab: dict[str, Any]) -> str:
+    source_paths = [
+        "fusion/constants.py",
+        "fusion/aeg_builder.py",
+        "fusion/manifest_features.py",
+        "fusion/semantic_categories.py",
+        "fusion/quality.py",
+        "extract/extract_graph_api.py",
+    ]
+    source_hashes = {path: _sha256_text_file(PROJECT_ROOT / path) for path in source_paths}
+    config_keys = [
+        "manifest_dim",
+        "node_feature_dim",
+        "vocab_size",
+        "sensitive_hops",
+        "max_methods_per_dex",
+        "fallback_max_methods",
+        "fallback_policy",
+        "use_graph_behavior_hints",
+        "num_api_buckets",
+        "max_api_events_per_dex",
+        "max_api_events_per_method",
+        "api_event_scope",
+        "framework_only",
+        "include_descriptor",
+        "keep_method_names",
+        "keep_api_tokens",
+    ]
+    payload = {
+        "schema_version": AEG_SCHEMA_VERSION,
+        "schema_table_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
+        "schema_tables": AEG_SCHEMA_TABLES,
+        "config": {key: cfg.get(key) for key in config_keys},
+        "manifest_vocab": {
+            "categories": vocab.get("categories") or [],
+            "permission_vocab": vocab.get("permission_vocab") or [],
+            "intent_vocab": vocab.get("intent_vocab") or [],
+            "feature_vocab": vocab.get("feature_vocab") or [],
+            "metadata": vocab.get("metadata") or {},
+        },
+        "source_hashes": source_hashes,
+    }
+    return stable_table_hash(payload)
 
 
 def _resolve_split_dirs(data: dict[str, Any], splits: list[str]) -> dict[str, Path]:
@@ -221,6 +277,19 @@ def _resume_existing(job: dict[str, str], cfg: dict[str, Any]) -> dict[str, str]
         return None
     try:
         existing = torch.load(out_path, map_location="cpu")
+        if int(existing.get("schema_version", 0)) != AEG_SCHEMA_VERSION:
+            return None
+        if existing.get("aeg_schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
+            return None
+        expected_fingerprint = str(cfg.get("build_fingerprint") or "")
+        if not expected_fingerprint or existing.get("aeg_build_fingerprint") != expected_fingerprint:
+            return None
+        meta = existing.get("aeg_meta") or {}
+        if meta.get("schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
+            return None
+        for key, expected in AEG_SCHEMA_TABLES.items():
+            if dict(meta.get(key) or {}) != expected:
+                return None
         if int(existing.get("schema_version", 0)) == AEG_SCHEMA_VERSION:
             return _index_row(job, out_path, "ok", "resume")
     except Exception:
@@ -277,6 +346,7 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
             "num_dex_success": len(dex_results),
             "dex_success_ratio": len(dex_results) / max(1, len(dex_entries)),
             "num_dex_failed": failed,
+            "aeg_build_fingerprint": cfg.get("build_fingerprint", ""),
         }
         payload = build_aeg_payload(
             sid=job["sha256"],
@@ -309,6 +379,13 @@ def run(args: argparse.Namespace) -> None:
     jobs = _collect_apks(cfg["split_dirs"], cfg["splits"], hash_files=cfg["hash_files"])
     _validate_split_counts(jobs, cfg["splits"])
     _validate_unique_hashes(jobs)
+    vocab_needs_build = cfg["rebuild_vocab"] or not cfg["vocab_path"].exists()
+    records: dict[str, dict[str, Any]] = {}
+    if vocab_needs_build:
+        records = _extract_manifest_records(jobs)
+    vocab = _build_or_load_vocab(jobs, records, cfg)
+    cfg["build_fingerprint"] = _build_fingerprint(cfg, vocab)
+
     resume_rows: list[dict[str, str]] = []
     pending_jobs: list[dict[str, str]] = []
     for job in jobs:
@@ -318,10 +395,9 @@ def run(args: argparse.Namespace) -> None:
         else:
             resume_rows.append(row)
 
-    vocab_needs_build = cfg["rebuild_vocab"] or not cfg["vocab_path"].exists()
-    manifest_jobs = jobs if vocab_needs_build else pending_jobs
-    records = _extract_manifest_records(manifest_jobs)
-    vocab = _build_or_load_vocab(jobs, records, cfg)
+    if pending_jobs:
+        pending_records = _extract_manifest_records(pending_jobs)
+        records.update(pending_records)
     rows: list[dict[str, str]] = list(resume_rows)
     ok = 0
     fail = 0

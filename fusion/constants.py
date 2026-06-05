@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-AEG_SCHEMA_VERSION = 4
+import hashlib
+import json
+
+AEG_SCHEMA_VERSION = 5
 
 
 NODE_TYPES = {
@@ -121,3 +124,18 @@ class QualityConstants:
 
     ALIGN_NODE_COVER_WEIGHT = 0.50
     ALIGN_API_COVER_WEIGHT = 0.50
+
+
+def stable_table_hash(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+AEG_SCHEMA_TABLES = {
+    "node_types": NODE_TYPES,
+    "edge_types": EDGE_TYPES,
+    "source_types": SOURCE_TYPES,
+    "view_types": VIEW_TYPES,
+}
+
+AEG_SCHEMA_TABLE_FINGERPRINT = stable_table_hash(AEG_SCHEMA_TABLES)

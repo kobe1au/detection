@@ -9,6 +9,8 @@ import torch
 
 from fusion.constants import (
     AEG_SCHEMA_VERSION,
+    AEG_SCHEMA_TABLE_FINGERPRINT,
+    AEG_SCHEMA_TABLES,
     EDGE_TYPES,
     NODE_TYPES,
     REVERSE_EDGE_TYPES,
@@ -406,6 +408,8 @@ def build_aeg_payload(
 
     return {
         "schema_version": AEG_SCHEMA_VERSION,
+        "aeg_schema_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
+        "aeg_build_fingerprint": str(direct_meta.get("aeg_build_fingerprint", "")),
         "sid": sid,
         "sha256": sid,
         "apk_name": apk_name,
@@ -444,9 +448,8 @@ def build_aeg_payload(
         "has_native": bool(hints.get("native", False)),
         "has_string_encryption_hint": bool(hints.get("crypto", False)),
         "aeg_meta": {
-            "node_types": NODE_TYPES,
-            "edge_types": EDGE_TYPES,
-            "source_types": SOURCE_TYPES,
+            **AEG_SCHEMA_TABLES,
+            "schema_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
             "num_nodes": int(graph["node_x"].size(0)),
             "num_edges": int(graph["edge_index"].size(1)),
             "node_feature_dim": int(node_feature_dim),

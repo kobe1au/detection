@@ -7,9 +7,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from fusion.aeg_builder import build_aeg_payload
-from fusion.constants import AEG_SCHEMA_VERSION, VIEW_TYPES
+from fusion.constants import AEG_SCHEMA_VERSION, EDGE_TYPES, NODE_TYPES, VIEW_TYPES
 from fusion.dataset import AEGDataset, aeg_collate_fn, payload_to_data
-from fusion.losses import compute_aeg_loss
+from fusion.losses import _source_contrast_weights, compute_aeg_loss
 from fusion.manifest_features import build_manifest_vocab, vectorize_manifest_record
 from fusion.model import AEGModel
 from fusion.perturbations import apply_aeg_view
@@ -101,6 +101,56 @@ def test_aeg_perturbation_updates_reliability():
     assert degraded.view_type_id.item() == VIEW_TYPES["api_missing"]
     assert degraded.q_api.item() == 0.0
     assert degraded.q_align.item() == 0.0
+    api_related = torch.isin(
+        degraded.edge_type,
+        torch.tensor(
+            [
+                EDGE_TYPES["METHOD_INVOKES_API_FAMILY"],
+                EDGE_TYPES["API_FAMILY_INVOKED_BY_METHOD"],
+                EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"],
+                EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
+            ],
+            dtype=torch.long,
+        ),
+    )
+    assert bool(api_related.any())
+    assert torch.all(degraded.edge_quality[api_related] == 0)
+
+
+def test_manifest_shuffle_is_type_aware(tmp_path: Path):
+    payload_a = _payload()
+    payload_b = _payload()
+    payload_b["sid"] = "b" * 64
+    payload_b["sha256"] = "b" * 64
+    data_a = payload_to_data(payload_a, label=1)
+    data_b = payload_to_data(payload_b, label=0)
+    aug = apply_aeg_view(data_a, view="manifest_shuffled", strength=1.0)
+    before_type = aug.node_type.clone()
+    batch = aeg_collate_fn([{"clean": data_a, "aug": aug}, {"clean": data_b, "aug": apply_aeg_view(data_b, view="clean", strength=0.0)}])
+    shuffled = batch["aug"].to_data_list()[0]
+    assert torch.equal(shuffled.node_type, before_type)
+    manifest_types = {NODE_TYPES["PERMISSION"], NODE_TYPES["INTENT"], NODE_TYPES["COMPONENT"]}
+    for node_type in manifest_types:
+        mask = (shuffled.node_source == 1) & (shuffled.node_type == node_type)
+        if bool(mask.any()):
+            assert torch.all(shuffled.node_type[mask] == node_type)
+
+
+def test_corrupted_source_contrast_weights_drop_untrusted_source():
+    ref = torch.zeros((2, 2))
+    clean = {
+        "code_reliability": torch.ones(2),
+        "manifest_reliability": torch.ones(2),
+    }
+    aug = {
+        "code_reliability": torch.ones(2),
+        "manifest_reliability": torch.ones(2),
+        "view_type_id": torch.full((2,), VIEW_TYPES["manifest_shuffled"], dtype=torch.long),
+    }
+    code_weight, manifest_weight, risk_weight = _source_contrast_weights(clean, aug, ref)
+    assert torch.all(code_weight == 1)
+    assert torch.all(manifest_weight == 0)
+    assert torch.all(risk_weight == 1)
 
 
 def test_aeg_config_loads():

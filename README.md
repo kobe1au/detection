@@ -15,7 +15,7 @@ extract/
   extract_graph_api.py          Reusable DEX/API/call-graph extractor
 
 fusion/
-  aeg_builder.py                Builds schema-v4 APK evidence graph payloads
+  aeg_builder.py                Builds schema-v5 APK evidence graph payloads
   constants.py                  AEG node/edge/source/view definitions
   dataset.py                    AEG Dataset and PyG batch collation
   manifest_features.py          Manifest parsing, vocab, vectorization
@@ -54,7 +54,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`.
+The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. Resume only reuses PT files whose schema table fingerprint and build fingerprint match the current extractor, Manifest vocabulary, and AEG construction code.
 
 Training uses strict CSV/PT integrity by default. If `results/labels/{train,val,test}.csv` contains ids without corresponding AEG `.pt` files, or a PT folder contains extra samples not in its CSV, training fails instead of silently changing the split size.
 

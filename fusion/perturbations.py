@@ -6,6 +6,42 @@ from torch_geometric.data import Data
 from fusion.constants import EDGE_TYPES, NODE_TYPES, SOURCE_TYPES, VIEW_TYPES
 
 
+API_EDGE_TYPES = {
+    EDGE_TYPES["METHOD_INVOKES_API_FAMILY"],
+    EDGE_TYPES["API_FAMILY_INVOKED_BY_METHOD"],
+    EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"],
+    EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
+}
+
+GRAPH_EDGE_TYPES = {
+    EDGE_TYPES["APK_HAS_METHOD"],
+    EDGE_TYPES["METHOD_IN_APK"],
+    EDGE_TYPES["METHOD_CALLS_METHOD"],
+    EDGE_TYPES["METHOD_CALLED_BY_METHOD"],
+    EDGE_TYPES["COMPONENT_MATCHES_METHOD"],
+    EDGE_TYPES["METHOD_MATCHES_COMPONENT"],
+    EDGE_TYPES["METHOD_HAS_RISK"],
+    EDGE_TYPES["RISK_OBSERVED_IN_METHOD"],
+    EDGE_TYPES["METHOD_HAS_STRING_HINT"],
+    EDGE_TYPES["STRING_HINT_IN_METHOD"],
+}
+
+MANIFEST_EDGE_TYPES = {
+    EDGE_TYPES["APK_REQUESTS_PERMISSION"],
+    EDGE_TYPES["PERMISSION_REQUESTED_BY_APK"],
+    EDGE_TYPES["APK_HAS_COMPONENT"],
+    EDGE_TYPES["COMPONENT_IN_APK"],
+    EDGE_TYPES["COMPONENT_DECLARES_INTENT"],
+    EDGE_TYPES["INTENT_DECLARED_BY_COMPONENT"],
+    EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"],
+    EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
+    EDGE_TYPES["COMPONENT_MATCHES_METHOD"],
+    EDGE_TYPES["METHOD_MATCHES_COMPONENT"],
+    EDGE_TYPES["MANIFEST_HAS_RISK"],
+    EDGE_TYPES["RISK_DECLARED_BY_MANIFEST"],
+}
+
+
 def _clamp_strength(value: float) -> float:
     return float(max(0.0, min(1.0, value)))
 
@@ -71,7 +107,7 @@ def _refresh_align_after_code_perturb(data: Data) -> None:
 
 def _degrade_api(data: Data, strength: float, *, missing: bool = False) -> None:
     api_nodes = _node_mask(data, node_types={NODE_TYPES["API_FAMILY"]})
-    api_edges = _edge_mask(data, edge_types={EDGE_TYPES["METHOD_INVOKES_API_FAMILY"], EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"]})
+    api_edges = _edge_mask(data, edge_types=API_EDGE_TYPES)
     _soft_degrade_nodes(data, api_nodes, strength, zero=missing)
     _soft_degrade_edges(data, api_edges, strength, zero=missing)
     _set_scalar(data, "q_api", 0.0 if missing else float(data.q_api.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
@@ -80,16 +116,7 @@ def _degrade_api(data: Data, strength: float, *, missing: bool = False) -> None:
 
 def _degrade_graph(data: Data, strength: float, *, missing: bool = False) -> None:
     graph_nodes = _node_mask(data, node_types={NODE_TYPES["METHOD"], NODE_TYPES["STRING_HINT"]})
-    graph_edges = _edge_mask(
-        data,
-        edge_types={
-            EDGE_TYPES["APK_HAS_METHOD"],
-            EDGE_TYPES["METHOD_CALLS_METHOD"],
-            EDGE_TYPES["COMPONENT_MATCHES_METHOD"],
-            EDGE_TYPES["METHOD_HAS_RISK"],
-            EDGE_TYPES["METHOD_HAS_STRING_HINT"],
-        },
-    )
+    graph_edges = _edge_mask(data, edge_types=GRAPH_EDGE_TYPES)
     _soft_degrade_nodes(data, graph_nodes, strength, zero=missing, noise=not missing)
     _soft_degrade_edges(data, graph_edges, strength, zero=missing)
     _set_scalar(data, "q_graph", 0.0 if missing else float(data.q_graph.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
@@ -98,7 +125,7 @@ def _degrade_graph(data: Data, strength: float, *, missing: bool = False) -> Non
 
 def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noisy: bool = False) -> None:
     manifest_nodes = _node_mask(data, sources={SOURCE_TYPES["manifest"]})
-    manifest_edges = _edge_mask(data, sources={SOURCE_TYPES["manifest"]})
+    manifest_edges = _edge_mask(data, edge_types=MANIFEST_EDGE_TYPES, sources={SOURCE_TYPES["manifest"]})
     _soft_degrade_nodes(data, manifest_nodes, strength, zero=missing, noise=noisy)
     _soft_degrade_edges(data, manifest_edges, strength, zero=missing)
     _set_scalar(data, "q_manifest", 0.0 if missing else float(data.q_manifest.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
