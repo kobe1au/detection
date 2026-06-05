@@ -5,6 +5,7 @@ import copy
 import csv
 import json
 import logging
+import math
 import os
 import random
 from pathlib import Path
@@ -30,10 +31,20 @@ from fusion.dataset import (
     robust_collate_fn,
 )
 from fusion.model import TriModalRobustModel
+from fusion.perturbations import EVAL_PERTURB_TYPES
 from fusion.utils import build_grad_scaler, get_amp_context
 
 
 logger = logging.getLogger("tri_modal_robust")
+
+DEFAULT_ROBUST_VAL_SCENARIOS = (
+    {"name": "api_graph_degraded_s0.5", "perturb_type": "api_graph_degraded", "strength": 0.5, "weight": 0.25},
+    {"name": "manifest_degraded_s0.5", "perturb_type": "manifest_degraded", "strength": 0.5, "weight": 0.15},
+    {"name": "all_degraded_s0.5", "perturb_type": "all_degraded", "strength": 0.5, "weight": 0.10},
+    {"name": "api_missing", "perturb_type": "api_missing", "strength": 1.0, "weight": 1.0 / 30.0},
+    {"name": "graph_missing", "perturb_type": "graph_missing", "strength": 1.0, "weight": 1.0 / 30.0},
+    {"name": "manifest_missing", "perturb_type": "manifest_missing", "strength": 1.0, "weight": 1.0 / 30.0},
+)
 
 
 class EmptyExtraEvalSetError(RuntimeError):
@@ -54,6 +65,8 @@ GATE_DIAGNOSTIC_KEYS = (
     "api_graph_consistency",
     "api_manifest_consistency",
     "graph_manifest_consistency",
+    "manifest_to_code_conflict",
+    "code_to_manifest_conflict",
     "api_graph_disagreement",
     "api_confidence",
     "graph_confidence",
@@ -62,6 +75,7 @@ GATE_DIAGNOSTIC_KEYS = (
     "api_alive",
     "graph_alive",
     "manifest_alive",
+    "gate_uses_perturbation_evidence",
 )
 
 
@@ -72,6 +86,12 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def configure_determinism(enabled: bool) -> None:
+    torch.backends.cudnn.benchmark = not enabled
+    torch.backends.cudnn.deterministic = enabled
+    torch.use_deterministic_algorithms(enabled, warn_only=True)
 
 
 def select_device(value: str) -> torch.device:
@@ -100,7 +120,7 @@ def load_yaml(path: str | Path) -> dict:
 
 def load_config_path(path: str | Path, seen: set[Path] | None = None) -> dict:
     path = Path(path)
-    seen = seen or set()
+    seen = set(seen or ())
     resolved = path.resolve()
     if resolved in seen:
         raise ValueError(f"Recursive config defaults detected: {path}")
@@ -132,6 +152,58 @@ def resolve(root: str | Path, path: str | Path) -> str:
     return str(Path(root) / path)
 
 
+def _read_split_identities(csv_path: str | Path, expected_split: str) -> tuple[set[str], set[str]]:
+    ids: set[str] = set()
+    packages: set[str] = set()
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = set(reader.fieldnames or [])
+        id_col = next((name for name in ("id", "ID", "Id", "sha256") if name in fields), None)
+        pkg_col = next((name for name in ("pkg_name", "package_name", "package") if name in fields), None)
+        if id_col is None:
+            raise ValueError(f"CSV {csv_path} must contain id or sha256")
+        for row_idx, row in enumerate(reader, start=2):
+            sid = str(row.get(id_col, "") or "").strip().lower()
+            if not sid:
+                raise ValueError(f"CSV {csv_path} has empty {id_col} at row {row_idx}")
+            ids.add(sid)
+            if "split" in fields:
+                split_value = str(row.get("split", "") or "").strip().lower()
+                if split_value and split_value != expected_split:
+                    raise ValueError(
+                        f"CSV {csv_path} row {row_idx} declares split={split_value!r}, "
+                        f"expected {expected_split!r}"
+                    )
+            if pkg_col is not None:
+                package = str(row.get(pkg_col, "") or "").strip().lower()
+                if package and package not in {"nan", "none", "null"}:
+                    packages.add(package)
+    return ids, packages
+
+
+def validate_split_partitions(cfg: dict, include_test: bool) -> None:
+    data_cfg = cfg.get("data", {})
+    if not bool(data_cfg.get("strict_partition_isolation", True)):
+        return
+    data_root = data_cfg.get("root", "")
+    split_names = ["train", "val"] + (["test"] if include_test else [])
+    identities: dict[str, tuple[set[str], set[str]]] = {}
+    for split in split_names:
+        csv_path = resolve(data_root, data_cfg[f"{split}_csv"])
+        identities[split] = _read_split_identities(csv_path, split)
+
+    for i, left in enumerate(split_names):
+        for right in split_names[i + 1 :]:
+            id_overlap = sorted(identities[left][0] & identities[right][0])
+            pkg_overlap = sorted(identities[left][1] & identities[right][1])
+            if id_overlap or pkg_overlap:
+                raise ValueError(
+                    f"Split leakage between {left} and {right}: "
+                    f"id_overlap={len(id_overlap)} examples={id_overlap[:10]}; "
+                    f"package_overlap={len(pkg_overlap)} examples={pkg_overlap[:10]}"
+                )
+
+
 def _dataset_common_kwargs(
     cfg: dict,
     is_train: bool,
@@ -161,6 +233,7 @@ def _dataset_common_kwargs(
         "graph_semantic_source": str(data_cfg.get("graph_semantic_source", "alignment")),
         "num_classes": int(model_cfg.get("num_classes", 2)),
         "label_map": data_cfg.get("label_map"),
+        "strict_split_integrity": bool(data_cfg.get("strict_split_integrity", True)),
     }
 
 
@@ -207,13 +280,21 @@ def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | Non
 
 def build_loader(cfg: dict, dataset, is_train: bool):
     train_cfg = cfg["train"]
-    workers = int(train_cfg.get("num_workers", 0))
+    worker_key = "num_workers" if is_train else "eval_num_workers"
+    workers = int(train_cfg.get(worker_key, train_cfg.get("num_workers", 0)))
+    pin_memory = bool(train_cfg.get("pin_memory", False))
+    if pin_memory and not bool(train_cfg.get("allow_pyg_pin_memory", False)):
+        logger.warning(
+            "train.pin_memory=true is unsafe for PyG Data/Batch on some CUDA runtimes; "
+            "forcing pin_memory=false. Set train.allow_pyg_pin_memory=true to override."
+        )
+        pin_memory = False
     return DataLoader(
         dataset,
         batch_size=int(train_cfg.get("batch_size" if is_train else "eval_batch_size", train_cfg.get("batch_size", 32))),
         shuffle=is_train,
         num_workers=workers,
-        pin_memory=bool(train_cfg.get("pin_memory", False)),
+        pin_memory=pin_memory,
         persistent_workers=bool(train_cfg.get("persistent_workers", False)) and workers > 0,
         collate_fn=robust_collate_fn,
     )
@@ -238,6 +319,116 @@ def enforce_failed_ratio(
             f"{split_name}: failed sample ratio {failed_ratio:.4f} exceeds "
             f"data.max_failed_ratio={max_failed_ratio:.4f}"
         )
+
+
+def _normalize_robust_val_scenarios(raw: Any) -> list[dict[str, Any]]:
+    scenarios = list(DEFAULT_ROBUST_VAL_SCENARIOS) if raw is None else raw
+    if not isinstance(scenarios, list):
+        raise ValueError("eval.robust_val.scenarios must be a list")
+    out: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for idx, item in enumerate(scenarios):
+        if not isinstance(item, dict):
+            raise ValueError(f"eval.robust_val.scenarios[{idx}] must be a mapping")
+        perturb_type = str(item.get("perturb_type") or "").strip()
+        if not perturb_type or perturb_type == "clean":
+            raise ValueError(f"eval.robust_val.scenarios[{idx}] requires a non-clean perturb_type")
+        if perturb_type not in EVAL_PERTURB_TYPES:
+            raise ValueError(
+                f"eval.robust_val.scenarios[{idx}] has unsupported perturb_type={perturb_type!r}"
+            )
+        strength = float(item.get("strength", 0.5))
+        weight = float(item.get("weight", 0.0))
+        if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
+            raise ValueError(f"eval.robust_val.scenarios[{idx}].strength must be within [0, 1]")
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(f"eval.robust_val.scenarios[{idx}].weight must be non-negative")
+        name = str(item.get("name") or f"{perturb_type}_s{strength:g}").strip()
+        if not name:
+            raise ValueError(f"eval.robust_val.scenarios[{idx}].name must not be empty")
+        if name in names:
+            raise ValueError(f"Duplicate eval.robust_val scenario name: {name}")
+        names.add(name)
+        out.append(
+            {
+                "name": name,
+                "perturb_type": perturb_type,
+                "strength": strength,
+                "weight": weight,
+            }
+        )
+    if not out:
+        raise ValueError("eval.robust_val.scenarios must not be empty")
+    return out
+
+
+def build_robust_val_loaders(cfg: dict) -> list[dict[str, Any]]:
+    robust_val_cfg = cfg.get("eval", {}).get("robust_val", {}) or {}
+    if not bool(robust_val_cfg.get("enabled", False)):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in _normalize_robust_val_scenarios(robust_val_cfg.get("scenarios")):
+        dataset = build_dataset(
+            cfg,
+            "val",
+            is_train=False,
+            perturb_type=item["perturb_type"],
+            perturb_strength=item["strength"],
+        )
+        out.append({**item, "loader": build_loader(cfg, dataset, is_train=False)})
+    return out
+
+
+@torch.no_grad()
+def evaluate_robust_validation(
+    model,
+    loaders: list[dict[str, Any]],
+    device,
+    use_amp: bool,
+    cfg: dict,
+) -> dict[str, dict[str, float]]:
+    results: dict[str, dict[str, float]] = {}
+    for item in loaders:
+        name = str(item["name"])
+        metrics, _ = evaluate(model, item["loader"], device, use_amp, f"val_{name}", dump_rows=False)
+        enforce_failed_ratio(metrics, cfg, f"val_{name}")
+        results[name] = metrics
+    return results
+
+
+def checkpoint_score(
+    cfg: dict,
+    clean_metrics: dict[str, float],
+    robust_metrics: dict[str, dict[str, float]],
+    robust_val_loaders: list[dict[str, Any]],
+) -> tuple[float, str]:
+    metric_name = str(cfg.get("train", {}).get("checkpoint_metric", "clean_macro_f1")).strip().lower()
+    clean_f1 = float(clean_metrics["macro_f1"])
+    if metric_name in {"clean", "clean_macro_f1", "macro_f1", "val_macro_f1"}:
+        return clean_f1, "clean_macro_f1"
+    if metric_name != "robust_composite":
+        raise ValueError(f"Unsupported train.checkpoint_metric: {metric_name}")
+    if not robust_val_loaders:
+        raise ValueError("train.checkpoint_metric=robust_composite requires eval.robust_val.enabled=true")
+
+    robust_val_cfg = cfg.get("eval", {}).get("robust_val", {}) or {}
+    clean_weight = float(robust_val_cfg.get("clean_weight", 0.4))
+    if not math.isfinite(clean_weight) or clean_weight < 0.0:
+        raise ValueError("eval.robust_val.clean_weight must be non-negative")
+    weighted_sum = clean_weight * clean_f1
+    weight_sum = clean_weight
+    for item in robust_val_loaders:
+        weight = float(item["weight"])
+        if weight <= 0.0:
+            continue
+        name = str(item["name"])
+        if name not in robust_metrics:
+            raise KeyError(f"Missing robust validation metrics for scenario: {name}")
+        weighted_sum += weight * float(robust_metrics[name]["macro_f1"])
+        weight_sum += weight
+    if weight_sum <= 0.0:
+        raise ValueError("Robust validation composite weights must sum to a positive value")
+    return weighted_sum / weight_sum, "robust_composite"
 
 
 def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
@@ -273,6 +464,10 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         joint_emb_dim=int(model_cfg.get("joint_emb_dim", 128)),
         gate_hidden_dim=int(gate_cfg.get("hidden_dim", 128)),
         gate_detach=bool(gate_cfg.get("detach", True)),
+        use_consistency_evidence=bool(gate_cfg.get("use_consistency_evidence", True)),
+        use_conflict_evidence=bool(gate_cfg.get("use_conflict_evidence", True)),
+        use_perturbation_evidence=bool(gate_cfg.get("use_perturbation_evidence", False)),
+        apply_alive_mask_to_learned_gate=bool(gate_cfg.get("apply_alive_mask", True)),
     )
 
 
@@ -463,17 +658,45 @@ def run(cfg: dict) -> dict[str, Any]:
     logging.basicConfig(level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO))
     train_cfg = cfg["train"]
     data_cfg = cfg["data"]
+    eval_cfg = cfg.get("eval", {})
     seed = int(train_cfg.get("seed", 42))
     set_seed(seed)
+    configure_determinism(bool(train_cfg.get("deterministic", False)))
     device = select_device(str(train_cfg.get("device", "auto")))
     use_amp = bool(train_cfg.get("use_amp", True))
+    run_test = bool(eval_cfg.get("run_test", True))
+    run_robust_test = bool(eval_cfg.get("run_robust_test", True))
+    tuning_mode = bool(train_cfg.get("tuning_mode", False))
+    gate_cfg = cfg.get("model", {}).get("gate", {}) or {}
+    if bool(gate_cfg.get("use_perturbation_evidence", False)) and not bool(
+        gate_cfg.get("oracle_perturbation_ablation", False)
+    ):
+        raise ValueError(
+            "model.gate.use_perturbation_evidence=true exposes synthetic perturbation strength to the gate. "
+            "Set model.gate.oracle_perturbation_ablation=true only for an explicitly labelled oracle ablation."
+        )
+    if run_robust_test and not run_test:
+        raise ValueError("eval.run_robust_test=true requires eval.run_test=true")
+    if tuning_mode:
+        if run_test or run_robust_test:
+            raise ValueError("train.tuning_mode=true forbids test evaluation")
+        if _normalize_extra_eval_sets(eval_cfg.get("extra_sets")):
+            raise ValueError("train.tuning_mode=true forbids eval.extra_sets")
+        if not bool((eval_cfg.get("robust_val", {}) or {}).get("enabled", False)):
+            raise ValueError("train.tuning_mode=true requires eval.robust_val.enabled=true")
+        if str(train_cfg.get("checkpoint_metric", "")).strip().lower() != "robust_composite":
+            raise ValueError("train.tuning_mode=true requires train.checkpoint_metric=robust_composite")
 
+    validate_split_partitions(cfg, include_test=run_test)
     train_ds = build_dataset(cfg, "train", is_train=True)
     val_ds = build_dataset(cfg, "val", is_train=False)
-    test_ds = build_dataset(cfg, "test", is_train=False)
     train_loader = build_loader(cfg, train_ds, is_train=True)
     val_loader = build_loader(cfg, val_ds, is_train=False)
-    test_loader = build_loader(cfg, test_ds, is_train=False)
+    robust_val_loaders = build_robust_val_loaders(cfg)
+    test_loader = None
+    if run_test:
+        test_ds = build_dataset(cfg, "test", is_train=False)
+        test_loader = build_loader(cfg, test_ds, is_train=False)
 
     model = build_model(cfg, train_ds.feature_dim).to(device)
     optimizer = torch.optim.AdamW(
@@ -490,7 +713,11 @@ def run(cfg: dict) -> dict[str, Any]:
 
     out_dir = Path(data_cfg.get("out_dir", "experiments")) / str(train_cfg.get("exp_name", "tri_modal_robust")) / str(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
-    best_f1 = -1.0
+    with open(out_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    best_score = -1.0
+    best_val_f1 = -1.0
+    checkpoint_metric_name = ""
     best_path = out_dir / "best_tri_modal_robust.pt"
     patience = int(train_cfg.get("patience", 10))
     stale = 0
@@ -499,19 +726,39 @@ def run(cfg: dict) -> dict[str, Any]:
         train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch)
         val_metrics, _ = evaluate(model, val_loader, device, use_amp, "val", dump_rows=False)
         enforce_failed_ratio(val_metrics, cfg, "val")
+        val_robust_metrics = evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
+        score, checkpoint_metric_name = checkpoint_score(
+            cfg,
+            val_metrics,
+            val_robust_metrics,
+            robust_val_loaders,
+        )
         scheduler.step()
         logger.info(
-            "epoch=%s train_loss=%.4f val_macro_f1=%.4f val_auc=%.4f val_acc=%.4f",
+            "epoch=%s train_loss=%.4f val_macro_f1=%.4f val_auc=%.4f val_acc=%.4f checkpoint_score=%.4f",
             epoch,
             train_loss,
             val_metrics["f1"],
             val_metrics["auc"],
             val_metrics["acc"],
+            score,
         )
-        if val_metrics["f1"] > best_f1 + float(train_cfg.get("min_delta", 1e-4)):
-            best_f1 = val_metrics["f1"]
+        if score > best_score + float(train_cfg.get("min_delta", 1e-4)):
+            best_score = score
+            best_val_f1 = float(val_metrics["macro_f1"])
             stale = 0
-            torch.save({"model": model.state_dict(), "cfg": cfg, "val": val_metrics, "epoch": epoch}, best_path)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "cfg": cfg,
+                    "val": val_metrics,
+                    "val_robust": val_robust_metrics,
+                    "checkpoint_score": score,
+                    "checkpoint_metric": checkpoint_metric_name,
+                    "epoch": epoch,
+                },
+                best_path,
+            )
         else:
             stale += 1
             if stale >= patience:
@@ -522,31 +769,37 @@ def run(cfg: dict) -> dict[str, Any]:
         model.load_state_dict(ckpt["model"])
 
     val_metrics, val_rows = evaluate(model, val_loader, device, use_amp, "val_clean", dump_rows=True)
-    test_metrics, test_rows = evaluate(model, test_loader, device, use_amp, "test_clean", dump_rows=True)
     enforce_failed_ratio(val_metrics, cfg, "val_clean")
-    enforce_failed_ratio(test_metrics, cfg, "test_clean")
+    val_robust_results = evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
+
+    test_metrics: dict[str, Any] = {}
+    test_rows: list[dict[str, Any]] = []
+    robust_results: dict[str, Any] = {}
+    if run_test:
+        assert test_loader is not None
+        test_metrics, test_rows = evaluate(model, test_loader, device, use_amp, "test_clean", dump_rows=True)
+        enforce_failed_ratio(test_metrics, cfg, "test_clean")
+        if run_robust_test:
+            perturb_tests = list(eval_cfg.get("perturb_tests", ["clean"]))
+            if eval_cfg.get("perturb_strengths") is not None:
+                perturb_strengths = [float(v) for v in eval_cfg.get("perturb_strengths") or []]
+            else:
+                perturb_strengths = [float(eval_cfg.get("perturb_strength", 0.5))]
+            perturb_strengths = perturb_strengths or [0.5]
+            for perturb in perturb_tests:
+                if perturb == "clean":
+                    robust_results[perturb] = test_metrics
+                    continue
+                for strength in perturb_strengths:
+                    result_key = perturb if len(perturb_strengths) == 1 else f"{perturb}_s{strength:g}"
+                    robust_ds = build_dataset(cfg, "test", is_train=False, perturb_type=perturb, perturb_strength=strength)
+                    robust_loader = build_loader(cfg, robust_ds, is_train=False)
+                    metrics, rows = evaluate(model, robust_loader, device, use_amp, f"test_{result_key}", dump_rows=True)
+                    enforce_failed_ratio(metrics, cfg, f"test_{result_key}")
+                    robust_results[result_key] = metrics
+                    test_rows.extend(rows)
 
     all_rows = val_rows + test_rows
-    robust_results = {}
-    eval_cfg = cfg.get("eval", {})
-    perturb_tests = list(eval_cfg.get("perturb_tests", ["clean"]))
-    if eval_cfg.get("perturb_strengths") is not None:
-        perturb_strengths = [float(v) for v in eval_cfg.get("perturb_strengths") or []]
-    else:
-        perturb_strengths = [float(eval_cfg.get("perturb_strength", 0.5))]
-    perturb_strengths = perturb_strengths or [0.5]
-    for perturb in perturb_tests:
-        if perturb == "clean":
-            robust_results[perturb] = test_metrics
-            continue
-        for strength in perturb_strengths:
-            result_key = perturb if len(perturb_strengths) == 1 else f"{perturb}_s{strength:g}"
-            robust_ds = build_dataset(cfg, "test", is_train=False, perturb_type=perturb, perturb_strength=strength)
-            robust_loader = build_loader(cfg, robust_ds, is_train=False)
-            metrics, rows = evaluate(model, robust_loader, device, use_amp, f"test_{result_key}", dump_rows=True)
-            enforce_failed_ratio(metrics, cfg, f"test_{result_key}")
-            robust_results[result_key] = metrics
-            all_rows.extend(rows)
 
     extra_results = {}
     extra_rows: list[dict[str, Any]] = []
@@ -594,10 +847,12 @@ def run(cfg: dict) -> dict[str, Any]:
     if extra_results:
         _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
     summary = {
-        "best_val_f1": best_f1,
-        "best_val_macro_f1": best_f1,
-        "checkpoint_metric": "macro_f1",
+        "best_checkpoint_score": best_score,
+        "best_val_f1": best_val_f1,
+        "best_val_macro_f1": best_val_f1,
+        "checkpoint_metric": checkpoint_metric_name,
         "val": val_metrics,
+        "val_robust": val_robust_results,
         "test": test_metrics,
         "robust": robust_results,
         "extra_eval": extra_results,

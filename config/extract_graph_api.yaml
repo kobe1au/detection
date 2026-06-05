@@ -46,7 +46,7 @@ storage:
   keep_api_tokens: false
 
 execution:
-  workers: 4
+  workers: 8
   # Graph-Lite changed call_x from 515 to 519 dims. Keep this false when
   # regenerating a dataset, or write to a fresh out_root, to avoid mixing
   # old 515-dim .pt files with new 519-dim .pt files.

@@ -22,8 +22,8 @@ TRI_MODAL_FUSION_MODES = {
     "tri_modal_concat",
     "tri_modal_fixed_gate",
     "tri_modal_reliability_gate",
+    "tri_modal_confidence_gate",
     "tri_modal_ours",
-    "tri_modal_full_soft_consistency",
 }
 
 
@@ -211,7 +211,7 @@ class ManifestEncoder(nn.Module):
 class FourBranchEvidenceGate(nn.Module):
     """Evidence-only four-way gate for API, Graph, Manifest, and Joint branches."""
 
-    def __init__(self, evidence_dim: int = 20, hidden_dim: int | None = None):
+    def __init__(self, evidence_dim: int = 17, hidden_dim: int | None = None):
         super().__init__()
         hidden_dim = hidden_dim or ArchitectureConstants.GATE_HIDDEN_DIM
         self.evidence_dim = int(evidence_dim)
@@ -259,6 +259,10 @@ class TriModalRobustModel(nn.Module):
         joint_emb_dim: int = 128,
         gate_hidden_dim: int = 128,
         gate_detach: bool = True,
+        use_consistency_evidence: bool = True,
+        use_conflict_evidence: bool = True,
+        use_perturbation_evidence: bool = False,
+        apply_alive_mask_to_learned_gate: bool = True,
     ):
         super().__init__()
         # Defensive check: ensure DEFAULT_API_TYPE_ID_TO_CATEGORY stays
@@ -276,6 +280,10 @@ class TriModalRobustModel(nn.Module):
         self.manifest_emb_dim = int(manifest_emb_dim)
         self.joint_emb_dim = int(joint_emb_dim)
         self.gate_detach = bool(gate_detach)
+        self.use_consistency_evidence = bool(use_consistency_evidence)
+        self.use_conflict_evidence = bool(use_conflict_evidence)
+        self.use_perturbation_evidence = bool(use_perturbation_evidence)
+        self.apply_alive_mask_to_learned_gate = bool(apply_alive_mask_to_learned_gate)
 
         self.api_encoder = ApiSequenceEncoder(
             num_hash_buckets=api_num_hash_buckets,
@@ -345,7 +353,10 @@ class TriModalRobustModel(nn.Module):
         self.manifest_semantic_head = nn.Linear(manifest_emb_dim, SEMANTIC_CATEGORY_DIM)
         self.api_graph_concat_head = build_main_head(api_emb_dim + graph_emb_dim, num_classes)
         self.tri_concat_head = build_main_head(api_emb_dim + graph_emb_dim + manifest_emb_dim, num_classes)
-        self.gate_net = FourBranchEvidenceGate(evidence_dim=20, hidden_dim=gate_hidden_dim)
+        self.gate_net = FourBranchEvidenceGate(
+            evidence_dim=20 if self.use_perturbation_evidence else 17,
+            hidden_dim=gate_hidden_dim,
+        )
 
     @staticmethod
     def _scalar_attr(graph_data, name: str, batch_size: int, device, dtype, default: float) -> torch.Tensor:
@@ -429,6 +440,24 @@ class TriModalRobustModel(nn.Module):
         sim = F.cosine_similarity(a.float(), b.float(), dim=-1).view(-1, 1).clamp(0.0, 1.0)
         return torch.where(valid, sim, torch.zeros_like(sim))
 
+    @staticmethod
+    def _directional_semantic_conflicts(
+        api_counts: torch.Tensor,
+        graph_counts: torch.Tensor,
+        manifest_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        api = api_counts.float().clamp_min(0.0)
+        graph = graph_counts.float().clamp_min(0.0)
+        manifest = manifest_counts.float().clamp_min(0.0)
+        code = torch.maximum(api, graph)
+        valid = (code.sum(dim=-1, keepdim=True) > 0) & (manifest.sum(dim=-1, keepdim=True) > 0)
+        code = code / code.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        manifest = manifest / manifest.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        manifest_to_code = (manifest - code).clamp_min(0.0).sum(dim=-1, keepdim=True)
+        code_to_manifest = (code - manifest).clamp_min(0.0).sum(dim=-1, keepdim=True)
+        zero = torch.zeros_like(manifest_to_code)
+        return torch.where(valid, manifest_to_code, zero), torch.where(valid, code_to_manifest, zero)
+
     def _encode_api(self, graph_data, batch_size: int, device, dtype):
         _, pooled, _ = self.api_encoder(graph_data, batch_size, device, dtype)
         return pooled
@@ -456,9 +485,18 @@ class TriModalRobustModel(nn.Module):
         pert_graph = self._scalar_attr(graph_data, "pert_graph", batch_size, device, dtype, 0.0)
         pert_manifest = self._scalar_attr(graph_data, "pert_manifest", batch_size, device, dtype, 1.0)
 
-        r_api = (q_api * (1.0 - pert_api)).clamp(0.0, 1.0)
-        r_graph = (q_graph * (1.0 - pert_graph)).clamp(0.0, 1.0)
-        r_manifest = (q_manifest * (1.0 - pert_manifest)).clamp(0.0, 1.0)
+        # Synthetic perturbation strength is oracle metadata and is unavailable
+        # for naturally corrupted APKs. The main method therefore derives
+        # reliability from observable post-extraction quality only. An explicit
+        # oracle ablation can opt into perturbation evidence.
+        if self.use_perturbation_evidence:
+            r_api = (q_api * (1.0 - pert_api)).clamp(0.0, 1.0)
+            r_graph = (q_graph * (1.0 - pert_graph)).clamp(0.0, 1.0)
+            r_manifest = (q_manifest * (1.0 - pert_manifest)).clamp(0.0, 1.0)
+        else:
+            r_api = q_api
+            r_graph = q_graph
+            r_manifest = q_manifest
 
         api_conf = self._confidence(api_logits).to(dtype=dtype)
         graph_conf = self._confidence(graph_logits).to(dtype=dtype)
@@ -478,6 +516,23 @@ class TriModalRobustModel(nn.Module):
         api_graph_consistency = torch.where(graph_missing_counts, q_align, api_graph_consistency).clamp(0.0, 1.0)
         api_manifest_consistency = self._cosine_counts(api_counts, manifest_counts)
         graph_manifest_consistency = self._cosine_counts(graph_counts, manifest_counts)
+        manifest_to_code_conflict, code_to_manifest_conflict = self._directional_semantic_conflicts(
+            api_counts,
+            graph_counts,
+            manifest_counts,
+        )
+        evidence_api_graph_consistency = api_graph_consistency
+        evidence_api_manifest_consistency = api_manifest_consistency
+        evidence_graph_manifest_consistency = graph_manifest_consistency
+        evidence_manifest_to_code_conflict = manifest_to_code_conflict
+        evidence_code_to_manifest_conflict = code_to_manifest_conflict
+        if not self.use_consistency_evidence:
+            evidence_api_graph_consistency = torch.zeros_like(api_graph_consistency)
+            evidence_api_manifest_consistency = torch.zeros_like(api_manifest_consistency)
+            evidence_graph_manifest_consistency = torch.zeros_like(graph_manifest_consistency)
+        if not self.use_conflict_evidence:
+            evidence_manifest_to_code_conflict = torch.zeros_like(manifest_to_code_conflict)
+            evidence_code_to_manifest_conflict = torch.zeros_like(code_to_manifest_conflict)
 
         api_graph_disagreement = self._prob_disagreement(api_logits, graph_logits).to(dtype=dtype)
         api_alive = self._modality_alive(api_emb).to(dtype=dtype) * (q_api > 0.0).to(dtype=dtype)
@@ -489,13 +544,7 @@ class TriModalRobustModel(nn.Module):
 
         evidence = torch.cat(
             [
-                q_api,
-                q_graph,
-                q_manifest,
                 q_align,
-                pert_api,
-                pert_graph,
-                pert_manifest,
                 r_api,
                 r_graph,
                 r_manifest,
@@ -504,14 +553,19 @@ class TriModalRobustModel(nn.Module):
                 manifest_conf,
                 joint_conf,
                 api_graph_disagreement,
-                api_manifest_consistency,
-                graph_manifest_consistency,
+                evidence_api_graph_consistency,
+                evidence_api_manifest_consistency,
+                evidence_graph_manifest_consistency,
                 api_alive,
                 graph_alive,
                 manifest_alive,
+                evidence_manifest_to_code_conflict,
+                evidence_code_to_manifest_conflict,
             ],
             dim=-1,
         )
+        if self.use_perturbation_evidence:
+            evidence = torch.cat([evidence, pert_api, pert_graph, pert_manifest], dim=-1)
         diagnostics = {
             "q_api": q_api.detach().view(batch_size),
             "q_graph": q_graph.detach().view(batch_size),
@@ -531,6 +585,8 @@ class TriModalRobustModel(nn.Module):
             "api_graph_consistency": api_graph_consistency.detach().view(batch_size),
             "api_manifest_consistency": api_manifest_consistency.detach().view(batch_size),
             "graph_manifest_consistency": graph_manifest_consistency.detach().view(batch_size),
+            "manifest_to_code_conflict": manifest_to_code_conflict.detach().view(batch_size),
+            "code_to_manifest_conflict": code_to_manifest_conflict.detach().view(batch_size),
             "api_semantic_category_counts": api_counts.detach(),
             "graph_semantic_category_counts": graph_counts.detach(),
             "manifest_category_counts": manifest_counts.detach(),
@@ -539,31 +595,46 @@ class TriModalRobustModel(nn.Module):
             "api_alive": api_alive.detach().view(batch_size),
             "graph_alive": graph_alive.detach().view(batch_size),
             "manifest_alive": manifest_alive.detach().view(batch_size),
+            "gate_uses_perturbation_evidence": torch.full(
+                (batch_size,),
+                float(self.use_perturbation_evidence),
+                device=device,
+                dtype=dtype,
+            ),
         }
         return evidence, diagnostics
 
     @staticmethod
     def _heuristic_reliability_gate(evidence: torch.Tensor) -> torch.Tensor:
-        r_api = evidence[:, 7:8]
-        r_graph = evidence[:, 8:9]
-        r_manifest = evidence[:, 9:10]
-        api_manifest = evidence[:, 15:16]
-        graph_manifest = evidence[:, 16:17]
-        api_alive = evidence[:, 17:18]
-        graph_alive = evidence[:, 18:19]
-        manifest_alive = evidence[:, 19:20]
-        manifest_joint_factor = 0.5 + 0.5 * r_manifest
+        r_api = evidence[:, 1:2]
+        r_graph = evidence[:, 2:3]
+        r_manifest = evidence[:, 3:4]
+        api_graph = evidence[:, 9:10]
+        api_manifest = evidence[:, 10:11]
+        graph_manifest = evidence[:, 11:12]
+        api_alive = evidence[:, 12:13]
+        graph_alive = evidence[:, 13:14]
+        manifest_alive = evidence[:, 14:15]
+        alive_sum = (api_alive + graph_alive + manifest_alive).clamp_min(1.0)
+        reliability_support = (
+            r_api * api_alive + r_graph * graph_alive + r_manifest * manifest_alive
+        ) / alive_sum
+        pair_support = api_alive * graph_alive + api_alive * manifest_alive + graph_alive * manifest_alive
+        pair_consistency = (
+            api_graph * api_alive * graph_alive
+            + api_manifest * api_alive * manifest_alive
+            + graph_manifest * graph_alive * manifest_alive
+        ) / pair_support.clamp_min(1.0)
         joint_score = (
-            (r_api * r_graph).sqrt()
-            * (0.5 + 0.25 * api_manifest + 0.25 * graph_manifest)
-            * manifest_joint_factor
+            reliability_support.square() * (0.5 + 0.5 * pair_consistency)
         ).clamp(0.0, 1.0)
+        joint_availability = (alive_sum / 3.0).clamp(0.0, 1.0)
         scores = torch.cat(
             [
                 r_api * api_alive,
                 r_graph * graph_alive,
                 r_manifest * manifest_alive,
-                joint_score * api_alive.clamp_min(0.25) * graph_alive.clamp_min(0.25),
+                joint_score * joint_availability,
             ],
             dim=-1,
         )
@@ -571,6 +642,34 @@ class TriModalRobustModel(nn.Module):
         normalized = scores / denom.clamp_min(1e-8)
         fallback = torch.full_like(scores, 0.25)
         return torch.where(denom > 1e-8, normalized, fallback)
+
+    @staticmethod
+    def _confidence_gate(evidence: torch.Tensor) -> torch.Tensor:
+        scores = torch.cat(
+            [
+                evidence[:, 4:5],
+                evidence[:, 5:6],
+                evidence[:, 6:7],
+                evidence[:, 7:8],
+            ],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+        denom = scores.sum(dim=-1, keepdim=True)
+        normalized = scores / denom.clamp_min(1e-8)
+        fallback = torch.full_like(scores, 0.25)
+        return torch.where(denom > 1e-8, normalized, fallback)
+
+    @staticmethod
+    def _apply_alive_mask(gate_weights: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
+        api_alive = evidence[:, 12:13].clamp(0.0, 1.0)
+        graph_alive = evidence[:, 13:14].clamp(0.0, 1.0)
+        manifest_alive = evidence[:, 14:15].clamp(0.0, 1.0)
+        joint_alive = torch.maximum(torch.maximum(api_alive, graph_alive), manifest_alive)
+        support = torch.cat([api_alive, graph_alive, manifest_alive, joint_alive], dim=-1)
+        masked = gate_weights * support
+        denom = masked.sum(dim=-1, keepdim=True)
+        fallback = torch.full_like(masked, 0.25)
+        return torch.where(denom > 1e-8, masked / denom.clamp_min(1e-8), fallback)
 
     def forward(
         self,
@@ -645,9 +744,14 @@ class TriModalRobustModel(nn.Module):
             elif self.fusion_mode == "tri_modal_reliability_gate":
                 gate_weights = self._heuristic_reliability_gate(evidence).to(dtype=dtype)
                 extra["gate_prior_enabled"] = False
+            elif self.fusion_mode == "tri_modal_confidence_gate":
+                gate_weights = self._confidence_gate(evidence).to(dtype=dtype)
+                extra["gate_prior_enabled"] = False
             else:
                 gate_input = evidence.detach() if self.gate_detach else evidence
                 gate_weights = self.gate_net(gate_input)
+                if self.apply_alive_mask_to_learned_gate:
+                    gate_weights = self._apply_alive_mask(gate_weights, evidence).to(dtype=dtype)
                 extra["gate_prior_enabled"] = True
             logits = (
                 gate_weights[:, 0:1] * api_logits

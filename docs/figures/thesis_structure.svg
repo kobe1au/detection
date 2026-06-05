@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="780" viewBox="0 0 980 780">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#222222"/>
+    </marker>
+    <style>
+      .page {
+        fill: #ffffff;
+      }
+      .chapter {
+        fill: #ffffff;
+        stroke: #222222;
+        stroke-width: 1.8;
+      }
+      .method {
+        fill: #ffffff;
+        stroke: #222222;
+        stroke-width: 1.8;
+      }
+      .tag {
+        fill: #dcecff;
+        stroke: #6f9bd2;
+        stroke-width: 1.5;
+      }
+      .group {
+        fill: none;
+        stroke: #222222;
+        stroke-width: 1.6;
+        stroke-dasharray: 6 5;
+      }
+      .arrow {
+        stroke: #222222;
+        stroke-width: 1.8;
+        fill: none;
+        marker-end: url(#arrow);
+      }
+      .text {
+        font-family: "SimSun", "Songti SC", "Microsoft YaHei", Arial, sans-serif;
+        fill: #333333;
+        font-size: 18px;
+        text-anchor: middle;
+        dominant-baseline: middle;
+      }
+      .small {
+        font-size: 17px;
+      }
+      .tag-text {
+        font-family: "SimSun", "Songti SC", "Microsoft YaHei", Arial, sans-serif;
+        fill: #345d8f;
+        font-size: 18px;
+        text-anchor: middle;
+        dominant-baseline: middle;
+      }
+    </style>
+  </defs>
+
+  <rect class="page" x="0" y="0" width="980" height="780"/>
+
+  <!-- Top chapters -->
+  <rect class="chapter" x="370" y="34" width="240" height="64"/>
+  <text class="text" x="490" y="66">第一章  引言</text>
+
+  <line class="arrow" x1="490" y1="98" x2="490" y2="154"/>
+
+  <rect class="chapter" x="370" y="154" width="240" height="64"/>
+  <text class="text" x="490" y="186">第二章  相关理论</text>
+
+  <line class="arrow" x1="490" y1="218" x2="490" y2="276"/>
+
+  <!-- Method group -->
+  <rect class="group" x="62" y="276" width="856" height="284" rx="36" ry="36"/>
+
+  <!-- Tags -->
+  <rect class="tag" x="112" y="318" width="180" height="48"/>
+  <text class="tag-text" x="202" y="342">可靠性建模</text>
+
+  <rect class="tag" x="390" y="318" width="200" height="48"/>
+  <text class="tag-text" x="490" y="342">软一致性学习</text>
+
+  <rect class="tag" x="696" y="318" width="180" height="48"/>
+  <text class="tag-text" x="786" y="342">自适应融合</text>
+
+  <!-- Method chapters -->
+  <rect class="method" x="94" y="394" width="226" height="112" rx="18" ry="18"/>
+  <text class="text small" x="207" y="428">第三章</text>
+  <text class="text small" x="207" y="456">面向代码共模失效的</text>
+  <text class="text small" x="207" y="484">三模态可靠性建模</text>
+
+  <rect class="method" x="377" y="394" width="246" height="112" rx="18" ry="18"/>
+  <text class="text small" x="500" y="428">第四章</text>
+  <text class="text small" x="500" y="456">Manifest 声明引导的</text>
+  <text class="text small" x="500" y="484">跨源软一致性学习</text>
+
+  <rect class="method" x="690" y="394" width="226" height="112" rx="18" ry="18"/>
+  <text class="text small" x="803" y="428">第五章</text>
+  <text class="text small" x="803" y="456">冲突感知的四分支</text>
+  <text class="text small" x="803" y="484">自适应融合方法</text>
+
+  <line class="arrow" x1="320" y1="450" x2="377" y2="450"/>
+  <line class="arrow" x1="623" y1="450" x2="690" y2="450"/>
+
+  <!-- Bottom chapters -->
+  <line class="arrow" x1="490" y1="560" x2="490" y2="602"/>
+
+  <rect class="chapter" x="350" y="602" width="280" height="58"/>
+  <text class="text" x="490" y="631">第六章  实验设计与结果分析</text>
+
+  <line class="arrow" x1="490" y1="660" x2="490" y2="690"/>
+
+  <rect class="chapter" x="370" y="690" width="240" height="54"/>
+  <text class="text" x="490" y="717">第七章  总结与展望</text>
+</svg>

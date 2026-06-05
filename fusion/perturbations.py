@@ -8,7 +8,6 @@ import torch
 from fusion.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
     api_semantic_counts_from_type_ids,
-    graph_semantic_counts_from_method_api_edges,
 )
 
 
@@ -88,20 +87,73 @@ def _set_min_pert(data: dict, key: str, strength: float) -> None:
     data[key] = max(current, _clamp_strength(strength))
 
 
-def _degrade_quality(data: dict, key: str, strength: float) -> None:
-    q = _scalar_float(data.get(key), 1.0)
-    data[key] = max(0.0, min(1.0, q * (1.0 - _clamp_strength(strength))))
+def refresh_api_quality(data: dict) -> None:
+    api_ids = data.get("api_ids")
+    if not isinstance(api_ids, torch.Tensor) or api_ids.numel() <= 0:
+        data["q_api"] = 0.0
+        return
+    api_ids = api_ids.view(-1)
+    n = int(api_ids.numel())
+    api_type_ids = data.get("api_type_ids")
+    api_in_graph = data.get("api_in_graph_mask")
+    count_score = min(1.0, n / 128.0)
+    diversity_score = min(1.0, float(api_ids.unique().numel()) / max(n, 1) * 2.0)
+    coverage_score = (
+        float(api_in_graph.float().view(-1).mean().item())
+        if isinstance(api_in_graph, torch.Tensor) and api_in_graph.numel() == n
+        else 0.0
+    )
+    type_score = (
+        float((api_type_ids.long().view(-1) > 0).float().mean().item())
+        if isinstance(api_type_ids, torch.Tensor) and api_type_ids.numel() == n
+        else 0.0
+    )
+    data["q_api"] = max(
+        0.0,
+        min(1.0, 0.35 * count_score + 0.25 * diversity_score + 0.25 * coverage_score + 0.15 * type_score),
+    )
+
+
+def refresh_graph_quality(data: dict) -> None:
+    x = data.get("x")
+    edge_index = data.get("edge_index")
+    num_nodes = int(x.size(0)) if isinstance(x, torch.Tensor) and x.ndim == 2 else 0
+    if num_nodes <= 0:
+        data["q_graph"] = 0.0
+        return
+    num_edges = (
+        int(edge_index.size(1))
+        if isinstance(edge_index, torch.Tensor) and edge_index.ndim == 2 and edge_index.size(0) == 2
+        else 0
+    )
+    node_score = min(1.0, num_nodes / 32.0)
+    edge_score = min(1.0, num_edges / max(num_nodes, 1))
+    data["q_graph"] = max(0.0, min(1.0, 0.5 * node_score + 0.5 * edge_score))
 
 
 def refresh_align_quality_after_code_perturb(data: dict) -> None:
     q_api = _scalar_float(data.get("q_api"), 0.0)
     q_graph = _scalar_float(data.get("q_graph"), 0.0)
-    pert_api = _scalar_float(data.get("pert_api"), 0.0)
-    pert_graph = _scalar_float(data.get("pert_graph"), 0.0)
-    old = _scalar_float(data.get("q_align"), 0.0)
-    code_alive = min(max(q_api, 0.0), max(q_graph, 0.0))
-    code_pert = max(_clamp_strength(pert_api), _clamp_strength(pert_graph))
-    data["q_align"] = max(0.0, min(old, code_alive)) * (1.0 - code_pert)
+    api_ids = data.get("api_ids")
+    x = data.get("x")
+    edge = data.get("method_api_edge_index")
+    num_api = int(api_ids.numel()) if isinstance(api_ids, torch.Tensor) else 0
+    num_nodes = int(x.size(0)) if isinstance(x, torch.Tensor) and x.ndim == 2 else 0
+    if (
+        num_api <= 0
+        or num_nodes <= 0
+        or not isinstance(edge, torch.Tensor)
+        or edge.ndim != 2
+        or edge.size(0) != 2
+        or edge.numel() == 0
+    ):
+        data["q_align"] = 0.0
+        return
+    node_cover = float(edge[0].unique().numel()) / max(num_nodes, 1)
+    api_cover = float(edge[1].unique().numel()) / max(num_api, 1)
+    edge_cover = 0.5 * node_cover + 0.5 * api_cover
+    code_quality = (max(0.0, min(1.0, q_api)) * max(0.0, min(1.0, q_graph))) ** 0.5
+    data["q_align"] = max(0.0, min(1.0, edge_cover * code_quality))
 
 
 def _should_degrade_category_counts(data: dict) -> bool:
@@ -196,20 +248,6 @@ def recompute_api_category_counts(data: dict) -> None:
     data["api_category_counts"] = counts
 
 
-def recompute_graph_category_counts_from_api_edges(data: dict) -> None:
-    ids = data.get("api_type_ids")
-    edge = data.get("method_api_edge_index")
-    counts = graph_semantic_counts_from_method_api_edges(ids, edge)
-    device = None
-    if isinstance(ids, torch.Tensor):
-        device = ids.device
-    elif isinstance(edge, torch.Tensor):
-        device = edge.device
-    counts = counts.to(device=device) if device is not None else counts
-    data["graph_semantic_category_counts"] = counts
-    data["graph_category_counts"] = counts
-
-
 def _select_api_events(data: dict, keep: torch.Tensor) -> None:
     keep = keep.bool().view(-1)
     n_api = int(keep.numel())
@@ -278,11 +316,10 @@ def apply_api_event_dropout(data: dict, strength: float, sensitive_only: bool = 
 
     actual = float(drop_idx.numel()) / max(n_api, 1)
     _select_api_events(data, keep)
-    _degrade_quality(data, "q_api", actual)
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_sensitive_event_dropout" if sensitive_only else "api_event_dropout"
     recompute_api_category_counts(data)
-    recompute_graph_category_counts_from_api_edges(data)
+    refresh_api_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -305,11 +342,10 @@ def apply_api_category_dropout(data: dict, strength: float) -> dict:
     ids_new[chosen] = 0
     data["api_type_ids"] = ids_new
     actual = float(n_drop) / max(int(ids.numel()), 1)
-    _degrade_quality(data, "q_api", actual)
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_category_dropout"
     recompute_api_category_counts(data)
-    recompute_graph_category_counts_from_api_edges(data)
+    refresh_api_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -329,9 +365,9 @@ def apply_api_feature_noise(data: dict, strength: float) -> dict:
     ids_new = ids.clone()
     ids_new[idx] = torch.randint(1, int(ids.max().item()) + 2, (n_noise,), device=ids.device)
     data["api_ids"] = ids_new
-    _degrade_quality(data, "q_api", 0.5 * strength)
     _set_min_pert(data, "pert_api", strength)
     data["api_aug_type"] = "api_feature_noise"
+    refresh_api_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -361,8 +397,6 @@ def apply_api_missing(data: dict) -> dict:
         counts = torch.zeros((SEMANTIC_CATEGORY_DIM,), dtype=torch.float32, device=device)
     data["api_semantic_category_counts"] = counts
     data["api_category_counts"] = counts
-    data["graph_semantic_category_counts"] = counts.clone()
-    data["graph_category_counts"] = counts.clone()
     data["q_api"] = 0.0
     data["pert_api"] = 1.0
     data["api_aug_type"] = "modality_dropout_api"
@@ -376,10 +410,10 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
         return data
     edge = data.get("edge_index")
     if not isinstance(edge, torch.Tensor) or edge.ndim != 2 or edge.size(1) == 0:
-        _degrade_quality(data, "q_graph", 1.0)
         _set_min_pert(data, "pert_graph", 1.0)
         degrade_graph_counts(data, 1.0)
         data["graph_aug_type"] = "graph_sparsify"
+        refresh_graph_quality(data)
         refresh_align_quality_after_code_perturb(data)
         return data
     keep = torch.rand(edge.size(1), device=edge.device) > strength
@@ -387,10 +421,10 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
         keep[random.randrange(edge.size(1))] = True
     data["edge_index"] = edge[:, keep]
     actual = 1.0 - float(keep.float().mean().item())
-    _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_sparsify"
     degrade_graph_counts(data, actual)
+    refresh_graph_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -416,10 +450,10 @@ def apply_graph_local_break(data: dict, strength: float) -> dict:
         keep[random.randrange(edge.size(1))] = True
     data["edge_index"] = edge[:, keep]
     actual = 1.0 - float(keep.float().mean().item())
-    _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_local_break"
     degrade_graph_counts(data, actual)
+    refresh_graph_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -440,10 +474,10 @@ def apply_graph_feature_obfuscation(data: dict, strength: float) -> dict:
     x_new[idx] = 0.15 * x_new[idx] + 0.03 * torch.randn_like(x_new[idx])
     data["x"] = x_new
     actual = float(n_mask) / max(n, 1)
-    _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_feature_obfuscation"
     degrade_graph_counts(data, actual)
+    refresh_graph_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -464,10 +498,10 @@ def apply_graph_node_feature_mask(data: dict, strength: float) -> dict:
     x_new[idx] = 0.0
     data["x"] = x_new
     actual = float(n_mask) / max(n, 1)
-    _degrade_quality(data, "q_graph", actual)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_node_feature_mask"
     degrade_graph_counts(data, actual)
+    refresh_graph_quality(data)
     refresh_align_quality_after_code_perturb(data)
     return data
 
@@ -546,7 +580,6 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
             ids_new[idx] = 0
             data["manifest_permission_ids"] = ids_new
     degrade_manifest_counts(data, strength, "mask")
-    _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_permission_mask"
     return data
@@ -563,7 +596,6 @@ def apply_manifest_permission_injection(data: dict, strength: float) -> dict:
         if pos.numel() > 0:
             data["manifest_x"] = _inject_vector_positions(vec, pos)
     degrade_manifest_counts(data, strength, "inject")
-    _degrade_quality(data, "q_manifest", 0.5 * _clamp_strength(strength))
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_permission_injection"
     return data
@@ -589,7 +621,6 @@ def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
             ids_new[idx] = 0
             data["manifest_intent_ids"] = ids_new
     degrade_manifest_counts(data, strength, "mask")
-    _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_intent_mask"
     return data
@@ -621,7 +652,6 @@ def apply_manifest_component_mask(data: dict, strength: float) -> dict:
         if pos.numel() > 0:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
     degrade_manifest_counts(data, strength, "mask")
-    _degrade_quality(data, "q_manifest", strength)
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_component_mask"
     return data
@@ -636,7 +666,6 @@ def apply_manifest_feature_noise(data: dict, strength: float) -> dict:
         noise = torch.randn_like(vec.float()) * (0.05 + 0.20 * _clamp_strength(strength))
         data["manifest_x"] = (vec.float() + noise).clamp(0.0, 1.0)
     degrade_manifest_counts(data, strength, "noise")
-    _degrade_quality(data, "q_manifest", 0.5 * _clamp_strength(strength))
     _set_min_pert(data, "pert_manifest", strength)
     data["manifest_aug_type"] = "manifest_feature_noise"
     return data

@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 import hashlib
 import logging
+import math
 import random
 from pathlib import Path
 from typing import Any
@@ -151,6 +152,7 @@ class RobustTriModalDataset(Dataset):
         graph_semantic_source: str = "alignment",
         num_classes: int = 2,
         label_map: dict | None = None,
+        strict_split_integrity: bool = True,
         **_unused,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
@@ -162,6 +164,17 @@ class RobustTriModalDataset(Dataset):
         self.perturb_strengths = list(perturb_strengths or [0.1, 0.3, 0.5])
         self.eval_perturb_type = eval_perturb_type
         self.eval_perturb_strength = float(eval_perturb_strength)
+        if not math.isfinite(self.perturb_prob) or not 0.0 <= self.perturb_prob <= 1.0:
+            raise ValueError(f"perturb_prob must be within [0, 1], got {self.perturb_prob}")
+        if not self.perturb_strengths or any(
+            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+            for value in self.perturb_strengths
+        ):
+            raise ValueError(f"perturb_strengths must be a non-empty list within [0, 1], got {self.perturb_strengths}")
+        if not math.isfinite(self.eval_perturb_strength) or not 0.0 <= self.eval_perturb_strength <= 1.0:
+            raise ValueError(
+                f"eval_perturb_strength must be within [0, 1], got {self.eval_perturb_strength}"
+            )
         self.max_api_events_per_sample = (
             int(max_api_events_per_sample) if max_api_events_per_sample is not None else None
         )
@@ -185,6 +198,7 @@ class RobustTriModalDataset(Dataset):
                 f"must be one of {VALID_GRAPH_SEMANTIC_SOURCES}"
             )
         self.graph_semantic_source = src
+        self.strict_split_integrity = bool(strict_split_integrity)
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -195,6 +209,12 @@ class RobustTriModalDataset(Dataset):
         year_col = next((c for c in ["year", "Year", "vt_year", "dex_year"] if c in df.columns), None)
 
         sid_series = df[id_col].astype(str).str.strip().str.lower()
+        duplicate_csv_ids = sorted(sid_series[sid_series.duplicated(keep=False)].unique().tolist())
+        if duplicate_csv_ids:
+            raise ValueError(
+                f"CSV {csv_path} contains duplicate sample IDs; "
+                f"count={len(duplicate_csv_ids)} examples={duplicate_csv_ids[:10]}"
+            )
         raw_labels = df["label"].astype(str).str.strip()
         if label_map:
             normalized_map = {str(k).strip(): int(v) for k, v in label_map.items()}
@@ -231,11 +251,38 @@ class RobustTriModalDataset(Dataset):
             else {sid: 0 for sid in sid_series}
         )
 
-        self.samples: list[tuple[Path, int, str, int]] = []
-        for pt_file in sorted(self.pt_dir.rglob("*.pt")):
+        pt_files = sorted(self.pt_dir.rglob("*.pt"))
+        pt_by_sid: dict[str, Path] = {}
+        duplicate_pt_ids: list[str] = []
+        for pt_file in pt_files:
             sid = pt_file.stem.lower()
-            if sid in labels:
-                self.samples.append((pt_file, int(labels[sid]), sid, int(years.get(sid, 0))))
+            if sid in pt_by_sid:
+                duplicate_pt_ids.append(sid)
+            else:
+                pt_by_sid[sid] = pt_file
+        if duplicate_pt_ids:
+            raise ValueError(
+                f"PT directory {self.pt_dir} contains duplicate filename stems; "
+                f"count={len(set(duplicate_pt_ids))} examples={sorted(set(duplicate_pt_ids))[:10]}"
+            )
+
+        csv_ids = set(labels)
+        pt_ids = set(pt_by_sid)
+        csv_only = sorted(csv_ids - pt_ids)
+        pt_only = sorted(pt_ids - csv_ids)
+        if csv_only or pt_only:
+            message = (
+                f"Split integrity mismatch for CSV={csv_path} PT={self.pt_dir}: "
+                f"csv_only={len(csv_only)} examples={csv_only[:10]}; "
+                f"pt_only={len(pt_only)} examples={pt_only[:10]}"
+            )
+            if self.strict_split_integrity:
+                raise ValueError(message)
+            logger.warning(message)
+
+        self.samples: list[tuple[Path, int, str, int]] = []
+        for sid in sorted(csv_ids & pt_ids):
+            self.samples.append((pt_by_sid[sid], int(labels[sid]), sid, int(years.get(sid, 0))))
         if not self.samples:
             raise RuntimeError(f"No matching .pt samples found in {self.pt_dir} for {csv_path}")
         self.sample_sids = [sid for _, _, sid, _ in self.samples]

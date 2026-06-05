@@ -280,7 +280,7 @@ Do not start formal training until CSV/PT matching and semantic coverage are cle
 Main entrypoint:
 
 ```bash
-python -m fusion.train --config config/experiments/tri_modal_robust/T0_api_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/full/ours.yaml
 ```
 
 Multiple configs can be overlaid left to right:
@@ -327,27 +327,36 @@ Do not use positive-class F1 as the main robustness metric. In missing-modality 
 Recommended order:
 
 ```bash
-python -m fusion.train --config config/experiments/tri_modal_robust/T0_api_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/T1_graph_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/T2_manifest_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/full/ours.yaml
 
-python -m fusion.train --config config/experiments/tri_modal_robust/T3_api_graph_concat.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/T4_api_graph_manifest_concat.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i1/api_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i1/graph_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i1/manifest_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i1/api_graph_concat.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i1/tri_modal_concat.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i1/reliability_gate.yaml
 
-python -m fusion.train --config config/experiments/tri_modal_robust/T5_tri_modal_fixed_gate.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/T6_tri_modal_reliability_gate.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/T7_tri_modal_full_soft_consistency.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i2/no_consistency.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i2/evidence_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i2/loss_only.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i2/evidence_plus_loss.yaml
+
+python -m fusion.train --config config/experiments/tri_modal_robust/i3/fixed_gate.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i3/confidence_gate.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i3/reliability_gate.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i3/learned_gate_no_prior.yaml
+python -m fusion.train --config config/experiments/tri_modal_robust/i3/learned_gate_with_prior.yaml
 ```
 
 Baselines:
 
 ```text
-T0 API-only
-T1 Graph-only
-T2 Manifest-only
-T3 API+Graph concat
-T4 API+Graph+Manifest concat
-T5 Tri-modal fixed gate
+i1/api_only API-only
+i1/graph_only Graph-only
+i1/manifest_only Manifest-only
+i1/api_graph_concat API+Graph concat
+i1/tri_modal_concat API+Graph+Manifest concat
+i3/fixed_gate Tri-modal fixed gate
 T6 Tri-modal reliability gate
 T7 Full method
 ```
@@ -403,17 +412,17 @@ Manifest-only can be strong. That is not automatically a flaw, but it creates a 
 
 ```bash
 python scripts/make_manifest_shortcut_controls.py \
-  --config config/experiments/tri_modal_robust/T7_tri_modal_full_soft_consistency.yaml \
+  --config config/experiments/tri_modal_robust/full/ours.yaml \
   --splits test \
   --controls shuffled zeroed noisy \
   --resume
 ```
 
-Then evaluate:
+Then evaluate with a small override YAML that adds the generated control sets under `eval.extra_sets`:
 
 ```bash
 python -m fusion.train \
-  --config config/experiments/tri_modal_robust/T10_manifest_shortcut_control.yaml
+  --config config/experiments/tri_modal_robust/full/ours.yaml path/to/manifest_control_eval.yaml
 ```
 
 Expected behavior:
@@ -429,16 +438,16 @@ Synthetic perturbation is not enough for a strong robustness paper. Build real l
 
 ```bash
 python scripts/build_real_failure_slices.py \
-  --config config/experiments/tri_modal_robust/T7_tri_modal_full_soft_consistency.yaml \
+  --config config/experiments/tri_modal_robust/full/ours.yaml \
   --splits test \
   --write-empty
 ```
 
-Evaluate:
+Evaluate with an override YAML that adds the slice CSVs under `eval.extra_sets`:
 
 ```bash
 python -m fusion.train \
-  --config config/experiments/tri_modal_robust/T9_failure_slice_eval.yaml
+  --config config/experiments/tri_modal_robust/full/ours.yaml path/to/failure_slice_eval.yaml
 ```
 
 Useful slices include:
@@ -483,7 +492,7 @@ Evaluate:
 
 ```bash
 python -m fusion.train \
-  --config config/experiments/tri_modal_robust/T8_obfuscapk_eval.yaml
+  --config config/experiments/tri_modal_robust/full/ours.yaml path/to/obfuscapk_eval.yaml
 ```
 
 ## Interpreting Current Baselines
@@ -535,8 +544,7 @@ python scripts/summarize_robust_dataset_quality.py \
   --splits train val test
 
 python -m fusion.train \
-  --config config/experiments/tri_modal_robust/T0_api_only.yaml
+  --config config/experiments/tri_modal_robust/i1/api_only.yaml
 ```
 
 If these fail, fix the data/config/runtime issue before running the full experiment matrix.
-
