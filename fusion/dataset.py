@@ -255,6 +255,7 @@ class RobustTriModalDataset(Dataset):
         strict_split_integrity: bool = True,
         allow_pt_superset: bool = False,
         require_manifest_semantic_maps: bool = False,
+        allow_legacy_pt_compat: bool = False,
         min_pt_schema_version: int = 0,
         manifest_vocab_path: str = "",
         **_unused,
@@ -312,7 +313,10 @@ class RobustTriModalDataset(Dataset):
         self.strict_split_integrity = bool(strict_split_integrity)
         self.allow_pt_superset = bool(allow_pt_superset)
         self.require_manifest_semantic_maps = bool(require_manifest_semantic_maps)
+        self.allow_legacy_pt_compat = bool(allow_legacy_pt_compat)
         self.min_pt_schema_version = max(0, int(min_pt_schema_version))
+        self._warned_legacy_schema = False
+        self._warned_manifest_map_fallback = False
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -765,10 +769,18 @@ class RobustTriModalDataset(Dataset):
             q_manifest = 0.0
         manifest_available = has_manifest and q_manifest > 0.0
         if self.require_manifest_semantic_maps and manifest_available and not maps_available:
-            raise FatalDatasetConfigError(
-                "PT is missing Manifest term-to-category maps required by the configured "
-                "consistency evidence/loss. Regenerate PT files with the current direct builder."
-            )
+            if not self.allow_legacy_pt_compat:
+                raise FatalDatasetConfigError(
+                    "PT is missing Manifest term-to-category maps required by the configured "
+                    "consistency evidence/loss. Regenerate PT files with the current direct builder."
+                )
+            if not self._warned_manifest_map_fallback:
+                logger.warning(
+                    "Using legacy PT compatibility mode: Manifest term-to-category maps are "
+                    "missing, so Manifest perturbations will use approximate semantic-count "
+                    "updates. Prefer schema-3 PTs for final formal experiments."
+                )
+                self._warned_manifest_map_fallback = True
         if p_raw is None:
             pert_manifest = 0.0 if manifest_available else 1.0
         else:
@@ -861,10 +873,20 @@ class RobustTriModalDataset(Dataset):
                 except (TypeError, ValueError):
                     version = 0
                 if version < self.min_pt_schema_version:
-                    raise FatalDatasetConfigError(
-                        f"PT schema version {version} is below required version "
-                        f"{self.min_pt_schema_version}: {pt_path}. Regenerate PT files."
-                    )
+                    if not self.allow_legacy_pt_compat:
+                        raise FatalDatasetConfigError(
+                            f"PT schema version {version} is below required version "
+                            f"{self.min_pt_schema_version}: {pt_path}. Regenerate PT files."
+                        )
+                    if not self._warned_legacy_schema:
+                        logger.warning(
+                            "Using legacy PT compatibility mode: observed PT schema version "
+                            "%s below configured min_pt_schema_version=%s. This avoids APK "
+                            "re-extraction but should be reported as a compatibility run.",
+                            version,
+                            self.min_pt_schema_version,
+                        )
+                        self._warned_legacy_schema = True
                 if self.min_pt_schema_version >= 3:
                     required_fields = (
                         "manifest_permission_category_map",
@@ -876,10 +898,19 @@ class RobustTriModalDataset(Dataset):
                         if not isinstance(raw, dict) or key not in raw
                     ]
                     if missing_fields:
-                        raise FatalDatasetConfigError(
-                            f"PT declares schema version {version} but is missing "
-                            f"required fields {missing_fields}: {pt_path}. Regenerate PT files."
-                        )
+                        if not self.allow_legacy_pt_compat:
+                            raise FatalDatasetConfigError(
+                                f"PT declares schema version {version} but is missing "
+                                f"required fields {missing_fields}: {pt_path}. Regenerate PT files."
+                            )
+                        if not self._warned_legacy_schema:
+                            logger.warning(
+                                "Using legacy PT compatibility mode: current-schema Manifest "
+                                "fields are missing from at least one PT. Missing fields from "
+                                "first observed sample: %s",
+                                missing_fields,
+                            )
+                            self._warned_legacy_schema = True
             dex_list, sources = _normalize_loaded_pt(raw)
             data = self._aggregate_api_graph(dex_list)
             if data is None:

@@ -66,6 +66,9 @@ def test_metrics_report_macro_f1_as_primary_f1():
     assert metrics["f1"] == pytest.approx(metrics["macro_f1"])
     assert metrics["recall_pos"] == pytest.approx(1.0)
     assert metrics["macro_recall"] == pytest.approx(0.5)
+    assert "brier" in metrics
+    assert "ece_10" in metrics
+    assert "mean_confidence" in metrics
 
 
 def test_checkpoint_score_clean_and_robust_composite():
@@ -762,6 +765,22 @@ def test_dataset_rejects_legacy_pt_when_schema_is_locked(tmp_path: Path):
         dataset[0]
 
 
+def test_dataset_allows_legacy_pt_in_explicit_compat_mode(tmp_path: Path):
+    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="legacy_compat")
+    dataset = RobustTriModalDataset(
+        str(pt_dir),
+        str(csv_path),
+        is_train=False,
+        manifest_dim=16,
+        min_pt_schema_version=2,
+        require_manifest_semantic_maps=True,
+        allow_legacy_pt_compat=True,
+    )
+    sample = dataset[0]
+    assert sample.y.item() == 1
+    assert sample.manifest_category_counts.numel() == 12
+
+
 def test_heuristic_joint_gate_uses_manifest_reliability():
     evidence = torch.zeros(2, 17)
     evidence[:, 1] = 1.0
@@ -927,16 +946,15 @@ def test_aggregate_graph_degradation_retries_noop_operations():
     assert out["pert_graph"] > 0.0
 
 
-def test_manifest_perturbation_modifies_feature_vector_only():
-    """Manifest perturbations modify manifest_x but do NOT artificially
-    degrade pre-computed category counts.  The counts are derived from the
-    original manifest payload at extraction time."""
+def test_manifest_perturbation_updates_feature_vector_and_semantic_counts():
+    """Manifest perturbations must keep feature vectors and category-count
+    evidence in sync. Otherwise gate diagnostics would see stale consistency
+    evidence under manifest_degraded tests."""
     data = _perturbation_sample()
     before = data["manifest_category_counts"].clone()
     before_x = data["manifest_x"].clone()
     data = apply_manifest_permission_mask(data, 0.5)
-    # Category counts are unchanged (pre-computed).
-    assert torch.equal(before, data["manifest_category_counts"])
+    assert not torch.equal(before, data["manifest_category_counts"])
     # The feature vector IS modified.
     assert not torch.equal(before_x, data["manifest_x"])
     assert data["q_manifest"] == 1.0

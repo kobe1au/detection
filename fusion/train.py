@@ -290,6 +290,7 @@ def _dataset_common_kwargs(
         "strict_split_integrity": bool(data_cfg.get("strict_split_integrity", True)),
         "allow_pt_superset": False,
         "require_manifest_semantic_maps": require_manifest_semantic_maps,
+        "allow_legacy_pt_compat": bool(data_cfg.get("allow_legacy_pt_compat", False)),
         "min_pt_schema_version": int(data_cfg.get("min_pt_schema_version", 0)),
         "manifest_vocab_path": manifest_vocab_path,
     }
@@ -544,7 +545,26 @@ def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[st
             "recall_pos": 0.0,
             "auc": 0.0,
             "ap": 0.0,
+            "brier": 0.0,
+            "ece_10": 0.0,
+            "mean_confidence": 0.0,
+            "confidence_accuracy_gap": 0.0,
         }
+    y = np.asarray(labels, dtype=np.float64)
+    p = np.asarray(probs, dtype=np.float64)
+    pred_arr = np.asarray(preds, dtype=np.int64)
+    confidence = np.maximum(p, 1.0 - p)
+    correct = (pred_arr == y.astype(np.int64)).astype(np.float64)
+    brier = float(np.mean((p - y) ** 2))
+    ece = 0.0
+    for lo, hi in zip(np.linspace(0.0, 1.0, 11)[:-1], np.linspace(0.0, 1.0, 11)[1:]):
+        if hi >= 1.0:
+            mask = (confidence >= lo) & (confidence <= hi)
+        else:
+            mask = (confidence >= lo) & (confidence < hi)
+        if not np.any(mask):
+            continue
+        ece += float(mask.mean()) * abs(float(confidence[mask].mean()) - float(correct[mask].mean()))
     macro_f1 = float(f1_score(labels, preds, average="macro", zero_division=0))
     f1_pos = float(f1_score(labels, preds, average="binary", pos_label=1, zero_division=0))
     macro_recall = float(recall_score(labels, preds, average="macro", zero_division=0))
@@ -557,6 +577,10 @@ def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[st
         "recall": macro_recall,
         "macro_recall": macro_recall,
         "recall_pos": recall_pos,
+        "brier": brier,
+        "ece_10": float(ece),
+        "mean_confidence": float(confidence.mean()),
+        "confidence_accuracy_gap": float(confidence.mean() - correct.mean()),
     }
     if len(set(labels)) > 1:
         out["auc"] = float(roc_auc_score(labels, probs))
@@ -598,6 +622,8 @@ def evaluate(model, loader, device, use_amp: bool, split_name: str, dump_rows: b
                     "label": int(labels[i].detach().cpu().item()),
                     "prob_malware": float(prob[i].detach().cpu().item()),
                     "pred": int(pred[i].detach().cpu().item()),
+                    "final_confidence": float(torch.softmax(logits.float(), dim=-1)[i].max().detach().cpu().item()),
+                    "correct": int(pred[i].detach().cpu().item() == labels[i].detach().cpu().item()),
                     "year": int(batch.get("years")[i].detach().cpu().item()) if batch.get("years") is not None else 0,
                 }
                 for row_key, batch_key in (

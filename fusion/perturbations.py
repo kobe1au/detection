@@ -440,7 +440,7 @@ def _update_manifest_semantic_counts(
     map_key: str,
     relative_positions: torch.Tensor,
     sign: float,
-) -> None:
+) -> bool:
     counts = data.get("manifest_category_counts")
     mapping = data.get(map_key)
     if (
@@ -450,15 +450,46 @@ def _update_manifest_semantic_counts(
         or mapping.size(1) != counts.numel()
         or relative_positions.numel() == 0
     ):
-        return
+        return False
     relative_positions = relative_positions.to(mapping.device).long()
     relative_positions = relative_positions[
         (relative_positions >= 0) & (relative_positions < mapping.size(0))
     ]
     if relative_positions.numel() == 0:
-        return
+        return False
     delta = mapping[relative_positions].sum(dim=0).to(device=counts.device, dtype=counts.dtype)
     updated = (counts + float(sign) * delta).clamp_min(0.0)
+    _set_manifest_semantic_counts(data, updated)
+    return True
+
+
+def _approx_update_manifest_semantic_counts(data: dict, strength: float, mode: str) -> None:
+    """Fallback for legacy PTs without Manifest term-to-category maps.
+
+    Schema-3 PTs update semantic counts using exact vocab-index maps.  Older PTs
+    may only contain the aggregate 12-D Manifest category vector.  In that case,
+    keep the gate evidence conservative by perturbing the aggregate vector
+    itself instead of leaving it stale.
+    """
+    counts = data.get("manifest_category_counts")
+    if not isinstance(counts, torch.Tensor) or counts.numel() != SEMANTIC_CATEGORY_DIM:
+        return
+    strength = clamp_strength(strength)
+    if strength <= 0.0:
+        return
+    flat = counts.float().clone().view(-1)
+    if mode == "mask":
+        updated = flat * (1.0 - strength)
+    elif mode == "inject":
+        n = _num_to_perturb(flat.numel(), strength)
+        updated = flat.clone()
+        if n > 0:
+            idx = torch.randperm(flat.numel(), device=flat.device)[:n]
+            increment = flat[flat > 0].mean() if bool((flat > 0).any()) else flat.new_tensor(1.0)
+            updated[idx] = updated[idx] + increment.clamp_min(1.0)
+    else:
+        noise = torch.randn_like(flat) * strength * flat.mean().clamp_min(1.0)
+        updated = (flat + noise).clamp_min(0.0)
     _set_manifest_semantic_counts(data, updated)
 
 
@@ -495,7 +526,14 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
         if pos.numel() > 0:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
             actual = _actual_fraction(pos.numel(), eligible)
-            _update_manifest_semantic_counts(data, "manifest_permission_category_map", pos, -1.0)
+            changed = _update_manifest_semantic_counts(
+                data,
+                "manifest_permission_category_map",
+                pos,
+                -1.0,
+            )
+            if not changed:
+                _approx_update_manifest_semantic_counts(data, actual, "mask")
     ids = data.get("manifest_permission_ids")
     if isinstance(ids, torch.Tensor) and ids.numel() > 0 and "pos" in locals() and pos.numel() > 0:
         removed_ids = pos.to(ids.device).long() + 1
@@ -518,7 +556,14 @@ def apply_manifest_permission_injection(data: dict, strength: float) -> dict:
         if pos.numel() > 0:
             data["manifest_x"] = _inject_vector_positions(vec, pos)
             actual = _actual_fraction(pos.numel(), eligible)
-            _update_manifest_semantic_counts(data, "manifest_permission_category_map", pos, 1.0)
+            changed = _update_manifest_semantic_counts(
+                data,
+                "manifest_permission_category_map",
+                pos,
+                1.0,
+            )
+            if not changed:
+                _approx_update_manifest_semantic_counts(data, actual, "inject")
             ids = data.get("manifest_permission_ids")
             if isinstance(ids, torch.Tensor):
                 injected = pos.to(ids.device).long() + 1
@@ -543,12 +588,14 @@ def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
         if pos.numel() > 0:
             data["manifest_x"] = _mask_vector_positions(vec, pos)
             actual = _actual_fraction(pos.numel(), eligible)
-            _update_manifest_semantic_counts(
+            changed = _update_manifest_semantic_counts(
                 data,
                 "manifest_intent_category_map",
                 pos - perm_dim,
                 -1.0,
             )
+            if not changed:
+                _approx_update_manifest_semantic_counts(data, actual, "mask")
     ids = data.get("manifest_intent_ids")
     if isinstance(ids, torch.Tensor) and ids.numel() > 0 and "pos" in locals() and pos.numel() > 0:
         removed_ids = (pos.to(ids.device).long() - perm_dim) + 1
@@ -607,6 +654,7 @@ def apply_manifest_component_mask(data: dict, strength: float) -> dict:
         and component_counts.numel() == SEMANTIC_CATEGORY_DIM
         and isinstance(counts, torch.Tensor)
         and counts.numel() == SEMANTIC_CATEGORY_DIM
+        and component_counts.float().abs().sum() > 0
     ):
         removed = component_counts.to(device=counts.device, dtype=counts.dtype) * strength
         _set_manifest_semantic_counts(data, (counts - removed).clamp_min(0.0))
@@ -614,6 +662,8 @@ def apply_manifest_component_mask(data: dict, strength: float) -> dict:
             component_counts.float() * (1.0 - strength)
         ).to(device=component_counts.device, dtype=component_counts.dtype)
         actual = max(actual, strength)
+    elif actual > 0.0:
+        _approx_update_manifest_semantic_counts(data, actual, "mask")
     _update_manifest_perturbation(data, actual)
     data["manifest_aug_type"] = "manifest_component_mask"
     return data

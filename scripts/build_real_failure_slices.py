@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 import torch
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -188,6 +189,39 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _write_extra_eval_yaml(
+    path: Path,
+    cfg: dict[str, Any],
+    out_dir: Path,
+    splits: list[str],
+    summary: dict[str, Any],
+) -> None:
+    """Write an override config that evaluates trained models on real slices."""
+    data_cfg = cfg["data"]
+    root = data_cfg.get("root", "")
+    extra_sets: list[dict[str, Any]] = []
+    for split in splits:
+        split_summary = summary.get(split, {}) or {}
+        for slice_name, count in sorted((split_summary.get("slices") or {}).items()):
+            if int(count) <= 0:
+                continue
+            csv_path = out_dir / f"{split}_{slice_name}.csv"
+            extra_sets.append(
+                {
+                    "name": f"{split}_{slice_name}",
+                    "pt_dir": resolve(root, data_cfg[f"{split}_pt_dir"]),
+                    "csv": str(csv_path),
+                    "split_name": f"{split}_{slice_name}",
+                    "allow_pt_superset": True,
+                    "strict_split_integrity": True,
+                    "skip_if_empty": True,
+                }
+            )
+    payload = {"eval": {"extra_sets": extra_sets}}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
+
+
 def build_slices(args: argparse.Namespace) -> dict[str, Any]:
     cfg = load_config(args.config)
     splits = args.splits or ["train", "val", "test"]
@@ -249,6 +283,8 @@ def build_slices(args: argparse.Namespace) -> dict[str, Any]:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.extra_eval_yaml:
+        _write_extra_eval_yaml(Path(args.extra_eval_yaml), cfg, out_dir, splits, summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return summary
 
@@ -265,6 +301,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--common-api-threshold", type=float, default=0.4)
     parser.add_argument("--common-graph-threshold", type=float, default=0.4)
     parser.add_argument("--write-empty", action="store_true", help="Write header-only CSVs for empty slices.")
+    parser.add_argument(
+        "--extra-eval-yaml",
+        default="results/robust_slices/extra_eval_slices.yaml",
+        help="Write a YAML override with eval.extra_sets for all non-empty slices. Use empty string to disable.",
+    )
     return parser.parse_args()
 
 

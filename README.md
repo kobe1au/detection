@@ -217,7 +217,7 @@ The direct builder records failures instead of exiting when `fail_on_error=false
 
 Each new PT stores a schema/config/vocabulary fingerprint. Resume skips only matching PTs. Legacy PTs without a fingerprint are rejected unless `execution.allow_legacy_resume=true` is explicitly set. Do not enable that option for formal experiments.
 
-Current-schema PTs also contain Manifest term-to-category maps, component-derived category counts, and continuous Manifest extraction coverage. The formal experiment base config locks `data.min_pt_schema_version: 3`, so all I1/I2/I3/Full results use one consistent PT schema. Regenerate PTs before formal experiments; yesterday's legacy-PT results remain pilot results only.
+Current-schema PTs also contain Manifest term-to-category maps, component-derived category counts, and continuous Manifest extraction coverage. The default experiment base currently enables `data.allow_legacy_pt_compat: true` with `data.min_pt_schema_version: 0` so existing PTs can be reused without expensive APK re-extraction. In this mode, missing Manifest term-to-category maps are handled with conservative aggregate-count fallbacks. For the cleanest final formal run, regenerate schema-3 PTs and set `data.min_pt_schema_version: 3` with legacy compatibility disabled.
 
 The builder writes:
 

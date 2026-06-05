@@ -133,6 +133,54 @@ python -m fusion.train --config \
   results/optuna/robust_v2/best_aug_override.yaml
 ```
 
+## External-Style Reference Baselines
+
+Use these as reference implementations, not claims of exact paper reproduction.
+They provide classical/static comparison points for the final method:
+
+```bash
+python scripts/train_static_baselines.py \
+  --config config/experiments/tri_modal_robust/base_tri_modal_robust.yaml \
+  --out-dir results/static_reference_baselines \
+  --robust-test
+```
+
+The script includes Drebin-style sparse static features, MaMaDroid-style API-type
+transition features, API bag-of-words, Manifest-only, and tri-modal static linear
+baselines. Report them separately from the internal neural ablations.
+
+## Real Failure Slices
+
+Build quality/failure slice CSVs before final robustness evaluation:
+
+```bash
+python scripts/build_real_failure_slices.py \
+  --config config/experiments/tri_modal_robust/base_tri_modal_robust.yaml \
+  --splits val test \
+  --out-dir results/robust_slices \
+  --extra-eval-yaml results/robust_slices/extra_eval_slices.yaml
+```
+
+Then evaluate the selected checkpoint/method on those slices by appending the generated
+override:
+
+```bash
+python -m fusion.train --config \
+  config/experiments/tri_modal_robust/full/ours.yaml \
+  results/robust_slices/extra_eval_slices.yaml
+```
+
+These slices are the main evidence for real extractor failures: low API quality, low
+graph quality, low API-Graph alignment, Manifest parse failures, and partial multi-DEX
+failures.
+
+## Calibration Diagnostics
+
+Every neural evaluation now reports `brier`, `ece_10`, `mean_confidence`, and
+`confidence_accuracy_gap` in `summary.yaml`. Per-sample `gate_diagnostics.csv` also
+contains final confidence and correctness, which supports calibration and gate-weight
+correlation plots.
+
 ## Notes
 
 The default data paths target the AutoDL layout:
