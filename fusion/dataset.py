@@ -200,6 +200,9 @@ def payload_to_data(payload: dict[str, Any], *, label: int | None = None) -> Dat
     data.cf_weight = torch.tensor([0.0], dtype=torch.float32)
     data.manifest_parse_ok = torch.tensor([1.0 if payload.get("manifest_parse_ok", True) else 0.0], dtype=torch.float32)
     data.dex_success_ratio = torch.tensor([float(payload.get("dex_success_ratio", 1.0) or 0.0)], dtype=torch.float32)
+    data.graph_behavior_hints = torch.tensor([1.0 if payload.get("graph_behavior_hints", False) else 0.0], dtype=torch.float32)
+    data.graph_behavior_hint_start = torch.tensor([int(payload.get("graph_behavior_hint_start", 0) or 0)], dtype=torch.long)
+    data.graph_behavior_hint_dim = torch.tensor([int(payload.get("graph_behavior_hint_dim", 0) or 0)], dtype=torch.long)
     return data
 
 

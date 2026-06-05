@@ -126,6 +126,19 @@ def test_aeg_perturbation_updates_reliability():
     assert torch.all(degraded.edge_quality[api_related] == 0)
 
 
+def test_api_missing_clears_graph_behavior_hint_features():
+    payload = _payload()
+    payload["graph_behavior_hints"] = True
+    payload["graph_behavior_hint_start"] = 1
+    payload["graph_behavior_hint_dim"] = 4
+    method_mask = payload["node_type"] == NODE_TYPES["METHOD"]
+    payload["node_x"][method_mask, 1:5] = 1.0
+    data = payload_to_data(payload, label=1)
+    degraded = apply_aeg_view(data, view="api_missing", strength=1.0)
+    degraded_method_mask = degraded.node_type == NODE_TYPES["METHOD"]
+    assert torch.all(degraded.x[degraded_method_mask, 1:5] == 0)
+
+
 def test_manifest_missing_clears_aggregate_semantic_and_refreshes_risk():
     degraded = apply_aeg_view(payload_to_data(_payload(), label=1), view="manifest_missing", strength=1.0)
     apk_mask = degraded.node_type == NODE_TYPES["APK"]
@@ -222,3 +235,12 @@ def test_aeg_config_loads():
     cfg = load_config("config/experiments/aeg_robust/full/ours.yaml")
     assert cfg["model"]["hidden_dim"] == 128
     assert cfg["loss"]["clean_degraded_contrast_weight"] > 0.0
+
+
+def test_extract_behavior_hint_config_is_explicit_ablation():
+    from scripts.build_aeg_pts_direct import _load_config
+
+    base = _load_config(Path("config/extract_aeg.yaml"))
+    ablation = _load_config(Path("config/extract_aeg_behavior_hints.yaml"))
+    assert base["graph"]["use_behavior_hints"] is False
+    assert ablation["graph"]["use_behavior_hints"] is True

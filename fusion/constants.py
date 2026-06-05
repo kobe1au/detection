@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-AEG_SCHEMA_VERSION = 5
+AEG_SCHEMA_VERSION = 6
 
 
 NODE_TYPES = {

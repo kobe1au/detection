@@ -18,7 +18,10 @@ graph:
   max_methods_per_dex: 4096
   fallback_max_methods: 512
   fallback_policy: api_rich
-  use_behavior_hints: true
+  # Canonical AEG experiments keep graph method features code-structural.
+  # API-derived graph behavior hints are disabled to avoid leaking API evidence
+  # into api_missing/api_degraded robustness tests.
+  use_behavior_hints: false
 
 api:
   num_hash_buckets: 8192

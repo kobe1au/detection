@@ -4,13 +4,13 @@
 Low-level DEX/API/call-graph extractor used by the AEG builder.
 
 This module is intentionally not the project training-data entry point. Use
-`scripts/build_aeg_pts_direct.py` to build schema-v4 APK evidence graph `.pt`
+`scripts/build_aeg_pts_direct.py` to build schema-v6 APK evidence graph `.pt`
 files. The per-DEX dict produced here contains:
   {
     "dex_name": str,
 
     # Graph branch
-    "call_x": Float16Tensor [M, 515 + optional graph-lite behavior hints],
+    "call_x": Float16Tensor [M, 515 (+ optional graph-lite behavior hints for explicit ablation only)],
     "call_edge_index": Int32Tensor [2, E],
     "call_sensitive_mask": UInt8Tensor [M],
     "method_spans": Int32Tensor [M, 2],
@@ -31,7 +31,7 @@ files. The per-DEX dict produced here contains:
 
 Design:
   API branch: ordered framework API behavior sequence.
-  Graph branch: sensitive method call graph with lightweight method behavior hints.
+  Graph branch: sensitive method call graph with local structural method features.
   Alignment: method_api_edge_index anchors API events to graph method nodes.
 """
 
@@ -651,7 +651,7 @@ def build_graph_api_for_dex(
     framework_only: bool = True,
     include_descriptor: bool = False,
     fallback_policy: str = "api_rich",
-    use_graph_behavior_hints: bool = True,
+    use_graph_behavior_hints: bool = False,
 ) -> Dict[str, Any]:
     dx = _build_analysis(dvm, raw_bytes)
     graph_hint_dim = 4 if use_graph_behavior_hints else 0

@@ -31,6 +31,31 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in (update or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_update(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_config(path: Path) -> dict[str, Any]:
+    path = path.resolve()
+    cfg = _load_yaml(path)
+    bases = cfg.pop("base", None) or cfg.pop("bases", None) or []
+    if isinstance(bases, (str, Path)):
+        bases = [bases]
+    merged: dict[str, Any] = {}
+    for base in bases:
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        merged = _deep_update(merged, _load_config(base_path))
+    return _deep_update(merged, cfg)
+
+
 def _resolve_path(value: str | Path, base: Path = PROJECT_ROOT) -> Path:
     path = Path(value)
     return path if path.is_absolute() else base / path
@@ -58,6 +83,7 @@ def _build_fingerprint(cfg: dict[str, Any], vocab: dict[str, Any]) -> str:
         "fusion/semantic_categories.py",
         "fusion/quality.py",
         "extract/extract_graph_api.py",
+        "scripts/build_aeg_pts_direct.py",
     ]
     source_hashes = {path: _sha256_text_file(PROJECT_ROOT / path) for path in source_paths}
     config_keys = [
@@ -201,7 +227,7 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
         "max_methods_per_dex": int(graph.get("max_methods_per_dex", 4096)),
         "fallback_max_methods": int(graph.get("fallback_max_methods", 512)),
         "fallback_policy": str(graph.get("fallback_policy", "api_rich")),
-        "use_graph_behavior_hints": bool(graph.get("use_behavior_hints", True)),
+        "use_graph_behavior_hints": bool(graph.get("use_behavior_hints", False)),
         "num_api_buckets": int(api.get("num_hash_buckets", 8192)),
         "max_api_events_per_dex": int(api.get("max_events_per_dex", 1024)),
         "max_api_events_per_method": int(api.get("max_events_per_method", 32)),
@@ -347,6 +373,9 @@ def _process_one(job: dict[str, str], cfg: dict[str, Any], vocab: dict[str, Any]
             "dex_success_ratio": len(dex_results) / max(1, len(dex_entries)),
             "num_dex_failed": failed,
             "aeg_build_fingerprint": cfg.get("build_fingerprint", ""),
+            "use_graph_behavior_hints": bool(cfg.get("use_graph_behavior_hints", False)),
+            "graph_behavior_hint_start": int(cfg["vocab_size"]) * 2 + 3,
+            "graph_behavior_hint_dim": 4 if bool(cfg.get("use_graph_behavior_hints", False)) else 0,
         }
         payload = build_aeg_payload(
             sid=job["sha256"],
@@ -375,7 +404,7 @@ def _write_index(rows: list[dict[str, str]], path: Path) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
-    cfg = _parse_config(_load_yaml(Path(args.config)), args)
+    cfg = _parse_config(_load_config(Path(args.config)), args)
     jobs = _collect_apks(cfg["split_dirs"], cfg["splits"], hash_files=cfg["hash_files"])
     _validate_split_counts(jobs, cfg["splits"])
     _validate_unique_hashes(jobs)

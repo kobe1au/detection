@@ -1,0 +1,7 @@
+base: extract_aeg.yaml
+
+graph:
+  # Explicit ablation only. These API-derived method-level hints can strengthen
+  # graph nodes but weaken API/Graph evidence separation, so they are not used
+  # in the canonical AEG extraction config.
+  use_behavior_hints: true

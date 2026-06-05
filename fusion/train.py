@@ -317,7 +317,7 @@ def _robust_eval_loaders(cfg: dict[str, Any], split: str) -> list[tuple[str, Dat
     strengths = list(eval_cfg.get("perturb_strengths", [0.5]))
     loaders: list[tuple[str, DataLoader]] = []
     for view in views:
-        if view.endswith("_missing") or view in {"manifest_zeroed"}:
+        if view.endswith("_missing") or view in {"manifest_zeroed", "manifest_shuffled"}:
             ds = _make_dataset(cfg, split, aug=True, view=view, strength=1.0)
             loaders.append((view, _loader(cfg, ds, train=False)))
         else:

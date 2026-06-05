@@ -127,6 +127,27 @@ def _degrade_api_derived_method_semantic(data: Data, strength: float, *, missing
         data.node_semantic[method_mask] = data.node_semantic[method_mask] * (1.0 - _clamp_strength(strength))
 
 
+def _degrade_api_derived_method_features(data: Data, strength: float, *, missing: bool) -> None:
+    if not hasattr(data, "x"):
+        return
+    hint_dim_tensor = getattr(data, "graph_behavior_hint_dim", None)
+    hint_start_tensor = getattr(data, "graph_behavior_hint_start", None)
+    if not isinstance(hint_dim_tensor, torch.Tensor) or not isinstance(hint_start_tensor, torch.Tensor):
+        return
+    hint_dim = int(hint_dim_tensor.view(-1)[0].item()) if hint_dim_tensor.numel() else 0
+    hint_start = int(hint_start_tensor.view(-1)[0].item()) if hint_start_tensor.numel() else 0
+    if hint_dim <= 0 or hint_start < 0 or hint_start >= data.x.size(1):
+        return
+    end = min(data.x.size(1), hint_start + hint_dim)
+    method_mask = _node_mask(data, node_types={NODE_TYPES["METHOD"]})
+    if not bool(method_mask.any()) or end <= hint_start:
+        return
+    if missing:
+        data.x[method_mask, hint_start:end] = 0.0
+    else:
+        data.x[method_mask, hint_start:end] = data.x[method_mask, hint_start:end] * (1.0 - _clamp_strength(strength))
+
+
 def refresh_risk_node_quality(data: Data) -> None:
     if not hasattr(data, "node_quality") or not hasattr(data, "node_semantic") or not hasattr(data, "edge_type"):
         return
@@ -175,6 +196,7 @@ def _degrade_api(data: Data, strength: float, *, missing: bool = False) -> None:
     _soft_degrade_nodes(data, api_nodes, strength, zero=missing)
     _soft_degrade_edges(data, api_edges, strength, zero=missing)
     _degrade_api_derived_method_semantic(data, strength, missing=missing)
+    _degrade_api_derived_method_features(data, strength, missing=missing)
     clear_aggregate_apk_semantic(data)
     _set_scalar(data, "q_api", 0.0 if missing else float(data.q_api.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
     _refresh_align_after_code_perturb(data)
