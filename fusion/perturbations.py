@@ -13,6 +13,8 @@ API_EDGE_TYPES = {
     EDGE_TYPES["API_FAMILY_RELATED_TO_PERMISSION"],
     EDGE_TYPES["METHOD_HAS_RISK"],
     EDGE_TYPES["RISK_OBSERVED_IN_METHOD"],
+    EDGE_TYPES["METHOD_HAS_STRING_HINT"],
+    EDGE_TYPES["STRING_HINT_IN_METHOD"],
 }
 
 GRAPH_EDGE_TYPES = {
@@ -104,7 +106,11 @@ def _refresh_align_after_code_perturb(data: Data) -> None:
     q_api = float(getattr(data, "q_api", torch.tensor([0.0])).view(-1)[0].item())
     q_graph = float(getattr(data, "q_graph", torch.tensor([0.0])).view(-1)[0].item())
     q_align = float(getattr(data, "q_align", torch.tensor([0.0])).view(-1)[0].item())
-    _set_scalar(data, "q_align", min(q_align, q_api, q_graph))
+    pert_api = float(getattr(data, "pert_api", torch.tensor([0.0])).view(-1)[0].item())
+    pert_graph = float(getattr(data, "pert_graph", torch.tensor([0.0])).view(-1)[0].item())
+    r_api = q_api * (1.0 - _clamp_strength(pert_api))
+    r_graph = q_graph * (1.0 - _clamp_strength(pert_graph))
+    _set_scalar(data, "q_align", min(q_align, r_api, r_graph))
 
 
 def clear_aggregate_apk_semantic(data: Data) -> None:
@@ -113,6 +119,28 @@ def clear_aggregate_apk_semantic(data: Data) -> None:
     apk_mask = _node_mask(data, node_types={NODE_TYPES["APK"]})
     if bool(apk_mask.any()):
         data.node_semantic[apk_mask] = 0.0
+
+
+def refresh_apk_node_quality(data: Data) -> None:
+    if not hasattr(data, "node_quality") or not hasattr(data, "x"):
+        return
+    apk_mask = _node_mask(data, node_types={NODE_TYPES["APK"]})
+    if not bool(apk_mask.any()):
+        return
+    device = data.x.device
+    q_api = float(getattr(data, "q_api", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    q_graph = float(getattr(data, "q_graph", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    q_manifest = float(getattr(data, "q_manifest", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    pert_api = float(getattr(data, "pert_api", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    pert_graph = float(getattr(data, "pert_graph", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    pert_manifest = float(getattr(data, "pert_manifest", torch.tensor([0.0], device=device)).view(-1)[0].item())
+    data.node_quality[apk_mask] = float(
+        max(
+            q_api * (1.0 - _clamp_strength(pert_api)),
+            q_graph * (1.0 - _clamp_strength(pert_graph)),
+            q_manifest * (1.0 - _clamp_strength(pert_manifest)),
+        )
+    )
 
 
 def _degrade_api_derived_method_semantic(data: Data, strength: float, *, missing: bool) -> None:
@@ -191,15 +219,19 @@ def refresh_risk_node_quality(data: Data) -> None:
 
 
 def _degrade_api(data: Data, strength: float, *, missing: bool = False) -> None:
-    api_nodes = _node_mask(data, node_types={NODE_TYPES["API_FAMILY"]})
+    # STRING_HINT evidence is derived from both method names and API tokens.
+    # Until provenance is separable, degrade it with either code modality to
+    # prevent a missing API view from retaining API-derived behavior hints.
+    api_nodes = _node_mask(data, node_types={NODE_TYPES["API_FAMILY"], NODE_TYPES["STRING_HINT"]})
     api_edges = _edge_mask(data, edge_types=API_EDGE_TYPES)
     _soft_degrade_nodes(data, api_nodes, strength, zero=missing)
     _soft_degrade_edges(data, api_edges, strength, zero=missing)
     _degrade_api_derived_method_semantic(data, strength, missing=missing)
     _degrade_api_derived_method_features(data, strength, missing=missing)
     clear_aggregate_apk_semantic(data)
-    _set_scalar(data, "q_api", 0.0 if missing else float(data.q_api.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
+    _set_scalar(data, "pert_api", 1.0 if missing else max(float(data.pert_api.view(-1)[0].item()), strength))
     _refresh_align_after_code_perturb(data)
+    refresh_apk_node_quality(data)
     refresh_risk_node_quality(data)
 
 
@@ -208,8 +240,9 @@ def _degrade_graph(data: Data, strength: float, *, missing: bool = False) -> Non
     graph_edges = _edge_mask(data, edge_types=GRAPH_EDGE_TYPES)
     _soft_degrade_nodes(data, graph_nodes, strength, zero=missing, noise=not missing)
     _soft_degrade_edges(data, graph_edges, strength, zero=missing)
-    _set_scalar(data, "q_graph", 0.0 if missing else float(data.q_graph.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
+    _set_scalar(data, "pert_graph", 1.0 if missing else max(float(data.pert_graph.view(-1)[0].item()), strength))
     _refresh_align_after_code_perturb(data)
+    refresh_apk_node_quality(data)
     refresh_risk_node_quality(data)
 
 
@@ -219,7 +252,8 @@ def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noi
     _soft_degrade_nodes(data, manifest_nodes, strength, zero=missing, noise=noisy)
     _soft_degrade_edges(data, manifest_edges, strength, zero=missing)
     clear_aggregate_apk_semantic(data)
-    _set_scalar(data, "q_manifest", 0.0 if missing else float(data.q_manifest.view(-1)[0].item()) * (1.0 - _clamp_strength(strength)))
+    _set_scalar(data, "pert_manifest", 1.0 if missing else max(float(data.pert_manifest.view(-1)[0].item()), strength))
+    refresh_apk_node_quality(data)
     refresh_risk_node_quality(data)
 
 

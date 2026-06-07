@@ -1,10 +1,12 @@
-base: ../base.yaml
+base: multiview_contrast.yaml
 
 train:
-  output_dir: results/aeg_robust/ablation/no_robust_losses
+  output_dir: results/aeg_robust/i2/no_contrast
 
 loss:
   clean_degraded_contrast_weight: 0.0
   source_degraded_contrast_weight: 0.0
   cross_source_contrast_weight: 0.0
-  counterfactual_kl_weight: 0.0
+
+robust:
+  train_aug: false

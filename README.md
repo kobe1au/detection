@@ -54,7 +54,63 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. Resume only reuses PT files whose schema table fingerprint and build fingerprint match the current extractor, Manifest vocabulary, and AEG construction code.
+If disk space cannot hold train PT files yet, build only the train-derived
+Manifest vocabulary first:
+
+```bash
+python scripts/build_aeg_pts_direct.py \
+  --config config/extract_aeg_vocab_train_only.yaml \
+  --rebuild-vocab \
+  --vocab-only \
+  --workers 8
+```
+
+Then generate only validation and test PT files with the train vocabulary:
+
+```bash
+python scripts/build_aeg_pts_direct.py \
+  --config config/extract_aeg_val_test.yaml \
+  --no-rebuild-vocab \
+  --resume \
+  --workers 8
+```
+
+Generate train PT files later without rebuilding the frozen Manifest
+vocabulary:
+
+```bash
+python scripts/build_aeg_pts_direct.py \
+  --config config/extract_aeg_train_only.yaml \
+  --no-rebuild-vocab \
+  --resume \
+  --workers 8
+```
+
+The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume only reuses PT files whose schema table fingerprint and build fingerprint match the current extractor, Manifest vocabulary, and AEG construction code.
+
+Extraction first scans invoke targets for all methods, selects the methods kept
+by the configured graph budget, and only then builds expensive local CFG
+features. Manifest extraction is performed inside the same APK build worker
+when the train-only vocabulary is already frozen. `execution.hash_workers`
+parallelizes exact SHA256 verification without trusting filenames; benchmark
+`1/2/4` on the actual disk because excessive parallel reads can hurt HDDs.
+
+The canonical config stores the final AEG plus compact quality/audit metadata,
+but omits graph/API/Manifest intermediates that can be reconstructed from the
+final typed graph (`aeg.retain_intermediate_features=false`). It also stores
+large graph tensors as float16/int32/uint8 on disk
+(`aeg.storage_dtype=float16`); the Dataset converts them back to float32/long
+before training. Enable intermediate retention or float32 storage only for
+extractor debugging because either substantially increases PT storage.
+
+Every generated PT is checked against a versioned payload contract before it
+is saved. Dataset loading and training preflight repeat that validation and
+reject missing fields, invalid tensor shapes, mixed build fingerprints, or
+mixed contract versions instead of silently padding malformed samples. The
+compact contract retains the typed graph, reliability values, semantic
+aggregates, package/year metadata, Manifest parse status, multi-DEX extraction
+status, and behavior-risk slice flags needed by the three proposed methods and
+their robustness diagnostics.
 
 The canonical extraction config disables API-derived graph behavior hints
 (`graph.use_behavior_hints=false`) so API evidence is not leaked into graph
@@ -83,22 +139,29 @@ Or use the compact runner:
 
 ```bash
 python run.py final
-python run.py ablation
+python run.py i1
+python run.py i2
+python run.py i3
+python run.py full_seeds
 ```
 
 Checkpoint selection uses a validation-only composite score by default: clean validation macro-F1 plus representative robust validation views. Test and robust-test metrics are computed only after the best checkpoint is selected.
 
-## Main Ablations
+## Innovation Experiments
 
 ```bash
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_clean_degraded_contrast.yaml
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_cross_source_contrast.yaml
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_counterfactual.yaml
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_reliability_bias.yaml
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_conflict_bias.yaml
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_aug.yaml
-python -m fusion.train --config config/experiments/aeg_robust/ablation/no_robust_losses.yaml
+python run.py i1
+python run.py i2
+python run.py i3
+python run.py full_seeds
 ```
+
+`i1` isolates typed/source/quality-aware graph encoding under clean training.
+`i2` isolates clean-degraded, source-level, and cross-source contrastive
+objectives with counterfactual fusion disabled. `i3` reuses Full as its complete
+endpoint and removes individual latent-fusion mechanisms. Run single-seed
+screening first, then report three-seed mean and standard deviation for Full
+and the strongest competing configurations.
 
 ## Outputs
 
@@ -114,3 +177,27 @@ diagnostics_test_<view>_<strength>.csv
 ```
 
 Diagnostics include reliability scalars, code-Manifest similarity/conflict, and latent attention mass over method, API-family, permission, component, risk, static-hint, and global tokens.
+
+Aggregate synthetic robustness and real-failure slices after a run:
+
+```bash
+python scripts/summarize_aeg_diagnostics.py \
+  --input-dir results/aeg_robust/full/ours \
+  --min-count 20
+```
+
+For a real Obfuscapk benchmark, generate scenario PT files with
+`config/extract_obfuscapk.yaml`, map the changed APK hashes back to the clean
+test labels, then evaluate without retraining:
+
+```bash
+python scripts/build_obfuscapk_label_csvs.py \
+  --config config/extract_obfuscapk.yaml \
+  --clean-labels results/labels/test.csv \
+  --output-dir results/labels_obfuscapk
+
+python scripts/evaluate_aeg_checkpoint.py \
+  --checkpoint results/aeg_robust/full/ours/best.pt \
+  --config config/eval_obfuscapk.yaml \
+  --output-dir results/aeg_robust/full/ours/external
+```

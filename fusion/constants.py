@@ -4,6 +4,8 @@ import hashlib
 import json
 
 AEG_SCHEMA_VERSION = 6
+AEG_EXTRACTION_PIPELINE_VERSION = 1
+AEG_PAYLOAD_CONTRACT_VERSION = 1
 
 
 NODE_TYPES = {
@@ -139,3 +141,61 @@ AEG_SCHEMA_TABLES = {
 }
 
 AEG_SCHEMA_TABLE_FINGERPRINT = stable_table_hash(AEG_SCHEMA_TABLES)
+
+
+AEG_REQUIRED_PAYLOAD_FIELDS = (
+    "schema_version",
+    "aeg_schema_fingerprint",
+    "aeg_build_fingerprint",
+    "aeg_payload_contract_version",
+    "aeg_payload_contract_fingerprint",
+    "aeg_meta",
+    "sid",
+    "sha256",
+    "apk_name",
+    "split",
+    "package_name",
+    "year",
+    "sample_meta",
+    "storage_dtype",
+    "node_x",
+    "node_type",
+    "node_source",
+    "node_quality",
+    "node_semantic",
+    "edge_index",
+    "edge_type",
+    "edge_quality",
+    "edge_source",
+    "api_semantic_category_counts",
+    "graph_semantic_category_counts",
+    "manifest_category_counts",
+    "manifest_component_category_counts",
+    "manifest_stats",
+    "q_api",
+    "q_graph",
+    "q_manifest",
+    "q_align",
+    "pert_api",
+    "pert_graph",
+    "pert_manifest",
+    "manifest_parse_ok",
+    "manifest_parse_error",
+    "dex_success_ratio",
+    "multi_dex_total",
+    "multi_dex_success",
+    "graph_behavior_hints",
+    "graph_behavior_hint_start",
+    "graph_behavior_hint_dim",
+    "has_reflection",
+    "has_dynamic_loading",
+    "has_native",
+    "has_string_encryption_hint",
+)
+
+AEG_PAYLOAD_CONTRACT_FINGERPRINT = stable_table_hash(
+    {
+        "version": AEG_PAYLOAD_CONTRACT_VERSION,
+        "required_fields": AEG_REQUIRED_PAYLOAD_FIELDS,
+    }
+)

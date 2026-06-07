@@ -1,0 +1,11 @@
+base: extract_aeg.yaml
+
+data:
+  splits: [train]
+  require_all_label_ids: true
+
+manifest:
+  rebuild_vocab: false
+
+execution:
+  resume: true

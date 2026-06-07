@@ -1,7 +1,0 @@
-base: ../base.yaml
-
-train:
-  output_dir: results/aeg_robust/ablation/no_cross_source_contrast
-
-loss:
-  cross_source_contrast_weight: 0.0

@@ -1,0 +1,29 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/i1/typed_source_quality
+  checkpoint_metric: macro_f1
+
+model:
+  fusion_mode: latent
+  use_relation_types: true
+  use_node_source: true
+  use_edge_source: true
+  use_node_quality: true
+  use_edge_quality: true
+  source_bias_weight: 0.0
+  reliability_bias_weight: 0.0
+  conflict_bias_weight: 0.0
+
+loss:
+  clean_degraded_contrast_weight: 0.0
+  source_degraded_contrast_weight: 0.0
+  cross_source_contrast_weight: 0.0
+  counterfactual_kl_weight: 0.0
+
+robust:
+  train_aug: false
+
+eval:
+  robust_val:
+    enabled: false

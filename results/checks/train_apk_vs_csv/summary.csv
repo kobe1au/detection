@@ -1,0 +1,2 @@
+﻿"apk_dir","csv_path","apk_count","csv_count","matched_count","apk_without_csv_count","csv_without_apk_count","duplicate_csv_id_count","duplicate_apk_stem_count","report_dir"
+"D:\train","results\labels\train.csv","5528","10337","5442","86","4895","0","0","D:\code\detection\results\checks\train_apk_vs_csv"

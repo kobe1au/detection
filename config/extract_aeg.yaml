@@ -2,20 +2,30 @@ data:
   splits: [train, val, test]
   # Prefer split_dirs when train/val/test APKs live on different drives.
   split_dirs:
-    train: D:/resource/train
-    val: D:/resource/val
-    test: D:/resource/test
+    train: E:/train
+    val: E:/val
+    test: E:/test
   out_root: D:/pts_aeg
   out_dirs:
     train: D:/pts_aeg/train
     val: D:/pts_aeg/val
     test: D:/pts_aeg/test
+  # Only APKs whose actual SHA256 appears in the corresponding label CSV are
+  # converted. This prevents extra APKs from producing PT/CSV mismatches.
+  label_csvs:
+    train: results/labels/train.csv
+    val: results/labels/val.csv
+    test: results/labels/test.csv
+  filter_to_label_csv: true
+  require_all_label_ids: true
   hash_files: true
 
 graph:
   vocab_size: 256
   sensitive_hops: 1
   max_methods_per_dex: 4096
+  # Bound total APK graph size. The builder divides this budget across all DEX files.
+  max_methods_per_apk: 4096
   fallback_max_methods: 512
   fallback_policy: api_rich
   # Canonical AEG experiments keep graph method features code-structural.
@@ -26,6 +36,7 @@ graph:
 api:
   num_hash_buckets: 8192
   max_events_per_dex: 1024
+  max_events_per_apk: 4096
   max_events_per_method: 32
   event_scope: all_methods
   framework_only: true
@@ -42,10 +53,18 @@ manifest:
 
 aeg:
   node_feature_dim: 128
+  # Compact on-disk tensors are converted back to float32/long by Dataset.
+  storage_dtype: float16
   keep_method_names: true
   keep_api_tokens: true
+  # Raw graph/API/Manifest intermediates are used while constructing the AEG
+  # but are not needed by training. Keeping them would substantially enlarge PT files.
+  retain_intermediate_features: false
 
 execution:
-  workers: 4
+  workers: 8
+  # Exact SHA256 is still computed for split integrity. Hashing is I/O-bound;
+  # keep this modest on HDDs and benchmark 1/2/4 on the actual storage.
+  hash_workers: 4
   resume: true
   fail_on_error: false

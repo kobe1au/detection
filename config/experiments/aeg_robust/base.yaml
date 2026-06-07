@@ -21,6 +21,7 @@ train:
   eval_batch_size: 48
   num_workers: 4
   pin_memory: false
+  persistent_eval_workers: false
   lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
@@ -32,6 +33,14 @@ model:
   layers: 2
   dropout: 0.15
   num_latents: 16
+  fusion_mode: latent
+  use_relation_types: true
+  use_node_types: true
+  use_node_source: true
+  use_edge_source: true
+  use_node_quality: true
+  use_edge_quality: true
+  source_bias_weight: 1.0
   reliability_bias_weight: 1.0
   conflict_bias_weight: 0.5
   num_classes: 2
@@ -46,6 +55,9 @@ loss:
 
 robust:
   train_aug: true
+  # Primary experiments use a deterministic, label-agnostic donor. An
+  # opposite-label donor is only appropriate for an explicitly named stress test.
+  manifest_donor_mode: cyclic
   perturb_prob: 0.5
   perturb_strengths: [0.1, 0.3, 0.5]
   train_views:

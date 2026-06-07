@@ -1,0 +1,7 @@
+base: ../full/ours.yaml
+
+train:
+  output_dir: results/aeg_robust/i3/no_conflict_bias
+
+model:
+  conflict_bias_weight: 0.0

@@ -203,11 +203,14 @@ def _iter_basic_blocks(ma: Any):
         return []
 
 
-def parse_invoke_targets_from_method(m: Any) -> List[Tuple[str, str, str]]:
+def parse_invoke_targets_from_method(
+    m: Any,
+    instructions: Sequence[Any] | None = None,
+) -> List[Tuple[str, str, str]]:
     targets: List[Tuple[str, str, str]] = []
     pat = re.compile(r"(\[*L[^;]+;)->([^\s(]+)(\([^)]*\)\S*)")
 
-    for ins in _iter_method_instructions(m):
+    for ins in instructions if instructions is not None else _iter_method_instructions(m):
         try:
             name = str(ins.get_name()).lower()
         except Exception:
@@ -289,6 +292,8 @@ def build_method_local_cfg_embedding(
     ma: Any,
     m: Any,
     vocab_size: int = 256,
+    method_instructions: Sequence[Any] | None = None,
+    invoke_targets: Sequence[Tuple[str, str, str]] | None = None,
 ) -> Tuple[np.ndarray, Tuple[int, int], bool]:
     blocks = _iter_basic_blocks(ma)
     block_hists: List[np.ndarray] = []
@@ -322,7 +327,7 @@ def build_method_local_cfg_embedding(
                     except Exception:
                         pass
     else:
-        instructions = _iter_method_instructions(m)
+        instructions = list(method_instructions) if method_instructions is not None else _iter_method_instructions(m)
         block_hists.append(_block_histogram(instructions, vocab_size))
 
     if not block_hists:
@@ -333,9 +338,8 @@ def build_method_local_cfg_embedding(
     max_hist = h.max(axis=0)
 
     num_blocks = len(block_hists)
-    num_instr = 0
-    for ins in _iter_method_instructions(m):
-        num_instr += 1
+    instructions = list(method_instructions) if method_instructions is not None else _iter_method_instructions(m)
+    num_instr = len(instructions)
 
     stats = np.asarray(
         [
@@ -351,7 +355,8 @@ def build_method_local_cfg_embedding(
         int(min(starts)) if starts else 0,
         int(max(ends)) if ends else int(num_instr),
     )
-    sensitive = any(is_sensitive_callee(cls, name) for cls, name, _ in parse_invoke_targets_from_method(m))
+    targets = invoke_targets if invoke_targets is not None else parse_invoke_targets_from_method(m, instructions)
+    sensitive = any(is_sensitive_callee(cls, name) for cls, name, _ in targets)
     return emb, span, sensitive
 
 
@@ -692,23 +697,20 @@ def build_graph_api_for_dex(
     if m_all == 0:
         return _empty_dex_result(dim, "no_methods", use_graph_behavior_hints)
 
-    method_embs: List[np.ndarray] = []
-    method_spans: List[Tuple[int, int]] = []
     sensitive_seed: Set[int] = set()
     method_names: List[str] = []
     events_by_method: List[List[ApiEvent]] = []
+    invoke_targets_by_method: List[List[Tuple[str, str, str]]] = []
 
     for idx, (ma, m) in enumerate(zip(ma_list, method_list)):
-        emb, span, is_sensitive = build_method_local_cfg_embedding(
-            ma=ma,
-            m=m,
-            vocab_size=vocab_size,
-        )
+        method_instructions = _iter_method_instructions(m)
+        invoke_targets = parse_invoke_targets_from_method(m, method_instructions)
+        is_sensitive = any(is_sensitive_callee(cls, name) for cls, name, _ in invoke_targets)
         if is_sensitive:
             sensitive_seed.add(idx)
 
         cur_events: List[ApiEvent] = []
-        for cls, name, desc in parse_invoke_targets_from_method(m):
+        for cls, name, desc in invoke_targets:
             if not should_keep_api(cls, framework_only=framework_only):
                 continue
 
@@ -726,20 +728,11 @@ def build_graph_api_for_dex(
         if max_api_events_per_method > 0 and len(cur_events) > max_api_events_per_method:
             cur_events = select_api_events(cur_events, max_api_events_per_method)
 
-        if use_graph_behavior_hints:
-            hints = build_graph_lite_behavior_hints(
-                cur_events,
-                is_sensitive_method=is_sensitive,
-                count_norm=max_api_events_per_method,
-            )
-            emb = np.concatenate([emb, hints], axis=0).astype(np.float32)
-
-        method_embs.append(emb)
-        method_spans.append(span)
         method_names.append(canonical_method_sig_from_method(m))
         events_by_method.append(cur_events)
+        invoke_targets_by_method.append(invoke_targets)
 
-    dim = int(method_embs[0].shape[0])
+    dim = out_dim
 
     invoke_total = 0
     invoke_internal_hit = 0
@@ -747,8 +740,8 @@ def build_graph_api_for_dex(
     edges_full: Set[Tuple[int, int]] = set()
     neighbors_undirected: Dict[int, Set[int]] = {i: set() for i in range(m_all)}
 
-    for u, m in enumerate(method_list):
-        for cls, name, desc in parse_invoke_targets_from_method(m):
+    for u, invoke_targets in enumerate(invoke_targets_by_method):
+        for cls, name, desc in invoke_targets:
             invoke_total += 1
             v = method_to_idx.get(canonical_method_sig(cls, name, desc))
             if v is not None:
@@ -792,8 +785,32 @@ def build_graph_api_for_dex(
     kept_sorted = sorted(kept_nodes)
     old2new = {old: new for new, old in enumerate(kept_sorted)}
 
-    x_np = np.stack([method_embs[i] for i in kept_sorted], axis=0).astype(np.float16)
-    spans_np = np.asarray([method_spans[i] for i in kept_sorted], dtype=np.int32)
+    # Local CFG embeddings are the expensive part of extraction. Selection only
+    # depends on invoke targets and API events, so build CFG features after
+    # selecting nodes and avoid computing representations that will be dropped.
+    kept_method_embs: List[np.ndarray] = []
+    kept_method_spans: List[Tuple[int, int]] = []
+    for old_idx in kept_sorted:
+        method_instructions = _iter_method_instructions(method_list[old_idx])
+        emb, span, _is_sensitive = build_method_local_cfg_embedding(
+            ma=ma_list[old_idx],
+            m=method_list[old_idx],
+            vocab_size=vocab_size,
+            method_instructions=method_instructions,
+            invoke_targets=invoke_targets_by_method[old_idx],
+        )
+        if use_graph_behavior_hints:
+            hints = build_graph_lite_behavior_hints(
+                events_by_method[old_idx],
+                is_sensitive_method=old_idx in sensitive_seed,
+                count_norm=max_api_events_per_method,
+            )
+            emb = np.concatenate([emb, hints], axis=0).astype(np.float32)
+        kept_method_embs.append(emb)
+        kept_method_spans.append(span)
+
+    x_np = np.stack(kept_method_embs, axis=0).astype(np.float16)
+    spans_np = np.asarray(kept_method_spans, dtype=np.int32)
     sensitive_mask_np = np.asarray(
         [1 if i in sensitive_seed else 0 for i in kept_sorted],
         dtype=np.uint8,

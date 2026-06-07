@@ -49,6 +49,7 @@ class ManifestRecord:
     sid: str
     apk_name: str = ""
     sha256: str = ""
+    package_name: str = ""
     permissions: list[str] = field(default_factory=list)
     activities: list[str] = field(default_factory=list)
     services: list[str] = field(default_factory=list)
@@ -70,6 +71,7 @@ class ManifestRecord:
             "sid": self.sid,
             "apk_name": self.apk_name,
             "sha256": self.sha256,
+            "package_name": str(self.package_name or "").strip().lower(),
             "permissions": sorted(set(self.permissions)),
             "activities": sorted(set(self.activities)),
             "services": sorted(set(self.services)),
@@ -161,6 +163,12 @@ def _xml_components_and_intents(manifest_xml) -> tuple[dict[str, list[str]], lis
     return components, actions, categories, exported_count, component_details
 
 
+def _xml_package_name(manifest_xml) -> str:
+    if manifest_xml is None:
+        return ""
+    return str(manifest_xml.attrib.get("package", "") or "").strip().lower()
+
+
 def extract_manifest_record(apk_path: str | Path, sid: str | None = None) -> ManifestRecord:
     apk_path = Path(apk_path)
     rec = ManifestRecord(sid=(sid or apk_path.stem).lower(), apk_name=apk_path.name)
@@ -168,6 +176,10 @@ def extract_manifest_record(apk_path: str | Path, sid: str | None = None) -> Man
         from androguard.core.apk import APK
 
         apk = APK(str(apk_path))
+        try:
+            rec.package_name = str(apk.get_package() or "").strip().lower()
+        except Exception:
+            rec.package_name = ""
         rec.permissions = _lower_tokens(apk.get_permissions() or [])
         rec.activities = _lower_tokens(apk.get_activities() or [])
         rec.services = _lower_tokens(apk.get_services() or [])
@@ -186,6 +198,8 @@ def extract_manifest_record(apk_path: str | Path, sid: str | None = None) -> Man
             manifest_xml = apk.get_android_manifest_xml()
         except Exception:
             manifest_xml = None
+        if not rec.package_name:
+            rec.package_name = _xml_package_name(manifest_xml)
         xml_components, actions, categories, exported_count, component_details = _xml_components_and_intents(manifest_xml)
         rec.intent_actions = _lower_tokens(actions)
         rec.intent_categories = _lower_tokens(categories)
@@ -474,6 +488,7 @@ def vectorize_manifest_record(
         "manifest_meta": {
             "apk_name": record.get("apk_name", ""),
             "sha256": record.get("sha256", ""),
+            "package_name": str(record.get("package_name", "") or "").strip().lower(),
             "permissions": permissions,
             "intent_actions": _lower_tokens(record.get("intent_actions") or []),
             "intent_categories": _lower_tokens(record.get("intent_categories") or []),

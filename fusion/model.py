@@ -51,9 +51,17 @@ def _masked_semantic_mean(data: Batch, mask: torch.Tensor, num_graphs: int) -> t
 
 
 class RelationalGraphLayer(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float = 0.1,
+        *,
+        use_relation_types: bool = True,
+        use_edge_source: bool = True,
+    ):
         super().__init__()
         self.rel_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(NUM_EDGE_TYPES)])
+        self.shared_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.edge_source_emb = nn.Embedding(NUM_SOURCE_TYPES, hidden_dim)
         self.update = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -62,6 +70,8 @@ class RelationalGraphLayer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.norm = nn.LayerNorm(hidden_dim)
+        self.use_relation_types = bool(use_relation_types)
+        self.use_edge_source = bool(use_edge_source)
 
     def forward(
         self,
@@ -82,15 +92,19 @@ class RelationalGraphLayer(nn.Module):
 
         agg = torch.zeros_like(h)
         deg = torch.zeros((h.size(0), 1), dtype=h.dtype, device=h.device)
-        for rel_id, proj in enumerate(self.rel_proj):
-            mask = edge_type == rel_id
+        relation_iter = enumerate(self.rel_proj) if self.use_relation_types else [(None, self.shared_proj)]
+        for rel_id, proj in relation_iter:
+            mask = torch.ones_like(edge_type, dtype=torch.bool) if rel_id is None else edge_type == rel_id
             if not bool(mask.any()):
                 continue
             src = src_all[mask]
             dst = dst_all[mask]
             src_type = edge_source[mask].long().clamp(0, NUM_SOURCE_TYPES - 1)
             weight = edge_quality[mask].clamp_min(0.0).unsqueeze(-1)
-            msg = proj(h[src] + self.edge_source_emb(src_type)) * weight
+            msg_input = h[src]
+            if self.use_edge_source:
+                msg_input = msg_input + self.edge_source_emb(src_type)
+            msg = proj(msg_input) * weight
             agg.index_add_(0, dst, msg)
             deg.index_add_(0, dst, weight)
         agg = agg / deg.clamp_min(1.0)
@@ -105,6 +119,7 @@ class LatentReliabilityFusion(nn.Module):
         dropout: float = 0.1,
         reliability_bias_weight: float = 1.0,
         conflict_bias_weight: float = 0.5,
+        source_bias_weight: float = 1.0,
     ) -> None:
         super().__init__()
         self.latents = nn.Parameter(torch.randn(num_latents, hidden_dim) / math.sqrt(hidden_dim))
@@ -120,6 +135,7 @@ class LatentReliabilityFusion(nn.Module):
         )
         self.reliability_bias_weight = float(reliability_bias_weight)
         self.conflict_bias_weight = float(conflict_bias_weight)
+        self.source_bias_weight = float(source_bias_weight)
 
     def forward(
         self,
@@ -127,7 +143,7 @@ class LatentReliabilityFusion(nn.Module):
         token_reliability: torch.Tensor,
         conflict: torch.Tensor,
         token_source: torch.Tensor,
-        manifest_token_mask: torch.Tensor,
+        token_conflict_sensitivity: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, _, dim = tokens.shape
         query = self.q_proj(self.latents).unsqueeze(0).expand(bsz, -1, -1)
@@ -138,13 +154,9 @@ class LatentReliabilityFusion(nn.Module):
         rel = token_reliability.clamp_min(1e-4).to(dtype=scores.dtype)
         scores = scores + self.reliability_bias_weight * torch.log(rel).unsqueeze(1)
         source_bias = self.source_score_bias(token_source.long().clamp(0, NUM_SOURCE_TYPES - 1)).view(1, 1, -1)
-        scores = scores + source_bias
-        manifest_mask = manifest_token_mask.to(device=scores.device, dtype=torch.bool).view(1, 1, -1)
-        scores = torch.where(
-            manifest_mask,
-            scores - self.conflict_bias_weight * conflict.view(-1, 1, 1),
-            scores,
-        )
+        scores = scores + self.source_bias_weight * source_bias
+        conflict_sensitivity = token_conflict_sensitivity.to(device=scores.device, dtype=scores.dtype).view(1, 1, -1)
+        scores = scores - self.conflict_bias_weight * conflict.view(-1, 1, 1) * conflict_sensitivity
 
         attn = torch.softmax(scores, dim=-1)
         fused_latents = torch.einsum("bls,bsd->bld", attn, value)
@@ -165,22 +177,48 @@ class AEGModel(nn.Module):
         num_latents: int = 16,
         reliability_bias_weight: float = 1.0,
         conflict_bias_weight: float = 0.5,
+        source_bias_weight: float = 1.0,
+        use_node_source: bool = True,
+        use_node_types: bool = True,
+        use_edge_source: bool = True,
+        use_node_quality: bool = True,
+        use_edge_quality: bool = True,
+        use_relation_types: bool = True,
+        fusion_mode: str = "latent",
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
+        self.use_node_source = bool(use_node_source)
+        self.use_node_types = bool(use_node_types)
+        self.use_node_quality = bool(use_node_quality)
+        self.use_edge_quality = bool(use_edge_quality)
+        self.fusion_mode = str(fusion_mode or "latent").lower()
+        if self.fusion_mode not in {"latent", "mean_pool"}:
+            raise ValueError(f"Unsupported fusion_mode: {fusion_mode!r}")
         self.input_proj = nn.Linear(int(node_input_dim), hidden_dim)
         self.node_type_emb = nn.Embedding(NUM_NODE_TYPES, hidden_dim)
         self.source_emb = nn.Embedding(NUM_SOURCE_TYPES, hidden_dim)
         self.quality_proj = nn.Linear(1, hidden_dim)
         self.semantic_proj = nn.Linear(SEMANTIC_CATEGORY_DIM, hidden_dim)
         self.dropout = nn.Dropout(dropout)
-        self.layers = nn.ModuleList([RelationalGraphLayer(hidden_dim, dropout) for _ in range(int(layers))])
+        self.layers = nn.ModuleList(
+            [
+                RelationalGraphLayer(
+                    hidden_dim,
+                    dropout,
+                    use_relation_types=use_relation_types,
+                    use_edge_source=use_edge_source,
+                )
+                for _ in range(int(layers))
+            ]
+        )
         self.fusion = LatentReliabilityFusion(
             hidden_dim,
             num_latents=num_latents,
             dropout=dropout,
             reliability_bias_weight=reliability_bias_weight,
             conflict_bias_weight=conflict_bias_weight,
+            source_bias_weight=source_bias_weight,
         )
         self.classifier = nn.Sequential(
             nn.LayerNorm(hidden_dim),
@@ -202,13 +240,13 @@ class AEGModel(nn.Module):
         node_source = data.node_source.long().clamp(0, NUM_SOURCE_TYPES - 1)
         quality = data.node_quality.float().view(-1, 1).clamp(0.0, 1.0)
         semantic = data.node_semantic.float()
-        h = (
-            self.input_proj(x)
-            + self.node_type_emb(node_type)
-            + self.source_emb(node_source)
-            + self.quality_proj(quality)
-            + self.semantic_proj(semantic)
-        )
+        h = self.input_proj(x) + self.semantic_proj(semantic)
+        if self.use_node_types:
+            h = h + self.node_type_emb(node_type)
+        if self.use_node_source:
+            h = h + self.source_emb(node_source)
+        if self.use_node_quality:
+            h = h + self.quality_proj(quality)
         alive = (quality > 0).to(dtype=h.dtype)
         return self.dropout(h) * alive
 
@@ -220,14 +258,17 @@ class AEGModel(nn.Module):
         edge_type = data.edge_type.long().to(data.x.device)
         edge_quality = data.edge_quality.float().to(data.x.device)
         edge_source = data.edge_source.long().to(data.x.device)
-        node_alive = data.node_quality.float().to(data.x.device).view(-1, 1).clamp(0.0, 1.0)
-        node_alive_mask = (node_alive.view(-1) > 0)
+        node_quality = data.node_quality.float().to(data.x.device).view(-1, 1).clamp(0.0, 1.0)
+        node_alive_mask = node_quality.view(-1) > 0
+        node_weight = node_quality if self.use_node_quality else node_alive_mask.to(dtype=node_quality.dtype).view(-1, 1)
         edge_index = data.edge_index.to(data.x.device)
         if edge_index.numel() > 0 and edge_quality.numel() == edge_index.size(1):
             src, dst = edge_index.long()
-            edge_quality = edge_quality * node_alive.view(-1)[src] * node_alive.view(-1)[dst]
+            if not self.use_edge_quality:
+                edge_quality = (edge_quality > 0).to(dtype=edge_quality.dtype)
+            edge_quality = edge_quality * node_weight.view(-1)[src] * node_weight.view(-1)[dst]
         for layer in self.layers:
-            h = layer(h, edge_index, edge_type, edge_source, edge_quality) * node_alive
+            h = layer(h, edge_index, edge_type, edge_source, edge_quality) * node_weight
 
         source_code = (data.node_source == SOURCE_TYPES["code"]) & node_alive_mask
         source_manifest = (data.node_source == SOURCE_TYPES["manifest"]) & node_alive_mask
@@ -250,18 +291,36 @@ class AEGModel(nn.Module):
 
         code_sem = _masked_semantic_mean(data, source_code, num_graphs)
         manifest_sem = _masked_semantic_mean(data, source_manifest, num_graphs)
-        sim = F.cosine_similarity(code_sem, manifest_sem, dim=-1).clamp(-1.0, 1.0)
-        conflict = ((1.0 - sim) * 0.5).clamp(0.0, 1.0)
+        sim = F.cosine_similarity(code_sem, manifest_sem, dim=-1).clamp(0.0, 1.0)
+        both_semantic_available = (
+            (code_sem.norm(dim=-1) > 1e-8)
+            & (manifest_sem.norm(dim=-1) > 1e-8)
+        ).to(dtype=sim.dtype)
+        # Absence is handled by reliability; disagreement is only meaningful
+        # when both sources expose observable semantic evidence.
+        conflict = ((1.0 - sim) * both_semantic_available).clamp(0.0, 1.0)
 
         q_api = _graph_scalar(data, "q_api", 0.0).to(data.x.device)
         q_graph = _graph_scalar(data, "q_graph", 0.0).to(data.x.device)
         q_manifest = _graph_scalar(data, "q_manifest", 0.0).to(data.x.device)
         q_align = _graph_scalar(data, "q_align", 0.0).to(data.x.device)
-        code_rel = (q_api.clamp_min(0.0) * q_graph.clamp_min(0.0)).sqrt()
+        pert_api = _graph_scalar(data, "pert_api", 0.0).to(data.x.device).clamp(0.0, 1.0)
+        pert_graph = _graph_scalar(data, "pert_graph", 0.0).to(data.x.device).clamp(0.0, 1.0)
+        pert_manifest = _graph_scalar(data, "pert_manifest", 0.0).to(data.x.device).clamp(0.0, 1.0)
+        r_api = q_api.clamp(0.0, 1.0) * (1.0 - pert_api)
+        r_graph = q_graph.clamp(0.0, 1.0) * (1.0 - pert_graph)
+        r_manifest = q_manifest.clamp(0.0, 1.0) * (1.0 - pert_manifest)
+        # q_align is a soft correspondence-quality cue, not proof that API and
+        # graph semantics must agree. It therefore modulates rather than gates
+        # the code-side reliability.
+        code_rel = (
+            (r_api * r_graph).sqrt()
+            * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
+        ).clamp(0.0, 1.0)
         risk_rel = _masked_mean(data.node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
-        global_rel = torch.stack([code_rel, q_manifest], dim=-1).amax(dim=-1)
+        global_rel = torch.stack([code_rel, r_manifest], dim=-1).amax(dim=-1)
         token_rel = torch.stack(
-            [q_graph, q_api, q_manifest, q_manifest, risk_rel, q_api, global_rel],
+            [r_graph, r_api, r_manifest, r_manifest, risk_rel, r_api, global_rel],
             dim=-1,
         ).clamp(0.0, 1.0)
         tokens = torch.stack(
@@ -281,8 +340,24 @@ class AEGModel(nn.Module):
             dtype=torch.long,
             device=data.x.device,
         )
-        manifest_token_mask = torch.tensor([False, False, True, True, False, False, False], device=data.x.device)
-        fused, attention_mass = self.fusion(tokens, token_rel, conflict, token_source, manifest_token_mask)
+        # Direct Manifest tokens are fully conflict-sensitive. Mixed derived
+        # tokens are only softly suppressed because they may also contain
+        # valid code-side evidence.
+        token_conflict_sensitivity = torch.tensor(
+            [0.0, 0.0, 1.0, 1.0, 0.5, 0.0, 0.25],
+            device=data.x.device,
+        )
+        if self.fusion_mode == "mean_pool":
+            fused = tokens.mean(dim=1)
+            attention_mass = tokens.new_full((num_graphs, tokens.size(1)), 1.0 / tokens.size(1))
+        else:
+            fused, attention_mass = self.fusion(
+                tokens,
+                token_rel,
+                conflict,
+                token_source,
+                token_conflict_sensitivity,
+            )
         logits = self.classifier(fused)
         extra = {
             "fused_emb": fused,
@@ -302,8 +377,14 @@ class AEGModel(nn.Module):
             "q_graph": q_graph.detach(),
             "q_manifest": q_manifest.detach(),
             "q_align": q_align.detach(),
+            "pert_api": pert_api.detach(),
+            "pert_graph": pert_graph.detach(),
+            "pert_manifest": pert_manifest.detach(),
+            "r_api": r_api.detach(),
+            "r_graph": r_graph.detach(),
+            "r_manifest": r_manifest.detach(),
             "code_reliability": code_rel.detach(),
-            "manifest_reliability": q_manifest.detach(),
+            "manifest_reliability": r_manifest.detach(),
             "view_type_id": _graph_scalar(data, "view_type_id", 0.0).detach(),
             "cf_weight": _graph_scalar(data, "cf_weight", 0.0).detach(),
         }
@@ -324,4 +405,12 @@ def build_model(cfg: dict[str, Any], node_input_dim: int) -> AEGModel:
         num_latents=int(model_cfg.get("num_latents", 16)),
         reliability_bias_weight=float(model_cfg.get("reliability_bias_weight", 1.0)),
         conflict_bias_weight=float(model_cfg.get("conflict_bias_weight", 0.5)),
+        source_bias_weight=float(model_cfg.get("source_bias_weight", 1.0)),
+        use_node_source=bool(model_cfg.get("use_node_source", True)),
+        use_node_types=bool(model_cfg.get("use_node_types", True)),
+        use_edge_source=bool(model_cfg.get("use_edge_source", True)),
+        use_node_quality=bool(model_cfg.get("use_node_quality", True)),
+        use_edge_quality=bool(model_cfg.get("use_edge_quality", True)),
+        use_relation_types=bool(model_cfg.get("use_relation_types", True)),
+        fusion_mode=str(model_cfg.get("fusion_mode", "latent")),
     )

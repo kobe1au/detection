@@ -14,9 +14,16 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from fusion.constants import (
+    AEG_PAYLOAD_CONTRACT_FINGERPRINT,
+    AEG_PAYLOAD_CONTRACT_VERSION,
+    AEG_SCHEMA_TABLE_FINGERPRINT,
+    AEG_SCHEMA_VERSION,
+)
 from fusion.dataset import AEGDataset, aeg_collate_fn, split_label_stats
 from fusion.losses import compute_aeg_loss
 from fusion.model import build_model
+from fusion.payload_contract import validate_aeg_payload
 
 
 LOGGER = logging.getLogger(__name__)
@@ -155,6 +162,12 @@ def _make_dataset(cfg: dict[str, Any], split: str, *, aug: bool = False, view: s
         aug_strengths=[float(strength)] if strength is not None else list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
         seed=int((cfg.get("train", {}) or {}).get("seed", 42)),
         strict_integrity=bool(data_cfg.get("strict_integrity", True)),
+        manifest_donor_mode=str(robust_cfg.get("manifest_donor_mode", "cyclic")),
+        deterministic_aug=bool(view),
+        # Training preflight validates every PT exactly once before loaders are
+        # consumed. Revalidating all large tensors on every epoch is redundant
+        # and substantially slows disk-backed training.
+        validate_payload_on_load=False,
     )
 
 
@@ -170,24 +183,36 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
         shuffle=train,
         num_workers=workers,
         pin_memory=bool(train_cfg.get("pin_memory", False)),
-        persistent_workers=workers > 0,
+        # Robust evaluation constructs many scenario-specific loaders. Keeping
+        # every evaluation worker pool alive can exhaust RAM/file handles.
+        persistent_workers=workers > 0 and (
+            train or bool(train_cfg.get("persistent_eval_workers", False))
+        ),
         generator=generator,
         worker_init_fn=_seed_worker if workers > 0 else None,
         collate_fn=aeg_collate_fn,
     )
 
 
-def _sample_package_name(path: Path, cache: dict[Path, str]) -> str:
+def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dict[str, Any]:
     key = path.resolve()
     if key in cache:
         return cache[key]
     try:
         payload = torch.load(key, map_location="cpu")
-        package = str(payload.get("package_name") or "").strip().lower()
-    except Exception:
-        package = ""
-    cache[key] = package
-    return package
+        validate_aeg_payload(payload)
+        metadata = {
+            "package_name": str(payload.get("package_name") or "").strip().lower(),
+            "schema_version": int(payload.get("schema_version", 0) or 0),
+            "schema_fingerprint": str(payload.get("aeg_schema_fingerprint") or ""),
+            "build_fingerprint": str(payload.get("aeg_build_fingerprint") or ""),
+            "contract_version": int(payload.get("aeg_payload_contract_version", 0) or 0),
+            "contract_fingerprint": str(payload.get("aeg_payload_contract_fingerprint") or ""),
+        }
+    except Exception as exc:
+        raise ValueError(f"Failed to load AEG PT metadata from {key}: {type(exc).__name__}: {exc}") from exc
+    cache[key] = metadata
+    return metadata
 
 
 def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True) -> None:
@@ -195,7 +220,9 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
     conflicts: list[tuple[str, str, str]] = []
     package_seen: dict[str, tuple[str, str]] = {}
     package_conflicts: list[tuple[str, str, str, str, str]] = []
-    package_cache: dict[Path, str] = {}
+    metadata_cache: dict[Path, dict[str, Any]] = {}
+    build_fingerprints: dict[str, tuple[str, str]] = {}
+    invalid_metadata: list[tuple[str, str, str]] = []
     for dataset in datasets:
         for path, _label in dataset.samples:
             sid = path.stem.lower()
@@ -203,8 +230,22 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
             if prev is not None and prev != dataset.split:
                 conflicts.append((sid, prev, dataset.split))
             seen[sid] = dataset.split
+            metadata = _sample_build_metadata(path, metadata_cache)
+            if metadata["schema_version"] != AEG_SCHEMA_VERSION:
+                invalid_metadata.append((sid, dataset.split, f"schema_version={metadata['schema_version']}"))
+            elif metadata["schema_fingerprint"] != AEG_SCHEMA_TABLE_FINGERPRINT:
+                invalid_metadata.append((sid, dataset.split, "schema_fingerprint_mismatch"))
+            elif metadata["contract_version"] != AEG_PAYLOAD_CONTRACT_VERSION:
+                invalid_metadata.append((sid, dataset.split, f"contract_version={metadata['contract_version']}"))
+            elif metadata["contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
+                invalid_metadata.append((sid, dataset.split, "contract_fingerprint_mismatch"))
+            build_fingerprint = metadata["build_fingerprint"]
+            if not build_fingerprint:
+                invalid_metadata.append((sid, dataset.split, "missing_build_fingerprint"))
+            else:
+                build_fingerprints.setdefault(build_fingerprint, (dataset.split, sid))
             if check_package:
-                package = _sample_package_name(path, package_cache)
+                package = metadata["package_name"]
                 if package:
                     package_prev = package_seen.get(package)
                     if package_prev is not None and package_prev[0] != dataset.split:
@@ -213,6 +254,14 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
                         package_seen.setdefault(package, (dataset.split, sid))
     if conflicts:
         raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
+    if invalid_metadata:
+        raise ValueError(f"Invalid AEG PT build metadata: count={len(invalid_metadata)} examples={invalid_metadata[:5]}")
+    if len(build_fingerprints) != 1:
+        examples = [(fingerprint, split, sid) for fingerprint, (split, sid) in list(build_fingerprints.items())[:5]]
+        raise ValueError(
+            "Mixed AEG build fingerprints across train/val/test. "
+            f"count={len(build_fingerprints)} examples={examples}"
+        )
     if package_conflicts:
         raise ValueError(
             "Package name overlap across splits: "
@@ -301,10 +350,25 @@ def evaluate(
                     "q_graph": float(extra["q_graph"][idx].item()),
                     "q_manifest": float(extra["q_manifest"][idx].item()),
                     "q_align": float(extra["q_align"][idx].item()),
+                    "pert_api": float(data.pert_api[idx].item()),
+                    "pert_graph": float(data.pert_graph[idx].item()),
+                    "pert_manifest": float(data.pert_manifest[idx].item()),
+                    "r_api": float(extra["r_api"][idx].item()),
+                    "r_graph": float(extra["r_graph"][idx].item()),
+                    "r_manifest": float(extra["r_manifest"][idx].item()),
                     "code_reliability": float(extra["code_reliability"][idx].item()),
                     "manifest_reliability": float(extra["manifest_reliability"][idx].item()),
                     "code_manifest_similarity": float(extra["code_manifest_similarity"][idx].item()),
                     "code_manifest_conflict": float(extra["code_manifest_conflict"][idx].item()),
+                    "year": int(data.year[idx].item()),
+                    "manifest_parse_ok": int(data.manifest_parse_ok[idx].item()),
+                    "dex_success_ratio": float(data.dex_success_ratio[idx].item()),
+                    "multi_dex_total": int(data.multi_dex_total[idx].item()),
+                    "multi_dex_success": int(data.multi_dex_success[idx].item()),
+                    "has_reflection": int(data.has_reflection[idx].item()),
+                    "has_dynamic_loading": int(data.has_dynamic_loading[idx].item()),
+                    "has_native": int(data.has_native[idx].item()),
+                    "has_string_encryption_hint": int(data.has_string_encryption_hint[idx].item()),
                     "manifest_donor_sid": batch.get("manifest_donor_sid", [""] * y.numel())[idx]
                     if idx < len(batch.get("manifest_donor_sid", []))
                     else "",
@@ -437,6 +501,7 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
     robust_val_loaders = _robust_val_loaders(cfg)
     first_payload = torch.load(train_ds.samples[0][0], map_location="cpu")
     node_input_dim = int(first_payload["node_x"].size(1))
+    aeg_build_fingerprint = str(first_payload["aeg_build_fingerprint"])
     model = build_model(cfg, node_input_dim).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -472,7 +537,18 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
         if score > best_score:
             best_score = score
             best_epoch = epoch
-            torch.save({"model": model.state_dict(), "cfg": cfg, "epoch": epoch, "score": best_score}, out_dir / "best.pt")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "cfg": cfg,
+                    "epoch": epoch,
+                    "score": best_score,
+                    "node_input_dim": node_input_dim,
+                    "aeg_build_fingerprint": aeg_build_fingerprint,
+                    "aeg_payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
+                },
+                out_dir / "best.pt",
+            )
         elif epoch - best_epoch >= patience:
             LOGGER.info("Early stopping at epoch %s; best epoch %s", epoch, best_epoch)
             break

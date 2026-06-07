@@ -1,0 +1,7 @@
+base: multiview_contrast.yaml
+
+train:
+  output_dir: results/aeg_robust/i2/no_cross_source_contrast
+
+loss:
+  cross_source_contrast_weight: 0.0

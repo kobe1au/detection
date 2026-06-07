@@ -142,6 +142,20 @@ def _source_contrast_weights(
     return code_weight, manifest_weight, risk_weight
 
 
+def _fused_contrast_weight(
+    clean_extra: dict[str, torch.Tensor],
+    aug_extra: dict[str, torch.Tensor],
+    ref: torch.Tensor,
+) -> torch.Tensor:
+    clean_code = _extra_vector(clean_extra, "code_reliability", ref, 1.0)
+    aug_code = _extra_vector(aug_extra, "code_reliability", ref, 1.0)
+    clean_manifest = _extra_vector(clean_extra, "manifest_reliability", ref, 1.0)
+    aug_manifest = _extra_vector(aug_extra, "manifest_reliability", ref, 1.0)
+    clean_available = torch.maximum(clean_code, clean_manifest)
+    aug_available = torch.maximum(aug_code, aug_manifest)
+    return torch.minimum(clean_available, aug_available).clamp(0.0, 1.0)
+
+
 def compute_aeg_loss(
     clean_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -165,7 +179,12 @@ def compute_aeg_loss(
     source_aug = clean_logits.new_tensor(0.0)
     cf_kl = clean_logits.new_tensor(0.0)
     if aug_logits is not None and aug_extra is not None:
-        clean_aug = _info_nce(clean_extra["fused_emb"], aug_extra["fused_emb"], temperature)
+        clean_aug = _info_nce(
+            clean_extra["fused_emb"],
+            aug_extra["fused_emb"],
+            temperature,
+            _fused_contrast_weight(clean_extra, aug_extra, clean_logits),
+        )
         code_weight, manifest_weight, risk_weight = _source_contrast_weights(clean_extra, aug_extra, clean_logits)
         source_terms = [
             _info_nce(clean_extra["method_emb"], aug_extra["method_emb"], temperature, code_weight),

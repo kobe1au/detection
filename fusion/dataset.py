@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 from pathlib import Path
 from typing import Any
@@ -10,18 +11,18 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
 from fusion.constants import (
-    AEG_SCHEMA_VERSION,
-    AEG_SCHEMA_TABLE_FINGERPRINT,
-    AEG_SCHEMA_TABLES,
     EDGE_TYPES,
     NODE_TYPES,
     SOURCE_TYPES,
     VIEW_TYPES,
 )
-from fusion.perturbations import apply_aeg_view, clear_aggregate_apk_semantic, refresh_risk_node_quality
-from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
-
-
+from fusion.payload_contract import AEGPayloadContractError, validate_aeg_payload
+from fusion.perturbations import (
+    apply_aeg_view,
+    clear_aggregate_apk_semantic,
+    refresh_apk_node_quality,
+    refresh_risk_node_quality,
+)
 class AEGDatasetConfigError(RuntimeError):
     pass
 
@@ -60,7 +61,7 @@ def _read_labels(path: str | Path | None) -> dict[str, int]:
             raise AEGDatasetConfigError(f"Empty label CSV: {path}")
         field_map = {name.lower(): name for name in reader.fieldnames}
         id_field = None
-        for candidate in ("id", "sha256", "sid", "sample_id", "apk_sha256"):
+        for candidate in ("sha256", "apk_sha256", "id", "sid", "sample_id"):
             if candidate in field_map:
                 id_field = field_map[candidate]
                 break
@@ -115,65 +116,29 @@ def _scalar_tensor(payload: dict[str, Any], key: str, default: float = 0.0) -> t
     return torch.tensor([float(default)], dtype=torch.float32)
 
 
-def _fit_1d(value: torch.Tensor, length: int, *, dtype: torch.dtype, fill: float = 0.0) -> torch.Tensor:
-    out = value.to(dtype=dtype).view(-1)
-    if out.numel() < length:
-        pad = torch.full((length - out.numel(),), fill, dtype=dtype)
-        out = torch.cat([out, pad], dim=0)
-    return out[:length]
-
-
-def _fit_2d(value: torch.Tensor, rows: int, cols: int, *, dtype: torch.dtype) -> torch.Tensor:
-    out = value.to(dtype=dtype)
-    if out.ndim != 2:
-        out = torch.empty((0, cols), dtype=dtype)
-    if out.size(1) < cols:
-        out = torch.cat([out, torch.zeros((out.size(0), cols - out.size(1)), dtype=dtype)], dim=1)
-    elif out.size(1) > cols:
-        out = out[:, :cols]
-    if out.size(0) < rows:
-        out = torch.cat([out, torch.zeros((rows - out.size(0), cols), dtype=dtype)], dim=0)
-    return out[:rows]
-
-
-def payload_to_data(payload: dict[str, Any], *, label: int | None = None) -> Data:
-    schema = int(payload.get("schema_version", 0) or 0)
-    if schema != AEG_SCHEMA_VERSION:
-        raise AEGDatasetConfigError(
-            f"Expected AEG schema_version={AEG_SCHEMA_VERSION}, got {schema}. "
-            "Regenerate PT files with scripts/build_aeg_pts_direct.py."
-        )
-    if payload.get("aeg_schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
-        meta = payload.get("aeg_meta") or {}
-        if meta.get("schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
+def payload_to_data(
+    payload: dict[str, Any],
+    *,
+    label: int | None = None,
+    validate_payload: bool = True,
+) -> Data:
+    if validate_payload:
+        try:
+            validate_aeg_payload(payload)
+        except AEGPayloadContractError as exc:
             raise AEGDatasetConfigError(
-                f"AEG schema table fingerprint mismatch for {payload.get('sid', '<unknown>')}. "
-                "Regenerate PT files because node/edge/source/view type tables changed."
-            )
-    meta = payload.get("aeg_meta") or {}
-    for key, expected in AEG_SCHEMA_TABLES.items():
-        if key in meta and dict(meta[key]) != expected:
-            raise AEGDatasetConfigError(
-                f"AEG {key} table mismatch for {payload.get('sid', '<unknown>')}. "
-                "Regenerate PT files with the current code."
-            )
+                f"Invalid AEG PT payload for {payload.get('sid', '<unknown>')}: {exc}"
+            ) from exc
 
     node_x = _tensor(payload, "node_x", torch.float32)
-    if node_x.ndim != 2 or node_x.size(0) == 0:
-        raise AEGDatasetConfigError(f"AEG sample {payload.get('sid', '<unknown>')} has no nodes")
-    num_nodes = int(node_x.size(0))
     edge_index = _tensor(payload, "edge_index", torch.long, (2, 0))
-    if edge_index.ndim != 2 or edge_index.size(0) != 2:
-        raise AEGDatasetConfigError(f"AEG sample {payload.get('sid', '<unknown>')} has invalid edge_index")
-    num_edges = int(edge_index.size(1))
-
-    edge_type = _fit_1d(_tensor(payload, "edge_type", torch.long, (0,)), num_edges, dtype=torch.long, fill=0)
-    edge_quality = _fit_1d(_tensor(payload, "edge_quality", torch.float32, (0,)), num_edges, dtype=torch.float32, fill=1.0)
-    edge_source = _fit_1d(_tensor(payload, "edge_source", torch.long, (0,)), num_edges, dtype=torch.long, fill=0)
-    node_type = _fit_1d(_tensor(payload, "node_type", torch.long, (num_nodes,)), num_nodes, dtype=torch.long, fill=0)
-    node_source = _fit_1d(_tensor(payload, "node_source", torch.long, (num_nodes,)), num_nodes, dtype=torch.long, fill=0)
-    node_quality = _fit_1d(_tensor(payload, "node_quality", torch.float32, (num_nodes,)), num_nodes, dtype=torch.float32, fill=0.0)
-    node_semantic = _fit_2d(_tensor(payload, "node_semantic", torch.float32), num_nodes, SEMANTIC_CATEGORY_DIM, dtype=torch.float32)
+    edge_type = _tensor(payload, "edge_type", torch.long).view(-1)
+    edge_quality = _tensor(payload, "edge_quality", torch.float32).view(-1)
+    edge_source = _tensor(payload, "edge_source", torch.long).view(-1)
+    node_type = _tensor(payload, "node_type", torch.long).view(-1)
+    node_source = _tensor(payload, "node_source", torch.long).view(-1)
+    node_quality = _tensor(payload, "node_quality", torch.float32).view(-1)
+    node_semantic = _tensor(payload, "node_semantic", torch.float32)
 
     y_value = label if label is not None else int(payload.get("label", 0) or 0)
     data = Data(
@@ -190,6 +155,9 @@ def payload_to_data(payload: dict[str, Any], *, label: int | None = None) -> Dat
         q_graph=_scalar_tensor(payload, "q_graph"),
         q_manifest=_scalar_tensor(payload, "q_manifest"),
         q_align=_scalar_tensor(payload, "q_align"),
+        pert_api=_scalar_tensor(payload, "pert_api"),
+        pert_graph=_scalar_tensor(payload, "pert_graph"),
+        pert_manifest=_scalar_tensor(payload, "pert_manifest"),
         y=torch.tensor([int(y_value)], dtype=torch.long),
     )
     data.sid = str(payload.get("sid") or payload.get("sha256") or "").lower()
@@ -200,6 +168,16 @@ def payload_to_data(payload: dict[str, Any], *, label: int | None = None) -> Dat
     data.cf_weight = torch.tensor([0.0], dtype=torch.float32)
     data.manifest_parse_ok = torch.tensor([1.0 if payload.get("manifest_parse_ok", True) else 0.0], dtype=torch.float32)
     data.dex_success_ratio = torch.tensor([float(payload.get("dex_success_ratio", 1.0) or 0.0)], dtype=torch.float32)
+    data.year = torch.tensor([int(payload.get("year", 0) or 0)], dtype=torch.long)
+    data.multi_dex_total = torch.tensor([int(payload.get("multi_dex_total", 0) or 0)], dtype=torch.long)
+    data.multi_dex_success = torch.tensor([int(payload.get("multi_dex_success", 0) or 0)], dtype=torch.long)
+    data.has_reflection = torch.tensor([1.0 if payload.get("has_reflection", False) else 0.0], dtype=torch.float32)
+    data.has_dynamic_loading = torch.tensor([1.0 if payload.get("has_dynamic_loading", False) else 0.0], dtype=torch.float32)
+    data.has_native = torch.tensor([1.0 if payload.get("has_native", False) else 0.0], dtype=torch.float32)
+    data.has_string_encryption_hint = torch.tensor(
+        [1.0 if payload.get("has_string_encryption_hint", False) else 0.0],
+        dtype=torch.float32,
+    )
     data.graph_behavior_hints = torch.tensor([1.0 if payload.get("graph_behavior_hints", False) else 0.0], dtype=torch.float32)
     data.graph_behavior_hint_start = torch.tensor([int(payload.get("graph_behavior_hint_start", 0) or 0)], dtype=torch.long)
     data.graph_behavior_hint_dim = torch.tensor([int(payload.get("graph_behavior_hint_dim", 0) or 0)], dtype=torch.long)
@@ -219,6 +197,9 @@ class AEGDataset(Dataset):
         aug_prob: float = 0.5,
         seed: int = 42,
         strict_integrity: bool = True,
+        validate_payload_on_load: bool = True,
+        manifest_donor_mode: str = "cyclic",
+        deterministic_aug: bool = False,
     ) -> None:
         self.pt_dir = Path(pt_dir)
         if not self.pt_dir.exists():
@@ -229,7 +210,10 @@ class AEGDataset(Dataset):
         self.aug_views = list(aug_views or ("api_degraded", "graph_degraded", "api_graph_degraded", "manifest_degraded", "all_degraded"))
         self.aug_strengths = [float(v) for v in (aug_strengths or (0.1, 0.3, 0.5))]
         self.aug_prob = float(aug_prob)
-        _ = seed
+        self.validate_payload_on_load = bool(validate_payload_on_load)
+        self.manifest_donor_mode = str(manifest_donor_mode or "cyclic").lower()
+        self.seed = int(seed)
+        self.deterministic_aug = bool(deterministic_aug)
 
         pt_files = sorted(self.pt_dir.glob("*.pt"))
         pt_ids = {path.stem.lower() for path in pt_files}
@@ -253,7 +237,10 @@ class AEGDataset(Dataset):
         if not samples:
             raise AEGDatasetConfigError(f"No AEG PT samples found in {self.pt_dir}")
         self.samples = samples
-        self.manifest_donor_indices = _build_manifest_donor_indices(samples)
+        self.manifest_donor_indices = _build_manifest_donor_indices(
+            samples,
+            mode=self.manifest_donor_mode,
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -261,13 +248,23 @@ class AEGDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Data]:
         path, label = self.samples[idx]
         payload = torch.load(path, map_location="cpu")
-        clean = payload_to_data(payload, label=label)
+        clean = payload_to_data(payload, label=label, validate_payload=self.validate_payload_on_load)
         out = {"clean": clean}
         selected_view = "clean"
         if self.train_aug and float(torch.rand(()).item()) < self.aug_prob and self.aug_views:
             selected_view = self.aug_views[int(torch.randint(len(self.aug_views), (1,)).item())]
             strength = self.aug_strengths[int(torch.randint(len(self.aug_strengths), (1,)).item())]
-            out["aug"] = apply_aeg_view(clean, view=selected_view, strength=strength)
+            if self.deterministic_aug:
+                digest = hashlib.blake2b(
+                    f"{self.seed}:{clean.sid}:{selected_view}:{strength:.8f}".encode("utf-8"),
+                    digest_size=8,
+                ).digest()
+                deterministic_seed = int.from_bytes(digest, byteorder="little", signed=False)
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(deterministic_seed)
+                    out["aug"] = apply_aeg_view(clean, view=selected_view, strength=strength)
+            else:
+                out["aug"] = apply_aeg_view(clean, view=selected_view, strength=strength)
         else:
             out["aug"] = apply_aeg_view(clean, view="clean", strength=0.0)
         if selected_view == "manifest_shuffled":
@@ -275,7 +272,11 @@ class AEGDataset(Dataset):
             if donor_idx is not None:
                 donor_path, donor_label = self.samples[donor_idx]
                 donor_payload = torch.load(donor_path, map_location="cpu")
-                out["manifest_donor"] = payload_to_data(donor_payload, label=donor_label)
+                out["manifest_donor"] = payload_to_data(
+                    donor_payload,
+                    label=donor_label,
+                    validate_payload=self.validate_payload_on_load,
+                )
         return out
 
 
@@ -315,8 +316,10 @@ def _copy_manifest_content(target: Data, donor: Data) -> None:
         target.node_quality[target_idx] = donor.node_quality[repeat]
         target.node_semantic[target_idx] = donor.node_semantic[repeat]
     target.q_manifest = donor.q_manifest.clone()
+    target.pert_manifest = torch.tensor([1.0], dtype=torch.float32, device=target.x.device)
     _zero_shuffled_manifest_edges(target)
     clear_aggregate_apk_semantic(target)
+    refresh_apk_node_quality(target)
     refresh_risk_node_quality(target)
 
 
@@ -326,9 +329,10 @@ def _zero_manifest_nodes(data: Data) -> None:
         data.x[mask] = 0.0
         data.node_quality[mask] = 0.0
         data.node_semantic[mask] = 0.0
-    data.q_manifest = torch.tensor([0.0], dtype=torch.float32)
+    data.pert_manifest = torch.tensor([1.0], dtype=torch.float32, device=data.x.device)
     _zero_shuffled_manifest_edges(data)
     clear_aggregate_apk_semantic(data)
+    refresh_apk_node_quality(data)
     refresh_risk_node_quality(data)
 
 
@@ -354,15 +358,25 @@ def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data], dono
             _copy_manifest_content(aug, donor)
 
 
-def _build_manifest_donor_indices(samples: list[tuple[Path, int | None]]) -> list[int | None]:
+def _build_manifest_donor_indices(
+    samples: list[tuple[Path, int | None]],
+    *,
+    mode: str = "cyclic",
+) -> list[int | None]:
     n = len(samples)
     if n <= 1:
         return [None] * n
+    mode = str(mode or "cyclic").lower()
+    if mode not in {"cyclic", "opposite_label"}:
+        raise AEGDatasetConfigError(
+            "manifest_donor_mode must be 'cyclic' or 'opposite_label'; "
+            f"got {mode!r}"
+        )
     donors: list[int | None] = []
     labels = [label for _path, label in samples]
     for idx, label in enumerate(labels):
         donor_idx: int | None = None
-        if label is not None:
+        if mode == "opposite_label" and label is not None:
             for offset in range(1, n):
                 cand = (idx + offset) % n
                 cand_label = labels[cand]

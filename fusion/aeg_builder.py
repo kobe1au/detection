@@ -6,8 +6,11 @@ from collections import defaultdict
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from fusion.constants import (
+    AEG_PAYLOAD_CONTRACT_FINGERPRINT,
+    AEG_PAYLOAD_CONTRACT_VERSION,
     AEG_SCHEMA_VERSION,
     AEG_SCHEMA_TABLE_FINGERPRINT,
     AEG_SCHEMA_TABLES,
@@ -154,6 +157,26 @@ def _node_feature(base_dim: int, values: list[float] | torch.Tensor | None = Non
     return out
 
 
+def _compress_method_feature(feature: torch.Tensor, out_dim: int) -> torch.Tensor:
+    """Compress a full method-CFG vector without arbitrary prefix truncation.
+
+    The extractor emits two opcode histograms followed by three structural
+    statistics. When compression is required, pool the histogram portion and
+    preserve the structural statistics explicitly.
+    """
+
+    feature = torch.nan_to_num(feature.float().view(-1), nan=0.0, posinf=0.0, neginf=0.0)
+    out_dim = int(out_dim)
+    if feature.numel() <= out_dim:
+        return _node_feature(out_dim, feature)
+    if out_dim <= 3 or feature.numel() <= 3:
+        return _node_feature(out_dim, feature)
+    structural_stats = feature[-3:]
+    histogram = feature[:-3].view(1, 1, -1)
+    pooled = F.adaptive_avg_pool1d(histogram, out_dim - 3).view(-1)
+    return torch.cat([pooled, structural_stats], dim=0)
+
+
 def _normalize_name(value: str) -> str:
     text = str(value or "").lower()
     text = text.replace("/", ".").replace("$", ".")
@@ -259,6 +282,8 @@ def build_aeg_payload(
     manifest_record: dict[str, Any],
     direct_meta: dict[str, Any],
     node_feature_dim: int = 128,
+    retain_intermediate_features: bool = False,
+    storage_dtype: str = "float32",
 ) -> dict[str, Any]:
     flat = _flatten_dex_list(dex_list)
     call_x = flat["call_x"]
@@ -290,7 +315,10 @@ def build_aeg_payload(
         sanitize_semantic_counts(api_semantic_counts_from_type_ids(api_type_ids))
         + sanitize_semantic_counts(manifest_payload.get("manifest_category_counts"))
     )
-    apk_node = builder.add_node("APK", "derived", max(q_api, q_graph, q_manifest), apk_sem, [q_api, q_graph, q_manifest, q_align, dex_success_ratio])
+    # Quality is represented by node_quality and graph-level q_* fields. Keep
+    # node_x content-only so quality ablations cannot recover the same signal
+    # through a duplicated feature channel.
+    apk_node = builder.add_node("APK", "derived", max(q_api, q_graph, q_manifest), apk_sem)
 
     method_nodes = []
     method_sem = torch.zeros((num_methods, SEMANTIC_CATEGORY_DIM), dtype=torch.float32)
@@ -301,8 +329,8 @@ def build_aeg_payload(
 
     for idx in range(num_methods):
         feature = call_x[idx] if idx < call_x.size(0) else None
-        if feature is not None and feature.numel() > node_feature_dim:
-            feature = feature[:node_feature_dim]
+        if feature is not None:
+            feature = _compress_method_feature(feature, node_feature_dim)
         node = builder.add_node("METHOD", "code", q_graph, method_sem[idx], feature)
         method_nodes.append(node)
         builder.add_edge(apk_node, node, "APK_HAS_METHOD", q_graph, "code")
@@ -318,7 +346,7 @@ def build_aeg_payload(
             api_type_counts[int(value)] += 1
     for type_id, count in sorted(api_type_counts.items()):
         sem = _api_type_semantic(type_id)
-        feature = [float(type_id) / 32.0, math.log1p(count) / 8.0, q_api]
+        feature = [float(type_id) / 32.0, math.log1p(count) / 8.0]
         api_family_nodes[type_id] = builder.add_node("API_FAMILY", "code", q_api, sem, feature)
 
     if method_api_edge_index.numel() > 0:
@@ -338,7 +366,7 @@ def build_aeg_payload(
     for perm_id in perm_ids.tolist():
         row = int(perm_id) - 1
         sem = perm_map[row] if perm_map.ndim == 2 and 0 <= row < perm_map.size(0) else torch.zeros(SEMANTIC_CATEGORY_DIM)
-        node = builder.add_node("PERMISSION", "manifest", q_manifest, sem, [float(perm_id) / 512.0, q_manifest])
+        node = builder.add_node("PERMISSION", "manifest", q_manifest, sem, [float(perm_id) / 512.0])
         permission_nodes.append((int(perm_id), node, sem))
         builder.add_edge(apk_node, node, "APK_REQUESTS_PERMISSION", q_manifest, "manifest")
 
@@ -350,7 +378,7 @@ def build_aeg_payload(
     for idx, intent_id in enumerate(intent_ids.tolist()):
         row = int(intent_id) - 1
         sem = intent_map[row] if intent_map.ndim == 2 and 0 <= row < intent_map.size(0) else torch.zeros(SEMANTIC_CATEGORY_DIM)
-        node = builder.add_node("INTENT", "manifest", q_manifest, sem, [float(intent_id) / 512.0, q_manifest])
+        node = builder.add_node("INTENT", "manifest", q_manifest, sem, [float(intent_id) / 512.0])
         intent_nodes.append(node)
         if idx < len(intent_tokens):
             intent_token_to_node[intent_tokens[idx]] = node
@@ -359,7 +387,7 @@ def build_aeg_payload(
     method_name_norm = [_normalize_name(v) for v in flat["method_names"]]
     for comp_name, comp_type, comp_intents in _component_records(manifest_record):
         sem = category_counts_from_strings([comp_name], list(SEMANTIC_CATEGORIES))
-        feature = [float(comp_type) / 4.0, q_manifest]
+        feature = [float(comp_type) / 4.0]
         comp_node = builder.add_node("COMPONENT", "manifest", q_manifest, sem, feature)
         component_nodes.append(comp_node)
         builder.add_edge(apk_node, comp_node, "APK_HAS_COMPONENT", q_manifest, "manifest")
@@ -412,20 +440,29 @@ def build_aeg_payload(
 
     graph = builder.tensors()
 
-    return {
+    payload = {
         "schema_version": AEG_SCHEMA_VERSION,
         "aeg_schema_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
         "aeg_build_fingerprint": str(direct_meta.get("aeg_build_fingerprint", "")),
+        "aeg_payload_contract_version": AEG_PAYLOAD_CONTRACT_VERSION,
+        "aeg_payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
         "sid": sid,
         "sha256": sid,
         "apk_name": apk_name,
         "split": split,
         "package_name": str(manifest_record.get("package_name", "")),
         "year": int(manifest_record.get("year", 0) or 0),
-        **flat,
+        "sample_meta": dict(manifest_record.get("sample_meta") or {}),
+        "storage_dtype": str(storage_dtype),
         "api_semantic_category_counts": api_semantic_counts_from_type_ids(api_type_ids).float(),
         "graph_semantic_category_counts": method_sem.sum(dim=0).float(),
-        **manifest_payload,
+        "manifest_category_counts": _as_tensor(
+            manifest_payload.get("manifest_category_counts"), dtype=torch.float32
+        ).view(-1),
+        "manifest_component_category_counts": _as_tensor(
+            manifest_payload.get("manifest_component_category_counts"), dtype=torch.float32
+        ).view(-1),
+        "manifest_stats": _as_tensor(manifest_payload.get("manifest_stats"), dtype=torch.float32).view(-1),
         "q_api": torch.tensor([q_api], dtype=torch.float32),
         "q_graph": torch.tensor([q_graph], dtype=torch.float32),
         "q_manifest": torch.tensor([q_manifest], dtype=torch.float32),
@@ -434,21 +471,13 @@ def build_aeg_payload(
         "pert_graph": torch.tensor([0.0], dtype=torch.float32),
         "pert_manifest": torch.tensor([0.0], dtype=torch.float32),
         **graph,
-        "apk_node": int(apk_node),
-        "method_nodes": torch.tensor(method_nodes, dtype=torch.long),
-        "api_family_nodes": torch.tensor(list(api_family_nodes.values()), dtype=torch.long),
-        "permission_nodes": torch.tensor([node for _pid, node, _sem in permission_nodes], dtype=torch.long),
-        "intent_nodes": torch.tensor(intent_nodes, dtype=torch.long),
-        "component_nodes": torch.tensor(component_nodes, dtype=torch.long),
-        "risk_nodes": torch.tensor(risk_nodes, dtype=torch.long),
-        "string_hint_nodes": torch.tensor(string_hint_nodes, dtype=torch.long),
-        "method_api_edges": method_api_edge_index.long(),
-        "method_call_edges": call_edge_index.long(),
         "manifest_parse_ok": not bool((manifest_payload.get("manifest_meta") or {}).get("parse_error")),
         "manifest_parse_error": str((manifest_payload.get("manifest_meta") or {}).get("parse_error") or ""),
         "dex_success_ratio": float(dex_success_ratio),
         "multi_dex_total": int(direct_meta.get("num_dex_total", len(dex_list))),
         "multi_dex_success": int(direct_meta.get("num_dex_success", len(dex_list))),
+        "method_budget_per_dex": int(direct_meta.get("method_budget_per_dex", 0) or 0),
+        "api_event_budget_per_dex": int(direct_meta.get("api_event_budget_per_dex", 0) or 0),
         "graph_behavior_hints": bool(direct_meta.get("use_graph_behavior_hints", False)),
         "graph_behavior_hint_start": int(direct_meta.get("graph_behavior_hint_start", 0) or 0),
         "graph_behavior_hint_dim": int(direct_meta.get("graph_behavior_hint_dim", 0) or 0),
@@ -464,3 +493,29 @@ def build_aeg_payload(
             "node_feature_dim": int(node_feature_dim),
         },
     }
+    if retain_intermediate_features:
+        payload.update(
+            {
+                "apk_node": int(apk_node),
+                "method_nodes": torch.tensor(method_nodes, dtype=torch.long),
+                "api_family_nodes": torch.tensor(list(api_family_nodes.values()), dtype=torch.long),
+                "permission_nodes": torch.tensor([node for _pid, node, _sem in permission_nodes], dtype=torch.long),
+                "intent_nodes": torch.tensor(intent_nodes, dtype=torch.long),
+                "component_nodes": torch.tensor(component_nodes, dtype=torch.long),
+                "risk_nodes": torch.tensor(risk_nodes, dtype=torch.long),
+                "string_hint_nodes": torch.tensor(string_hint_nodes, dtype=torch.long),
+                "method_api_edges": method_api_edge_index.long(),
+                "method_call_edges": call_edge_index.long(),
+            }
+        )
+        payload.update(flat)
+        payload.update(manifest_payload)
+    if storage_dtype == "float16":
+        for key in ("node_x", "node_quality", "node_semantic", "edge_quality"):
+            payload[key] = payload[key].half()
+        payload["edge_index"] = payload["edge_index"].int()
+        for key in ("node_type", "node_source", "edge_type", "edge_source"):
+            payload[key] = payload[key].to(dtype=torch.uint8)
+    elif storage_dtype != "float32":
+        raise ValueError(f"Unsupported AEG storage dtype: {storage_dtype}")
+    return payload
