@@ -566,6 +566,108 @@ def test_aeg_builder_filters_jobs_to_label_csv(tmp_path: Path):
         )
 
 
+def test_vocab_only_automatically_scans_train_only():
+    from scripts.build_aeg_pts_direct import _load_config, _parse_config
+
+    raw = _load_config(Path("config/extract_aeg.yaml"))
+    args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=True, vocab_only=True)
+    cfg = _parse_config(raw, args)
+    assert cfg["splits"] == ["train"]
+    assert set(cfg["split_dirs"]) == {"train"}
+    assert set(cfg["label_csvs"]) == {"train"}
+
+
+def test_aeg_apk_hash_cache_reuses_unchanged_files(tmp_path: Path):
+    from scripts.build_aeg_pts_direct import _collect_apks
+
+    apk_dir = tmp_path / "train"
+    apk_dir.mkdir()
+    apk = apk_dir / "sample.apk"
+    apk.write_bytes(b"first")
+    cache_path = tmp_path / "hash_cache.csv"
+
+    first = _collect_apks({"train": apk_dir}, ["train"], hash_cache_path=cache_path)
+    second = _collect_apks({"train": apk_dir}, ["train"], hash_cache_path=cache_path)
+    assert first[0]["hash_cache_hit"] is False
+    assert second[0]["hash_cache_hit"] is True
+    assert first[0]["sha256"] == second[0]["sha256"]
+
+    apk.write_bytes(b"changed-content")
+    third = _collect_apks({"train": apk_dir}, ["train"], hash_cache_path=cache_path)
+    assert third[0]["hash_cache_hit"] is False
+    assert third[0]["sha256"] != first[0]["sha256"]
+
+
+def test_aeg_apk_container_preflight_classifies_invalid_files(tmp_path: Path):
+    import zipfile
+
+    from scripts.build_aeg_pts_direct import _scan_invalid_apk_containers
+
+    apk_dir = tmp_path / "train"
+    apk_dir.mkdir()
+    (apk_dir / "empty.apk").write_bytes(b"")
+    (apk_dir / "invalid.apk").write_bytes(b"\0" * 64)
+    with zipfile.ZipFile(apk_dir / "valid.apk", "w") as archive:
+        archive.writestr("AndroidManifest.xml", "manifest")
+
+    invalid = _scan_invalid_apk_containers({"train": apk_dir}, ["train"])
+    assert {(row["apk_name"], row["status"]) for row in invalid} == {
+        ("empty.apk", "zero_byte"),
+        ("invalid.apk", "non_zip_content"),
+    }
+
+
+def test_invalid_extra_apk_is_not_required_by_labels(tmp_path: Path):
+    from scripts.build_aeg_pts_direct import _invalid_apks_required_by_labels
+
+    label_csv = tmp_path / "train.csv"
+    with label_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "label"])
+        writer.writeheader()
+        writer.writerow({"id": "required", "label": 0})
+    rows = [
+        {"split": "train", "filename_id": "required", "status": "zero_byte"},
+        {"split": "train", "filename_id": "extra", "status": "zero_byte"},
+    ]
+    blocking = _invalid_apks_required_by_labels(rows, {"train": label_csv})
+    assert [row["filename_id"] for row in blocking] == ["required"]
+
+
+def test_aeg_apk_scan_index_marks_zero_and_content_mismatch(tmp_path: Path):
+    from scripts.build_aeg_pts_direct import _write_apk_scan_index
+
+    label_csv = tmp_path / "train.csv"
+    with label_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "label"])
+        writer.writeheader()
+        writer.writerow({"id": "expected", "label": 0})
+    report = tmp_path / "scan.csv"
+    _write_apk_scan_index(
+        [
+            {
+                "split": "train",
+                "apk_name": "expected.apk",
+                "apk_path": "expected.apk",
+                "filename_id": "expected",
+                "sha256": "different",
+                "size_bytes": 10,
+            },
+            {
+                "split": "train",
+                "apk_name": "empty.apk",
+                "apk_path": "empty.apk",
+                "filename_id": "empty",
+                "sha256": "e3b0",
+                "size_bytes": 0,
+            },
+        ],
+        {"train": label_csv},
+        report,
+    )
+    rows = list(csv.DictReader(report.open("r", encoding="utf-8")))
+    assert [row["status"] for row in rows] == ["content_hash_mismatch", "zero_byte"]
+
+
 def test_source_hash_is_stable_across_line_endings(tmp_path: Path):
     from scripts.build_aeg_pts_direct import _sha256_text_file
 

@@ -265,44 +265,268 @@ def _filter_jobs_to_labels(
     return filtered, ignored
 
 
+def _read_hash_cache(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return {
+            str(row.get("apk_path") or ""): dict(row)
+            for row in csv.DictReader(f)
+            if str(row.get("apk_path") or "") and str(row.get("sha256") or "")
+        }
+
+
+def _write_hash_cache(path: Path, cache: dict[str, dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["apk_path", "size_bytes", "mtime_ns", "sha256"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(cache[key] for key in sorted(cache))
+
+
+def _apk_container_status(path: Path) -> str:
+    try:
+        if path.stat().st_size <= 0:
+            return "zero_byte"
+        if not zipfile.is_zipfile(path):
+            return "non_zip_content"
+        with zipfile.ZipFile(path) as archive:
+            return "valid_apk_container" if "AndroidManifest.xml" in archive.namelist() else "zip_without_manifest"
+    except (OSError, zipfile.BadZipFile):
+        return "read_error"
+
+
+def _scan_invalid_apk_containers(
+    split_dirs: dict[str, Path],
+    splits: list[str],
+    *,
+    workers: int = 1,
+) -> list[dict[str, Any]]:
+    invalid: list[dict[str, Any]] = []
+    for split in splits:
+        split_dir = split_dirs[split]
+        if not split_dir.exists():
+            continue
+        paths = sorted(p for p in split_dir.iterdir() if p.is_file() and p.suffix.lower() == ".apk")
+        if workers > 1 and paths:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                statuses = list(
+                    tqdm(
+                        ex.map(_apk_container_status, paths),
+                        total=len(paths),
+                        desc=f"validate APK {split}",
+                        unit="apk",
+                    )
+                )
+        else:
+            statuses = [
+                _apk_container_status(path)
+                for path in tqdm(paths, desc=f"validate APK {split}", unit="apk")
+            ]
+        for path, status in zip(paths, statuses):
+            if status != "valid_apk_container":
+                try:
+                    size_bytes = path.stat().st_size
+                except OSError:
+                    size_bytes = -1
+                invalid.append(
+                    {
+                        "split": split,
+                        "apk_name": path.name,
+                        "apk_path": str(path.resolve()),
+                        "filename_id": path.stem.lower(),
+                        "size_bytes": size_bytes,
+                        "status": status,
+                    }
+                )
+    return invalid
+
+
+def _write_invalid_apk_report(rows: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["split", "apk_name", "apk_path", "filename_id", "size_bytes", "status"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _invalid_apks_required_by_labels(
+    rows: list[dict[str, Any]],
+    label_csvs: dict[str, Path],
+) -> list[dict[str, Any]]:
+    if not label_csvs:
+        return rows
+    allowed = {
+        split: _read_label_ids(label_path)
+        for split, label_path in label_csvs.items()
+    }
+    return [
+        row
+        for row in rows
+        if str(row.get("filename_id") or "").lower() in allowed.get(str(row.get("split") or ""), set())
+    ]
+
+
+def _cached_sha256(
+    path: Path,
+    stat: Any,
+    cache: dict[str, dict[str, str]],
+) -> tuple[str | None, bool]:
+    key = str(path.resolve())
+    row = cache.get(key)
+    if (
+        row
+        and str(row.get("size_bytes") or "") == str(stat.st_size)
+        and str(row.get("mtime_ns") or "") == str(stat.st_mtime_ns)
+        and len(str(row.get("sha256") or "")) == 64
+    ):
+        return str(row["sha256"]).lower(), True
+    return None, False
+
+
 def _collect_apks(
     split_dirs: dict[str, Path],
     splits: list[str],
     *,
     hash_files: bool = True,
     hash_workers: int = 1,
+    hash_cache_path: Path | None = None,
+    excluded_paths: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    cache = _read_hash_cache(hash_cache_path) if hash_files and hash_cache_path else {}
+    excluded = excluded_paths or set()
     jobs: list[dict[str, Any]] = []
     for split in splits:
         split_dir = split_dirs[split]
         if not split_dir.exists():
             continue
-        paths = sorted(p for p in split_dir.iterdir() if p.is_file() and p.suffix.lower() == ".apk")
-        hashes: list[str]
-        if hash_files and hash_workers > 1 and paths:
+        paths = sorted(
+            p
+            for p in split_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() == ".apk"
+            and str(p.resolve()) not in excluded
+        )
+        stats = [path.stat() for path in paths]
+        hashes: list[str | None] = [None] * len(paths)
+        cache_hits = [False] * len(paths)
+        pending: list[tuple[int, Path]] = []
+        if hash_files:
+            for index, (path, stat) in enumerate(zip(paths, stats)):
+                sha256, hit = _cached_sha256(path, stat, cache)
+                hashes[index] = sha256
+                cache_hits[index] = hit
+                if sha256 is None:
+                    pending.append((index, path))
+        if hash_files and hash_workers > 1 and pending:
             with ThreadPoolExecutor(max_workers=hash_workers) as ex:
-                hashes = list(
+                computed = list(
                     tqdm(
-                        ex.map(_sha256_file, paths),
-                        total=len(paths),
+                        ex.map(_sha256_file, (path for _, path in pending)),
+                        total=len(pending),
                         desc=f"scan/hash {split}",
                         unit="apk",
                     )
                 )
-        elif hash_files:
-            hashes = [_sha256_file(path) for path in tqdm(paths, desc=f"scan/hash {split}", unit="apk")]
-        else:
+            for (index, _), sha256 in zip(pending, computed):
+                hashes[index] = sha256
+        elif hash_files and pending:
+            computed = [
+                _sha256_file(path)
+                for _, path in tqdm(pending, desc=f"scan/hash {split}", unit="apk")
+            ]
+            for (index, _), sha256 in zip(pending, computed):
+                hashes[index] = sha256
+        elif not hash_files:
             hashes = [path.stem.lower() for path in paths]
-        for apk_path, sha256 in zip(paths, hashes):
+        for apk_path, stat, sha256, cache_hit in zip(paths, stats, hashes, cache_hits):
+            if sha256 is None:
+                raise RuntimeError(f"Failed to compute SHA256 for {apk_path}")
+            resolved_path = str(apk_path.resolve())
+            cache[resolved_path] = {
+                "apk_path": resolved_path,
+                "size_bytes": str(stat.st_size),
+                "mtime_ns": str(stat.st_mtime_ns),
+                "sha256": sha256,
+            }
             jobs.append(
                 {
                     "split": split,
-                    "apk_path": str(apk_path),
+                    "apk_path": resolved_path,
                     "apk_name": apk_path.name,
                     "sha256": sha256,
+                    "filename_id": apk_path.stem.lower(),
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "hash_cache_hit": cache_hit,
                 }
             )
+    if hash_files and hash_cache_path:
+        _write_hash_cache(hash_cache_path, cache)
     return jobs
+
+
+def _write_apk_scan_index(
+    jobs: list[dict[str, Any]],
+    label_csvs: dict[str, Path],
+    path: Path,
+) -> None:
+    allowed = {
+        split: _read_label_ids(label_path)
+        for split, label_path in label_csvs.items()
+    }
+    rows: list[dict[str, Any]] = []
+    for job in jobs:
+        split = str(job["split"])
+        filename_id = str(job.get("filename_id") or "").lower()
+        actual_sha256 = str(job["sha256"]).lower()
+        split_allowed = allowed.get(split, set())
+        size_bytes = int(job.get("size_bytes") or 0)
+        filename_in_labels = filename_id in split_allowed
+        actual_in_labels = actual_sha256 in split_allowed
+        if size_bytes == 0:
+            status = "zero_byte"
+        elif actual_sha256 == filename_id and actual_in_labels:
+            status = "ok"
+        elif actual_in_labels:
+            status = "actual_hash_in_labels_wrong_filename"
+        elif filename_in_labels:
+            status = "content_hash_mismatch"
+        else:
+            status = "not_in_label_csv"
+        rows.append(
+            {
+                "split": split,
+                "apk_name": job["apk_name"],
+                "apk_path": job["apk_path"],
+                "filename_id": filename_id,
+                "actual_sha256": actual_sha256,
+                "size_bytes": size_bytes,
+                "filename_in_label_csv": int(filename_in_labels),
+                "actual_sha_in_label_csv": int(actual_in_labels),
+                "hash_cache_hit": int(bool(job.get("hash_cache_hit", False))),
+                "status": status,
+            }
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "split",
+        "apk_name",
+        "apk_path",
+        "filename_id",
+        "actual_sha256",
+        "size_bytes",
+        "filename_in_label_csv",
+        "actual_sha_in_label_csv",
+        "hash_cache_hit",
+        "status",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _validate_split_counts(
@@ -342,14 +566,17 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     if not out_root_raw:
         raise ValueError("data.out_root is required")
     out_root = _resolve_path(out_root_raw)
-    splits = [str(v) for v in data.get("splits", ["train", "val", "test"])]
+    vocab_only = bool(getattr(args, "vocab_only", False))
+    configured_splits = [str(v) for v in data.get("splits", ["train", "val", "test"])]
+    if vocab_only and "train" not in configured_splits:
+        raise ValueError("--vocab-only requires train in data.splits")
+    splits = ["train"] if vocab_only else configured_splits
     split_dirs = _resolve_split_dirs(data, splits)
     out_dirs = _resolve_out_dirs(data, out_root, splits)
     label_csvs = _resolve_label_csvs(data, splits)
     vocab_path = _resolve_path(manifest.get("vocab_path", "config/manifest_vocab_aeg.yaml"))
     rebuild_vocab = bool(args.rebuild_vocab if args.rebuild_vocab is not None else manifest.get("rebuild_vocab", False))
     resume = bool(args.resume if args.resume is not None else execution.get("resume", True))
-    vocab_only = bool(getattr(args, "vocab_only", False))
     vocab_will_be_built = rebuild_vocab or not vocab_path.exists()
     if vocab_will_be_built and resume and not vocab_only:
         raise ValueError(
@@ -403,6 +630,9 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
         "require_all_label_ids": bool(data.get("require_all_label_ids", False)),
         "allow_empty_splits": bool(execution.get("allow_empty_splits", False)),
         "hash_files": bool(data.get("hash_files", True)),
+        "hash_cache_path": out_root / "aeg_apk_hash_cache.csv",
+        "scan_index_path": out_root / "aeg_apk_scan_index.csv",
+        "invalid_apk_report_path": out_root / "aeg_invalid_apks.csv",
         "vocab_path": vocab_path,
         "rebuild_vocab": rebuild_vocab,
         "manifest_dim": int(manifest.get("manifest_dim", 256)),
@@ -433,6 +663,7 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
         "storage_dtype": storage_dtype,
         "workers": workers,
         "hash_workers": hash_workers,
+        "validate_apk_containers": bool(execution.get("validate_apk_containers", True)),
         "resume": resume,
         "vocab_only": vocab_only,
         "fail_on_error": bool(execution.get("fail_on_error", False)),
@@ -732,22 +963,59 @@ def _validate_payload_for_save(payload: dict[str, Any], cfg: dict[str, Any], job
 
 def run(args: argparse.Namespace) -> None:
     cfg = _parse_config(_load_config(Path(args.config)), args)
+    invalid_apks: list[dict[str, Any]] = []
+    if cfg["validate_apk_containers"]:
+        invalid_apks = _scan_invalid_apk_containers(
+            cfg["split_dirs"],
+            cfg["splits"],
+            workers=cfg["hash_workers"],
+        )
+        _write_invalid_apk_report(invalid_apks, cfg["invalid_apk_report_path"])
+        if invalid_apks:
+            blocking_invalid = (
+                _invalid_apks_required_by_labels(invalid_apks, cfg["label_csvs"])
+                if cfg["filter_to_label_csv"]
+                else invalid_apks
+            )
+            reported_invalid = blocking_invalid or invalid_apks
+            counts: dict[str, int] = {}
+            for row in reported_invalid:
+                key = f"{row['split']}:{row['status']}"
+                counts[key] = counts.get(key, 0) + 1
+            message = (
+                "Invalid APK containers detected before hashing; "
+                f"counts={counts}; inspect report: {cfg['invalid_apk_report_path']}"
+            )
+            if blocking_invalid and cfg["require_all_label_ids"]:
+                raise RuntimeError(message)
+            print(f"WARNING: {message}")
     jobs = _collect_apks(
         cfg["split_dirs"],
         cfg["splits"],
         hash_files=cfg["hash_files"],
         hash_workers=cfg["hash_workers"],
+        hash_cache_path=cfg["hash_cache_path"],
+        excluded_paths={str(row["apk_path"]) for row in invalid_apks},
+    )
+    _write_apk_scan_index(jobs, cfg["label_csvs"], cfg["scan_index_path"])
+    cache_hits = sum(int(bool(job.get("hash_cache_hit", False))) for job in jobs)
+    print(
+        f"APK scan index ready: {cfg['scan_index_path']} "
+        f"(files={len(jobs)} hash_cache_hits={cache_hits})"
     )
     ignored_jobs: list[dict[str, Any]] = []
     if cfg["filter_to_label_csv"]:
         if not cfg["label_csvs"]:
             raise ValueError("data.filter_to_label_csv=true requires data.label_csvs")
-        jobs, ignored_jobs = _filter_jobs_to_labels(
-            jobs,
-            cfg["label_csvs"],
-            cfg["splits"],
-            require_all_label_ids=cfg["require_all_label_ids"],
-        )
+        try:
+            jobs, ignored_jobs = _filter_jobs_to_labels(
+                jobs,
+                cfg["label_csvs"],
+                cfg["splits"],
+                require_all_label_ids=cfg["require_all_label_ids"],
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc}; inspect APK scan report: {cfg['scan_index_path']}") from exc
         if ignored_jobs:
             print(f"Ignoring {len(ignored_jobs)} APK files not present in configured label CSVs.")
     _validate_split_counts(

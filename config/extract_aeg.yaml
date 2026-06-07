@@ -63,6 +63,8 @@ aeg:
 
 execution:
   workers: 8
+  # Reject zero-byte/non-ZIP inputs before the expensive full SHA256 scan.
+  validate_apk_containers: true
   # Exact SHA256 is still computed for split integrity. Hashing is I/O-bound;
   # keep this modest on HDDs and benchmark 1/2/4 on the actual storage.
   hash_workers: 4
