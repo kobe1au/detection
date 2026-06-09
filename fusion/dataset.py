@@ -302,36 +302,54 @@ def aeg_collate_fn(items: list[dict[str, Data]]) -> dict[str, Any]:
     }
 
 
-def _copy_manifest_content(target: Data, donor: Data, *, blind: bool = False) -> None:
+def _copy_manifest_content(target: Data, donor: Data, *, blind: bool = False) -> bool:
     target_mask = target.node_source == SOURCE_TYPES["manifest"]
     donor_mask = donor.node_source == SOURCE_TYPES["manifest"]
+
     if not bool(target_mask.any()):
-        return
+        _zero_manifest_nodes(target)
+        return False
+
     if not bool(donor_mask.any()):
         _zero_manifest_nodes(target)
-        return
+        return False
+
+    copied_any = False
     for node_type in (NODE_TYPES["PERMISSION"], NODE_TYPES["INTENT"], NODE_TYPES["COMPONENT"]):
         target_idx = torch.where(target_mask & (target.node_type == node_type))[0]
         if target_idx.numel() == 0:
             continue
+
         donor_idx = torch.where(donor_mask & (donor.node_type == node_type))[0]
         if donor_idx.numel() == 0:
             target.x[target_idx] = 0.0
             target.node_quality[target_idx] = 0.0
             target.node_semantic[target_idx] = 0.0
             continue
-        repeat = donor_idx.repeat((int(target_idx.numel()) + int(donor_idx.numel()) - 1) // int(donor_idx.numel()))[: target_idx.numel()]
+
+        copied_any = True
+        repeat = donor_idx.repeat(
+            (int(target_idx.numel()) + int(donor_idx.numel()) - 1)
+            // int(donor_idx.numel())
+        )[: target_idx.numel()]
         target.x[target_idx] = donor.x[repeat]
         target.node_semantic[target_idx] = donor.node_semantic[repeat]
         if not blind:
             target.node_quality[target_idx] = donor.node_quality[repeat]
+
+    if not copied_any:
+        _zero_manifest_nodes(target)
+        return False
+
     if not blind:
         target.q_manifest = donor.q_manifest.clone()
         target.pert_manifest = torch.tensor([1.0], dtype=torch.float32, device=target.x.device)
         _zero_shuffled_manifest_edges(target)
+
     clear_aggregate_apk_semantic(target)
     refresh_apk_node_quality(target)
     refresh_risk_node_quality(target)
+    return True
 
 
 def _zero_manifest_nodes(data: Data) -> None:
@@ -362,16 +380,22 @@ def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data], dono
         if view_id not in {VIEW_TYPES["manifest_shuffled"], VIEW_TYPES["manifest_shuffled_blind"]}:
             continue
         donor = donor_items[idx] if donor_items is not None and idx < len(donor_items) else None
-        if donor is None:
-            # A one-sample split cannot supply a donor; use zeroed Manifest
-            # evidence instead of silently keeping the original.
-            _zero_manifest_nodes(aug)
-            aug.effective_view_type_id = torch.tensor([VIEW_TYPES["manifest_missing"]], dtype=torch.long, device=aug.x.device)
-            aug.manifest_shuffle_fallback = torch.tensor([1], dtype=torch.long, device=aug.x.device)
-        else:
-            _copy_manifest_content(aug, donor, blind=view_id == VIEW_TYPES["manifest_shuffled_blind"])
+        copied = _copy_manifest_content(
+            aug,
+            donor,
+            blind=view_id == VIEW_TYPES["manifest_shuffled_blind"],
+        )
+
+        if copied:
             aug.effective_view_type_id = aug.view_type_id.clone().to(device=aug.x.device)
             aug.manifest_shuffle_fallback = torch.tensor([0], dtype=torch.long, device=aug.x.device)
+        else:
+            aug.effective_view_type_id = torch.tensor(
+                [VIEW_TYPES["manifest_missing"]],
+                dtype=torch.long,
+                device=aug.x.device,
+            )
+            aug.manifest_shuffle_fallback = torch.tensor([1], dtype=torch.long, device=aug.x.device)
 
 
 def _build_manifest_donor_indices(

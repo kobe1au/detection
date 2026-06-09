@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric import data
 from torch_geometric.data import Batch
 
 from fusion.constants import EDGE_TYPES, NUM_EDGE_TYPES, NUM_NODE_TYPES, NUM_SOURCE_TYPES, NODE_TYPES, SOURCE_TYPES
@@ -412,6 +413,8 @@ class AEGModel(nn.Module):
                 token_conflict_sensitivity,
             )
         logits = self.classifier(fused)
+        effective_view = _graph_scalar(data, "effective_view_type_id", 0.0)
+        requested_view = _graph_scalar(data, "requested_view_type_id", 0.0)
         extra = {
             "fused_emb": fused,
             "method_emb": method_emb,
@@ -438,7 +441,9 @@ class AEGModel(nn.Module):
             "r_manifest": r_manifest.detach(),
             "code_reliability": code_rel.detach(),
             "manifest_reliability": r_manifest.detach(),
-            "view_type_id": _graph_scalar(data, "view_type_id", 0.0).detach(),
+            "view_type_id": effective_view.detach(),
+            "requested_view_type_id": requested_view.detach(),
+            "effective_view_type_id": effective_view.detach(),
             "cf_weight": _graph_scalar(data, "cf_weight", 0.0).detach(),
         }
         return logits, extra
