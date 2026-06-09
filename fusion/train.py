@@ -46,7 +46,20 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
+    """Load config with base inheritance.
+    
+    Raises FileNotFoundError with helpful message if config not found but .example exists.
+    """
     path = Path(path)
+    if not path.exists():
+        example = path.parent / f"{path.stem}.example{path.suffix}"
+        if example.exists():
+            raise FileNotFoundError(
+                f"Config not found: {path}\n"
+                f"Copy {example.name} to {path.name} and update paths for your environment."
+            )
+        raise FileNotFoundError(f"Config not found: {path}")
+    
     cfg = load_yaml(path)
     bases = cfg.pop("base", None) or cfg.pop("bases", None) or []
     if isinstance(bases, (str, Path)):
@@ -179,19 +192,36 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
     train_cfg = cfg.get("train", {}) or {}
     batch_size = int(train_cfg.get("batch_size" if train else "eval_batch_size", train_cfg.get("batch_size", 24)))
     workers = int(train_cfg.get("num_workers", 0))
+    
+    loss_cfg = cfg.get("loss", {}) or {}
+    contrast_enabled = any(
+        float(loss_cfg.get(k, 0.0)) > 0.0
+        for k in [
+            "clean_degraded_contrast_weight",
+            "source_degraded_contrast_weight",
+            "cross_source_contrast_weight",
+        ]
+    )
+    
+    drop_last = False
+    if train and contrast_enabled:
+        drop_last = True
+        LOGGER.info(
+            "Contrastive learning enabled: setting drop_last=True "
+            "to ensure all batches have size >= 2"
+        )
+    
     generator = torch.Generator()
     train_seed = int(train_cfg.get("seed", 42))
-    # ✅ P0-2: eval_seed 完全独立,不派生自 train_seed
     eval_seed = int((cfg.get("eval", {}) or {}).get("seed", 2026))
     generator.manual_seed(train_seed if train else eval_seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=train,
+        drop_last=drop_last,
         num_workers=workers,
         pin_memory=bool(train_cfg.get("pin_memory", False)),
-        # Robust evaluation constructs many scenario-specific loaders. Keeping
-        # every evaluation worker pool alive can exhaust RAM/file handles.
         persistent_workers=workers > 0 and (
             train or bool(train_cfg.get("persistent_eval_workers", False))
         ),
@@ -474,6 +504,21 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
     device = _device(cfg)
     out_dir = Path(train_cfg.get("output_dir", "results/aeg_robust/run"))
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    loss_cfg = cfg.get("loss", {}) or {}
+    contrast_weights = [
+        float(loss_cfg.get("clean_degraded_contrast_weight", 0.1)),
+        float(loss_cfg.get("source_degraded_contrast_weight", 0.05)),
+        float(loss_cfg.get("cross_source_contrast_weight", 0.03)),
+    ]
+    batch_size = int(train_cfg.get("batch_size", 24))
+    
+    if any(w > 0 for w in contrast_weights) and batch_size < 2:
+        raise ValueError(
+            f"Contrastive learning requires batch_size >= 2, got {batch_size}. "
+            f"InfoNCE will return 0 when batch_size=1. "
+            f"Either increase batch_size or disable contrast (set weights to 0)."
+        )
 
     train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
     val_ds = _make_dataset(cfg, "val", aug=False)

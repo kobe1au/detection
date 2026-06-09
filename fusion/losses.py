@@ -7,14 +7,16 @@ import torch.nn.functional as F
 
 from fusion.constants import VIEW_TYPES
 
+MIN_TEMPERATURE = 1e-3
+
 
 def _info_nce(a: torch.Tensor, b: torch.Tensor, temperature: float, weights: torch.Tensor | None = None) -> torch.Tensor:
     if a.size(0) <= 1:
         return a.new_tensor(0.0)
     a = F.normalize(a, dim=-1)
     b = F.normalize(b, dim=-1)
-    logits_ab = a @ b.t() / max(float(temperature), 1e-4)
-    logits_ba = b @ a.t() / max(float(temperature), 1e-4)
+    logits_ab = a @ b.t() / max(float(temperature), MIN_TEMPERATURE)
+    logits_ba = b @ a.t() / max(float(temperature), MIN_TEMPERATURE)
     labels = torch.arange(a.size(0), device=a.device)
     loss = 0.5 * (
         F.cross_entropy(logits_ab, labels, reduction="none")
