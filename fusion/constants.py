@@ -5,7 +5,7 @@ import json
 
 AEG_SCHEMA_VERSION = 6
 AEG_EXTRACTION_PIPELINE_VERSION = 1
-AEG_PAYLOAD_CONTRACT_VERSION = 2
+AEG_PAYLOAD_CONTRACT_VERSION = 1
 
 
 NODE_TYPES = {
@@ -148,6 +148,7 @@ AEG_SCHEMA_TABLE_FINGERPRINT = stable_table_hash(AEG_SCHEMA_TABLES)
 AEG_REQUIRED_PAYLOAD_FIELDS = (
     "schema_version",
     "aeg_schema_fingerprint",
+    "aeg_build_fingerprint",
     "aeg_payload_contract_version",
     "aeg_payload_contract_fingerprint",
     "aeg_meta",
