@@ -34,6 +34,7 @@ model:
   dropout: 0.15
   num_latents: 16
   fusion_mode: latent
+  allow_node_dim_adapt: false
   use_relation_types: true
   use_node_types: true
   use_node_source: true
@@ -76,7 +77,8 @@ robust:
     - manifest_missing
 
 eval:
-  seed: 2026  # ✅ 独立于 train.seed,保证多 seed 实验公平性
+  # Keep evaluation perturbations fixed across train seeds for fair comparison.
+  seed: 2026
   robust_eval: true
   robust_val:
     enabled: true

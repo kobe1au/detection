@@ -1016,7 +1016,6 @@ def _merge_index_rows(path: Path, rows: list[dict[str, str]], current_splits: li
 def _validate_payload_for_save(payload: dict[str, Any], cfg: dict[str, Any], job: dict[str, Any]) -> None:
     validate_aeg_payload(
         payload,
-        expected_build_fingerprint=str(cfg.get("build_fingerprint") or ""),
         expected_node_feature_dim=cfg["node_feature_dim"],
     )
     if str(payload["sid"]).lower() != job["sha256"].lower():

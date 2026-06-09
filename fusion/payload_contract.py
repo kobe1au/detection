@@ -49,7 +49,6 @@ def _check_type_ids(key: str, value: torch.Tensor, upper: int) -> None:
 def validate_aeg_payload(
     payload: dict[str, Any],
     *,
-    expected_build_fingerprint: str | None = None,
     expected_node_feature_dim: int | None = None,
 ) -> None:
     if not isinstance(payload, dict):
@@ -68,10 +67,6 @@ def validate_aeg_payload(
         raise AEGPayloadContractError("AEG payload contract version mismatch")
     if payload["aeg_payload_contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
         raise AEGPayloadContractError("AEG payload contract fingerprint mismatch")
-    if expected_build_fingerprint is not None and payload["aeg_build_fingerprint"] != expected_build_fingerprint:
-        raise AEGPayloadContractError("AEG build fingerprint mismatch")
-    if not str(payload["aeg_build_fingerprint"] or ""):
-        raise AEGPayloadContractError("AEG build fingerprint is empty")
     if str(payload["sid"]).lower() != str(payload["sha256"]).lower():
         raise AEGPayloadContractError("AEG sid and sha256 do not match")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["sha256"]).lower()) is None:

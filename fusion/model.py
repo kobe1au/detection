@@ -204,6 +204,7 @@ class AEGModel(nn.Module):
         fusion_mode: str = "latent",
         masked_node_types: list[str | int] | tuple[str | int, ...] | None = None,
         masked_edge_types: list[str | int] | tuple[str | int, ...] | None = None,
+        allow_node_dim_adapt: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -211,6 +212,7 @@ class AEGModel(nn.Module):
         self.use_node_types = bool(use_node_types)
         self.use_node_quality = bool(use_node_quality)
         self.use_edge_quality = bool(use_edge_quality)
+        self.allow_node_dim_adapt = bool(allow_node_dim_adapt)
         self.fusion_mode = str(fusion_mode or "latent").lower()
         if self.fusion_mode not in {"latent", "mean_pool"}:
             raise ValueError(f"Unsupported fusion_mode: {fusion_mode!r}")
@@ -276,6 +278,12 @@ class AEGModel(nn.Module):
     def _initial_node_state(self, data: Batch) -> torch.Tensor:
         x = data.x.float()
         if x.size(1) != self.input_proj.in_features:
+            if not self.allow_node_dim_adapt:
+                raise ValueError(
+                    "AEG node feature dimension mismatch: "
+                    f"data.x.size(1)={x.size(1)} model_input_dim={self.input_proj.in_features}. "
+                    "Regenerate matching PT files or set model.allow_node_dim_adapt=true for explicit compatibility mode."
+                )
             if x.size(1) < self.input_proj.in_features:
                 pad = x.new_zeros((x.size(0), self.input_proj.in_features - x.size(1)))
                 x = torch.cat([x, pad], dim=-1)
@@ -460,4 +468,5 @@ def build_model(cfg: dict[str, Any], node_input_dim: int) -> AEGModel:
         fusion_mode=str(model_cfg.get("fusion_mode", "latent")),
         masked_node_types=model_cfg.get("masked_node_types"),
         masked_edge_types=model_cfg.get("masked_edge_types"),
+        allow_node_dim_adapt=bool(model_cfg.get("allow_node_dim_adapt", False)),
     )

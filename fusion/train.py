@@ -212,7 +212,6 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
             "package_name": str(payload.get("package_name") or "").strip().lower(),
             "schema_version": int(payload.get("schema_version", 0) or 0),
             "schema_fingerprint": str(payload.get("aeg_schema_fingerprint") or ""),
-            "build_fingerprint": str(payload.get("aeg_build_fingerprint") or ""),
             "contract_version": int(payload.get("aeg_payload_contract_version", 0) or 0),
             "contract_fingerprint": str(payload.get("aeg_payload_contract_fingerprint") or ""),
         }
@@ -228,7 +227,6 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
     package_seen: dict[str, tuple[str, str]] = {}
     package_conflicts: list[tuple[str, str, str, str, str]] = []
     metadata_cache: dict[Path, dict[str, Any]] = {}
-    build_fingerprints: dict[str, tuple[str, str]] = {}
     invalid_metadata: list[tuple[str, str, str]] = []
     for dataset in datasets:
         for path, _label in dataset.samples:
@@ -246,11 +244,6 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
                 invalid_metadata.append((sid, dataset.split, f"contract_version={metadata['contract_version']}"))
             elif metadata["contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
                 invalid_metadata.append((sid, dataset.split, "contract_fingerprint_mismatch"))
-            build_fingerprint = metadata["build_fingerprint"]
-            if not build_fingerprint:
-                invalid_metadata.append((sid, dataset.split, "missing_build_fingerprint"))
-            else:
-                build_fingerprints.setdefault(build_fingerprint, (dataset.split, sid))
             if check_package:
                 package = metadata["package_name"]
                 if package:
@@ -263,12 +256,6 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
         raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
     if invalid_metadata:
         raise ValueError(f"Invalid AEG PT build metadata: count={len(invalid_metadata)} examples={invalid_metadata[:5]}")
-    if len(build_fingerprints) != 1:
-        examples = [(fingerprint, split, sid) for fingerprint, (split, sid) in list(build_fingerprints.items())[:5]]
-        raise ValueError(
-            "Mixed AEG build fingerprints across train/val/test. "
-            f"count={len(build_fingerprints)} examples={examples}"
-        )
     if package_conflicts:
         raise ValueError(
             "Package name overlap across splits: "

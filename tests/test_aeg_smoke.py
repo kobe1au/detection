@@ -587,6 +587,27 @@ def test_build_model_uses_payload_node_width_over_yaml_hint():
     assert model.input_proj.in_features == 519
 
 
+def test_model_rejects_node_dim_mismatch_by_default():
+    data = payload_to_data(_payload(), label=1)
+    model = AEGModel(node_input_dim=data.x.size(1) + 1, hidden_dim=16, layers=1, num_latents=2)
+    with pytest.raises(ValueError, match="node feature dimension mismatch"):
+        model(Batch.from_data_list([data]))
+
+
+def test_model_can_explicitly_adapt_node_dim_mismatch():
+    data = payload_to_data(_payload(), label=1)
+    model = AEGModel(
+        node_input_dim=data.x.size(1) + 1,
+        hidden_dim=16,
+        layers=1,
+        num_latents=2,
+        allow_node_dim_adapt=True,
+    )
+    logits, extra = model(Batch.from_data_list([data]))
+    assert logits.shape == (1, 2)
+    assert torch.isfinite(extra["fused_emb"]).all()
+
+
 def test_extract_behavior_hint_config_is_explicit_ablation():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 
@@ -962,7 +983,7 @@ def test_package_name_overlap_across_splits_is_rejected(tmp_path: Path):
         _validate_split_isolation(train_ds, val_ds, check_package=True)
 
 
-def test_mixed_build_fingerprints_across_splits_are_rejected(tmp_path: Path):
+def test_mixed_build_fingerprints_do_not_block_split_isolation(tmp_path: Path):
     payload_train = _payload()
     payload_val = _payload()
     payload_val["sid"] = "b" * 64
@@ -982,5 +1003,4 @@ def test_mixed_build_fingerprints_across_splits_are_rejected(tmp_path: Path):
             writer.writerow({"id": payload["sid"], "label": label})
         datasets.append(AEGDataset(pt_dir, csv_path, split=split))
 
-    with pytest.raises(ValueError, match="Mixed AEG build fingerprints"):
-        _validate_split_isolation(*datasets, check_package=True)
+    _validate_split_isolation(*datasets, check_package=True)

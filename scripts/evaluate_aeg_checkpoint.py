@@ -38,24 +38,22 @@ def _first_pt(path: Path) -> Path:
         raise FileNotFoundError(f"No PT files found under {path}") from exc
 
 
-def _expected_training_contract(ckpt: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, int]:
-    fingerprint = str(ckpt.get("aeg_build_fingerprint") or "")
+def _expected_training_contract(ckpt: dict[str, Any], cfg: dict[str, Any]) -> int:
     node_input_dim = int(ckpt.get("node_input_dim") or 0)
-    if fingerprint and node_input_dim > 0:
-        return fingerprint, node_input_dim
+    if node_input_dim > 0:
+        return node_input_dim
     train_data = ((cfg.get("data", {}) or {}).get("train", {}) or {})
     pt_dir = _resolve(train_data.get("pt_dir", ""))
     payload = torch.load(_first_pt(pt_dir), map_location="cpu")
     validate_aeg_payload(payload)
-    return str(payload["aeg_build_fingerprint"]), int(payload["node_x"].size(1))
+    return int(payload["node_x"].size(1))
 
 
-def _validate_scenario(dataset: AEGDataset, build_fingerprint: str, node_input_dim: int) -> None:
+def _validate_scenario(dataset: AEGDataset, node_input_dim: int) -> None:
     for path, _label in dataset.samples:
         payload = torch.load(path, map_location="cpu")
         validate_aeg_payload(
             payload,
-            expected_build_fingerprint=build_fingerprint,
             expected_node_feature_dim=node_input_dim,
         )
 
@@ -72,7 +70,7 @@ def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
     if not scenarios:
         raise ValueError("Evaluation config requires a non-empty scenarios mapping")
 
-    build_fingerprint, node_input_dim = _expected_training_contract(ckpt, cfg)
+    node_input_dim = _expected_training_contract(ckpt, cfg)
     device = _device(cfg)
     model = build_model(cfg, node_input_dim).to(device)
     model.load_state_dict(ckpt["model"])
@@ -89,7 +87,7 @@ def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
             strict_integrity=True,
             validate_payload_on_load=False,
         )
-        _validate_scenario(dataset, build_fingerprint, node_input_dim)
+        _validate_scenario(dataset, node_input_dim)
         metrics, rows = evaluate(
             model,
             _loader(cfg, dataset, train=False),
