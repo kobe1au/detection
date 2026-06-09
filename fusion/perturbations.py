@@ -246,9 +246,20 @@ def _degrade_graph(data: Data, strength: float, *, missing: bool = False) -> Non
     refresh_risk_node_quality(data)
 
 
-def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noisy: bool = False) -> None:
+def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noisy: bool = False, blind: bool = False) -> None:
     manifest_nodes = _node_mask(data, sources={SOURCE_TYPES["manifest"]})
     manifest_edges = _edge_mask(data, edge_types=MANIFEST_EDGE_TYPES, sources={SOURCE_TYPES["manifest"]})
+    if blind and not missing:
+        if bool(manifest_nodes.any()):
+            strength = _clamp_strength(strength)
+            if hasattr(data, "node_semantic"):
+                data.node_semantic[manifest_nodes] = data.node_semantic[manifest_nodes] * (1.0 - strength)
+            data.x[manifest_nodes] = data.x[manifest_nodes] * (1.0 - 0.5 * strength)
+            if noisy:
+                data.x[manifest_nodes] = data.x[manifest_nodes] + torch.randn_like(data.x[manifest_nodes]) * strength * 0.1
+        clear_aggregate_apk_semantic(data)
+        refresh_risk_node_quality(data)
+        return
     _soft_degrade_nodes(data, manifest_nodes, strength, zero=missing, noise=noisy)
     _soft_degrade_edges(data, manifest_edges, strength, zero=missing)
     clear_aggregate_apk_semantic(data)
@@ -289,6 +300,11 @@ def apply_aeg_view(data: Data, *, view: str, strength: float = 0.5) -> Data:
         _degrade_manifest(out, strength, noisy=True)
         out.cf_weight = torch.tensor([0.8 * strength], dtype=torch.float32)
     elif view == "manifest_shuffled":
+        out.cf_weight = torch.tensor([0.9], dtype=torch.float32)
+    elif view == "manifest_noisy_blind":
+        _degrade_manifest(out, strength, noisy=True, blind=True)
+        out.cf_weight = torch.tensor([0.8 * strength], dtype=torch.float32)
+    elif view == "manifest_shuffled_blind":
         out.cf_weight = torch.tensor([0.9], dtype=torch.float32)
     elif view == "all_degraded":
         _degrade_api(out, strength)

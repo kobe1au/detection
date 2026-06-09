@@ -1,0 +1,12 @@
+base: multiview_contrast.yaml
+
+train:
+  output_dir: results/aeg_robust/i2/augmented_ce_only
+
+loss:
+  aug_ce_weight: 1.0
+  clean_degraded_contrast_weight: 0.0
+  source_degraded_contrast_weight: 0.0
+  cross_source_contrast_weight: 0.0
+  counterfactual_kl_weight: 0.0
+

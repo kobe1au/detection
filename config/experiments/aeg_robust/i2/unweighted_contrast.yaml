@@ -1,0 +1,8 @@
+base: multiview_contrast.yaml
+
+train:
+  output_dir: results/aeg_robust/i2/unweighted_contrast
+
+loss:
+  reliability_weighted_contrast: false
+

@@ -18,7 +18,11 @@
       "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py -q --basetemp=D:/code/detection/.pytest_tmp -p no:cacheprovider)",
       "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py --basetemp=D:/code/detection/.pytest_tmp -p no:cacheprovider -v)",
       "Bash(git -C \"D:/code/detection\" status)",
-      "Bash(git -C \"D:/code/detection\" diff HEAD -- fusion/robust/perturbations.py)"
+      "Bash(git -C \"D:/code/detection\" diff HEAD -- fusion/robust/perturbations.py)",
+      "Bash(head -5 D:/pts_aeg/aeg_apk_scan_index.csv)",
+      "Read(//d/pts_aeg/**)",
+      "Bash(grep -c \"^train,\" D:/pts_aeg/aeg_apk_scan_index.csv)",
+      "Bash(awk '{print $5, $9}')"
     ]
   }
 }

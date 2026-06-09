@@ -14,6 +14,26 @@ if str(PROJECT_ROOT) not in sys.path:
 from fusion.train import _binary_metrics
 
 
+SUMMARY_FIELDS = [
+    "scenario",
+    "slice",
+    "num_samples",
+    "positive_ratio",
+    "acc",
+    "macro_f1",
+    "f1",
+    "f1_pos",
+    "precision_pos",
+    "recall_pos",
+    "macro_recall",
+    "brier",
+    "ece_10",
+    "mean_confidence",
+    "auc",
+    "ap",
+]
+
+
 def _number(row: dict[str, str], key: str, default: float = 0.0) -> float:
     try:
         return float(row.get(key, default) or default)
@@ -76,7 +96,7 @@ def run(input_dir: Path, output: Path, min_count: int) -> None:
                 summaries.append(_summarize(scenario, slice_name, selected))
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summaries[0]))
+        writer = csv.DictWriter(f, fieldnames=list(summaries[0]) if summaries else SUMMARY_FIELDS)
         writer.writeheader()
         writer.writerows(summaries)
     print(f"Wrote {len(summaries)} scenario/slice summaries to {output}")

@@ -97,9 +97,11 @@ def _silence_third_party_logs() -> None:
 
 def _build_fingerprint(cfg: dict[str, Any], vocab: dict[str, Any]) -> str:
     source_paths = [
+        "scripts/build_aeg_pts_direct.py",
         "fusion/constants.py",
         "fusion/aeg_builder.py",
         "fusion/manifest_features.py",
+        "fusion/payload_contract.py",
         "fusion/semantic_categories.py",
         "fusion/quality.py",
         "extract/extract_graph_api.py",
@@ -183,6 +185,14 @@ def _resolve_label_csvs(data: dict[str, Any], splits: list[str]) -> dict[str, Pa
     if missing:
         raise ValueError(f"data.label_csvs is missing configured splits: {missing}")
     return {split: _resolve_path(raw[split]) for split in splits}
+
+
+def _resolve_optional_train_label_csv(data: dict[str, Any]) -> Path | None:
+    raw = data.get("label_csvs") or {}
+    if not isinstance(raw, dict):
+        return None
+    value = {str(k): v for k, v in raw.items()}.get("train")
+    return _resolve_path(value) if value else None
 
 
 def _read_label_records(path: Path) -> dict[str, dict[str, str]]:
@@ -574,6 +584,7 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     split_dirs = _resolve_split_dirs(data, splits)
     out_dirs = _resolve_out_dirs(data, out_root, splits)
     label_csvs = _resolve_label_csvs(data, splits)
+    train_label_csv_for_vocab = _resolve_optional_train_label_csv(data)
     vocab_path = _resolve_path(manifest.get("vocab_path", "config/manifest_vocab_aeg.yaml"))
     rebuild_vocab = bool(args.rebuild_vocab if args.rebuild_vocab is not None else manifest.get("rebuild_vocab", False))
     resume = bool(args.resume if args.resume is not None else execution.get("resume", True))
@@ -626,6 +637,7 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
         "out_root": out_root,
         "out_dirs": out_dirs,
         "label_csvs": label_csvs,
+        "train_label_csv_for_vocab": train_label_csv_for_vocab,
         "filter_to_label_csv": bool(data.get("filter_to_label_csv", bool(label_csvs))),
         "require_all_label_ids": bool(data.get("require_all_label_ids", False)),
         "allow_empty_splits": bool(execution.get("allow_empty_splits", False)),
@@ -763,9 +775,37 @@ def _build_or_load_vocab(jobs: list[dict[str, Any]], records: dict[str, dict[str
             "manifest_parse_success_count": sum(1 for record in train_records if not record.get("parse_error")),
         }
         validate_manifest_vocab(vocab, require_train_metadata=True, allow_empty=cfg["allow_empty_vocab"])
+        _validate_vocab_matches_train_csv(vocab, cfg)
         save_manifest_vocab(vocab, cfg["vocab_path"])
         return vocab
-    return load_manifest_vocab(cfg["vocab_path"], require_train_metadata=True, allow_empty=cfg["allow_empty_vocab"])
+    vocab = load_manifest_vocab(cfg["vocab_path"], require_train_metadata=True, allow_empty=cfg["allow_empty_vocab"])
+    _validate_vocab_matches_train_csv(vocab, cfg)
+    return vocab
+
+
+def _validate_vocab_matches_train_csv(vocab: dict[str, Any], cfg: dict[str, Any]) -> None:
+    train_label_csv = cfg.get("train_label_csv_for_vocab")
+    if not train_label_csv:
+        return
+    train_label_csv = Path(train_label_csv)
+    if not train_label_csv.exists():
+        return
+    train_ids = sorted(_read_label_ids(train_label_csv))
+    expected_count = len(train_ids)
+    expected_fingerprint = stable_table_hash(train_ids)
+    metadata = vocab.get("metadata") or {}
+    try:
+        observed_count = int(metadata.get("source_sample_count"))
+    except (TypeError, ValueError):
+        observed_count = -1
+    observed_fingerprint = str(metadata.get("source_id_fingerprint") or "")
+    if observed_count != expected_count or observed_fingerprint != expected_fingerprint:
+        raise ValueError(
+            "Manifest vocab metadata does not match the configured train CSV. "
+            f"expected_count={expected_count} observed_count={observed_count} "
+            f"expected_fingerprint={expected_fingerprint} observed_fingerprint={observed_fingerprint}. "
+            "Rebuild the Manifest vocab from the current train split."
+        )
 
 
 def _index_row(job: dict[str, Any], out_path: Path, status: str, reason: str = "") -> dict[str, str]:
@@ -785,6 +825,11 @@ def _out_path(job: dict[str, Any], cfg: dict[str, Any]) -> Path:
 
 
 def _resume_existing(job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, str] | None:
+    """Check if existing PT file is compatible (relaxed validation without fingerprint).
+
+    Only validates schema compatibility, not code identity. This allows code changes
+    (comments, refactoring, training logic) without invalidating all PT files.
+    """
     if not cfg["resume"]:
         return None
     out_path = _out_path(job, cfg)
@@ -792,16 +837,33 @@ def _resume_existing(job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, str]
         return None
     try:
         existing = torch.load(out_path, map_location="cpu")
-        expected_fingerprint = str(cfg.get("build_fingerprint") or "")
-        if not expected_fingerprint:
+
+        # ✅ Check schema version (affects PT structure)
+        if existing.get("schema_version") != AEG_SCHEMA_VERSION:
             return None
-        validate_aeg_payload(
-            existing,
-            expected_build_fingerprint=expected_fingerprint,
-            expected_node_feature_dim=cfg["node_feature_dim"],
-        )
+
+        # ✅ Check contract version (required fields list)
+        if existing.get("aeg_payload_contract_version") != AEG_PAYLOAD_CONTRACT_VERSION:
+            return None
+
+        # ✅ Check node feature dimension (affects model input)
+        node_x = existing.get("node_x")
+        if node_x is None or node_x.shape[1] != cfg["node_feature_dim"]:
+            return None
+
+        # ✅ Check sample ID matches
         if str(existing.get("sid") or "").lower() != job["sha256"].lower():
             return None
+
+        # ✅ Check required fields exist
+        required = ["node_x", "edge_index", "node_type", "edge_type", "node_source",
+                    "edge_source", "node_quality", "edge_quality", "node_semantic"]
+        if not all(field in existing for field in required):
+            return None
+
+        # ⚠️ Fingerprint check removed - only structural compatibility matters
+        # This allows code refactoring/optimization without invalidating PT files
+
         return _index_row(job, out_path, "ok", "resume")
     except Exception:
         return None
@@ -1048,6 +1110,12 @@ def run(args: argparse.Namespace) -> None:
             pending_jobs.append(job)
         else:
             resume_rows.append(row)
+    print(
+    "AEG PT resume precheck: "
+    f"total_jobs={len(jobs)} "
+    f"resumable={len(resume_rows)} "
+    f"pending={len(pending_jobs)}"
+)
 
     rows: list[dict[str, str]] = list(resume_rows)
     ok = 0

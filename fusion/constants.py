@@ -90,6 +90,8 @@ VIEW_TYPES = {
     "api_missing": 9,
     "graph_missing": 10,
     "manifest_missing": 11,
+    "manifest_noisy_blind": 12,
+    "manifest_shuffled_blind": 13,
 }
 
 VIEW_TYPE_NAMES = tuple(sorted(VIEW_TYPES, key=VIEW_TYPES.get))

@@ -253,6 +253,34 @@ def test_manifest_shuffle_uses_dataset_donor_with_batch_size_one(tmp_path: Path)
     assert extra["manifest_reliability"].item() == 0.0
 
 
+def test_manifest_shuffle_blind_keeps_reliability_scalars(tmp_path: Path):
+    payload_a = _payload()
+    payload_b = _payload()
+    payload_b["sid"] = "b" * 64
+    payload_b["sha256"] = "b" * 64
+    payload_b["q_manifest"] = torch.tensor([0.25], dtype=torch.float32)
+    data_a = payload_to_data(payload_a, label=1)
+    data_b = payload_to_data(payload_b, label=0)
+    aug = apply_aeg_view(data_a, view="manifest_shuffled_blind", strength=1.0)
+    batch = aeg_collate_fn([{"clean": data_a, "aug": aug, "manifest_donor": data_b}])
+    shuffled = batch["aug"].to_data_list()[0]
+    assert shuffled.view_type_id.item() == VIEW_TYPES["manifest_shuffled_blind"]
+    assert torch.allclose(shuffled.q_manifest.cpu(), data_a.q_manifest.cpu())
+    assert shuffled.pert_manifest.item() == data_a.pert_manifest.item()
+    _, extra = AEGModel(node_input_dim=shuffled.x.size(1), hidden_dim=16, layers=1, num_latents=2)(
+        Batch.from_data_list([shuffled])
+    )
+    assert extra["r_manifest"].item() > 0.0
+
+
+def test_manifest_noisy_blind_does_not_change_reliability_scalars():
+    data = payload_to_data(_payload(), label=1)
+    aug = apply_aeg_view(data, view="manifest_noisy_blind", strength=0.7)
+    assert aug.view_type_id.item() == VIEW_TYPES["manifest_noisy_blind"]
+    assert torch.allclose(aug.q_manifest.cpu(), data.q_manifest.cpu())
+    assert torch.allclose(aug.pert_manifest.cpu(), data.pert_manifest.cpu())
+
+
 def test_manifest_shuffle_default_donor_is_label_agnostic():
     from fusion.dataset import _build_manifest_donor_indices
 
@@ -330,6 +358,22 @@ def test_model_ablation_switches_keep_missing_evidence_masked():
     assert torch.isfinite(extra["fused_emb"]).all()
 
 
+def test_model_structural_ablation_masks_configured_nodes_and_edges():
+    data = payload_to_data(_payload(), label=1)
+    model = AEGModel(
+        node_input_dim=data.x.size(1),
+        hidden_dim=16,
+        layers=1,
+        num_latents=2,
+        masked_node_types=["RISK_SEMANTIC"],
+        masked_edge_types=["PERMISSION_RELATED_TO_API_FAMILY", "API_FAMILY_RELATED_TO_PERMISSION"],
+    )
+    assert NODE_TYPES["RISK_SEMANTIC"] in set(model.masked_node_type_ids.cpu().tolist())
+    assert EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"] in set(model.masked_edge_type_ids.cpu().tolist())
+    _, extra = model(Batch.from_data_list([data]))
+    assert torch.allclose(extra["risk_emb"].cpu(), torch.zeros_like(extra["risk_emb"].cpu()), atol=1e-6)
+
+
 def test_manifest_record_extracts_package_name(monkeypatch, tmp_path: Path):
     class FakeAPK:
         def __init__(self, _path: str):
@@ -399,6 +443,38 @@ def test_corrupted_source_contrast_weights_drop_untrusted_source():
     assert torch.all(risk_weight == 1)
 
 
+def test_loss_supports_unweighted_contrast_and_augmented_ce():
+    payload = _payload()
+    batch = Batch.from_data_list(
+        [
+            payload_to_data(payload, label=1),
+            payload_to_data({**payload, "sid": "b" * 64, "sha256": "b" * 64}, label=0),
+        ]
+    )
+    model = AEGModel(node_input_dim=batch.x.size(1), hidden_dim=16, layers=1, num_latents=2)
+    clean_logits, clean_extra = model(batch)
+    aug = Batch.from_data_list([apply_aeg_view(item, view="api_degraded", strength=0.5) for item in batch.to_data_list()])
+    aug_logits, aug_extra = model(aug)
+    loss, parts = compute_aeg_loss(
+        clean_logits,
+        batch.y.view(-1),
+        clean_extra,
+        aug_logits=aug_logits,
+        aug_extra=aug_extra,
+        loss_cfg={
+            "aug_ce_weight": 1.0,
+            "reliability_weighted_contrast": False,
+            "clean_degraded_contrast_weight": 0.1,
+            "source_degraded_contrast_weight": 0.1,
+            "cross_source_contrast_weight": 0.1,
+        },
+    )
+    assert torch.isfinite(loss)
+    assert parts["aug_ce"] >= 0.0
+    assert parts["aug_ce_weight"] == 1.0
+    assert parts["reliability_weighted_contrast"] == 0.0
+
+
 def test_fused_contrast_weight_drops_when_all_sources_are_unreliable():
     ref = torch.zeros((2, 2))
     clean = {
@@ -427,6 +503,7 @@ def test_all_aeg_experiment_configs_load_and_have_unique_outputs():
         assert output not in outputs, f"duplicate output_dir: {output}"
         outputs.add(output)
         assert cfg["robust"]["manifest_donor_mode"] == "cyclic"
+        assert int(cfg["eval"]["seed"]) == 2026
 
 
 def test_diagnostic_slice_summarizer(tmp_path: Path):
@@ -479,6 +556,22 @@ def test_diagnostic_slice_summarizer(tmp_path: Path):
     assert "dex_partial_failed" in text
 
 
+def test_diagnostic_slice_summarizer_handles_empty_selected_slices(tmp_path: Path):
+    from scripts.summarize_aeg_diagnostics import run
+
+    input_dir = tmp_path / "run"
+    input_dir.mkdir()
+    path = input_dir / "diagnostics_test_clean.csv"
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["label", "pred", "prob_malware"])
+        writer.writeheader()
+        writer.writerow({"label": 1, "pred": 1, "prob_malware": 0.9})
+    output = input_dir / "slice_metrics.csv"
+    run(input_dir, output, min_count=10)
+    text = output.read_text(encoding="utf-8")
+    assert text.startswith("scenario,slice,num_samples")
+
+
 def test_run_groups_expose_isolated_innovation_experiments():
     from run import resolve_target_specs
 
@@ -516,6 +609,46 @@ def test_extract_behavior_hint_config_is_explicit_ablation():
     args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=False)
     with pytest.raises(ValueError, match="use_behavior_hints=true"):
         _parse_config(broken, args)
+
+
+def test_val_test_extraction_keeps_train_vocab_guard_path():
+    from scripts.build_aeg_pts_direct import _load_config, _parse_config
+
+    args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=False)
+    cfg = _parse_config(_load_config(Path("config/extract_aeg_val_test.yaml")), args)
+    assert cfg["splits"] == ["val", "test"]
+    assert str(cfg["train_label_csv_for_vocab"]).replace("\\", "/").endswith("results/labels/train.csv")
+
+
+def test_manifest_vocab_fingerprint_must_match_train_csv(tmp_path: Path):
+    from fusion.constants import stable_table_hash
+    from scripts.build_aeg_pts_direct import _validate_vocab_matches_train_csv
+
+    train_ids = ["a" * 64, "b" * 64]
+    csv_path = tmp_path / "train.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "label"])
+        writer.writeheader()
+        for sid in train_ids:
+            writer.writerow({"id": sid, "label": 1})
+
+    cfg = {"train_label_csv_for_vocab": csv_path}
+    bad_vocab = {
+        "metadata": {
+            "source_sample_count": 1,
+            "source_id_fingerprint": "bad",
+        }
+    }
+    with pytest.raises(ValueError, match="does not match the configured train CSV"):
+        _validate_vocab_matches_train_csv(bad_vocab, cfg)
+
+    good_vocab = {
+        "metadata": {
+            "source_sample_count": len(train_ids),
+            "source_id_fingerprint": stable_table_hash(sorted(train_ids)),
+        }
+    }
+    _validate_vocab_matches_train_csv(good_vocab, cfg)
 
 
 def test_aeg_builder_index_merge_preserves_other_splits(tmp_path: Path):

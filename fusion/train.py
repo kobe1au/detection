@@ -152,6 +152,9 @@ def _make_dataset(cfg: dict[str, Any], split: str, *, aug: bool = False, view: s
     if not csv_path:
         raise ValueError(f"data.{split}.csv is required")
     robust_cfg = cfg.get("robust", {}) or {}
+    train_seed = int((cfg.get("train", {}) or {}).get("seed", 42))
+    eval_seed = int((cfg.get("eval", {}) or {}).get("seed", train_seed + 100_000))
+    dataset_seed = eval_seed if view else train_seed
     return AEGDataset(
         pt_dir,
         csv_path,
@@ -160,7 +163,7 @@ def _make_dataset(cfg: dict[str, Any], split: str, *, aug: bool = False, view: s
         aug_prob=1.0 if view else float(robust_cfg.get("perturb_prob", 0.5)),
         aug_views=[view] if view else list(robust_cfg.get("train_views", ["api_degraded", "graph_degraded", "api_graph_degraded", "manifest_degraded", "all_degraded"])),
         aug_strengths=[float(strength)] if strength is not None else list(robust_cfg.get("perturb_strengths", [0.1, 0.3, 0.5])),
-        seed=int((cfg.get("train", {}) or {}).get("seed", 42)),
+        seed=dataset_seed,
         strict_integrity=bool(data_cfg.get("strict_integrity", True)),
         manifest_donor_mode=str(robust_cfg.get("manifest_donor_mode", "cyclic")),
         deterministic_aug=bool(view),
@@ -176,7 +179,9 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
     batch_size = int(train_cfg.get("batch_size" if train else "eval_batch_size", train_cfg.get("batch_size", 24)))
     workers = int(train_cfg.get("num_workers", 0))
     generator = torch.Generator()
-    generator.manual_seed(int(train_cfg.get("seed", 42)) + (0 if train else 100_000))
+    train_seed = int(train_cfg.get("seed", 42))
+    eval_seed = int((cfg.get("eval", {}) or {}).get("seed", train_seed + 100_000))
+    generator.manual_seed(train_seed if train else eval_seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -410,7 +415,7 @@ def _robust_eval_loaders(cfg: dict[str, Any], split: str) -> list[tuple[str, Dat
     strengths = list(eval_cfg.get("perturb_strengths", [0.5]))
     loaders: list[tuple[str, DataLoader]] = []
     for view in views:
-        if view.endswith("_missing") or view in {"manifest_zeroed", "manifest_shuffled"}:
+        if view.endswith("_missing") or view in {"manifest_zeroed", "manifest_shuffled", "manifest_shuffled_blind"}:
             ds = _make_dataset(cfg, split, aug=True, view=view, strength=1.0)
             loaders.append((view, _loader(cfg, ds, train=False)))
         else:
@@ -483,21 +488,17 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
 
     train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
     val_ds = _make_dataset(cfg, "val", aug=False)
-    test_ds = _make_dataset(cfg, "test", aug=False)
     data_cfg = cfg.get("data", {}) or {}
     _validate_split_isolation(
         train_ds,
         val_ds,
-        test_ds,
         check_package=bool(data_cfg.get("enforce_package_isolation", True)),
     )
     LOGGER.info("Train stats: %s", split_label_stats(train_ds))
     LOGGER.info("Val stats: %s", split_label_stats(val_ds))
-    LOGGER.info("Test stats: %s", split_label_stats(test_ds))
 
     train_loader = _loader(cfg, train_ds, train=True)
     val_loader = _loader(cfg, val_ds, train=False)
-    test_loader = _loader(cfg, test_ds, train=False)
     robust_val_loaders = _robust_val_loaders(cfg)
     first_payload = torch.load(train_ds.samples[0][0], map_location="cpu")
     node_input_dim = int(first_payload["node_x"].size(1))
@@ -556,6 +557,15 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
     val_metrics, val_rows = evaluate(model, val_loader, device, split_name="val_best", dump_rows=True)
+    test_ds = _make_dataset(cfg, "test", aug=False)
+    _validate_split_isolation(
+        train_ds,
+        val_ds,
+        test_ds,
+        check_package=bool(data_cfg.get("enforce_package_isolation", True)),
+    )
+    LOGGER.info("Test stats: %s", split_label_stats(test_ds))
+    test_loader = _loader(cfg, test_ds, train=False)
     test_metrics, test_rows = evaluate(model, test_loader, device, split_name="test", dump_rows=True)
     summary: dict[str, Any] = {"best_epoch": best_epoch, "best_score": best_score, "val": val_metrics, "test": test_metrics}
 

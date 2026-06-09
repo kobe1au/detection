@@ -51,6 +51,8 @@ loss:
   source_degraded_contrast_weight: 0.05
   cross_source_contrast_weight: 0.03
   counterfactual_kl_weight: 0.05
+  aug_ce_weight: 0.0
+  reliability_weighted_contrast: true
   temperature: 0.2
 
 robust:
@@ -74,6 +76,7 @@ robust:
     - manifest_missing
 
 eval:
+  seed: 2026
   robust_eval: true
   robust_val:
     enabled: true
@@ -91,6 +94,10 @@ eval:
         view: manifest_shuffled
         strength: 1.0
         weight: 0.3
+      - name: manifest_shuffled_blind
+        view: manifest_shuffled_blind
+        strength: 1.0
+        weight: 0.2
       - name: all_degraded
         view: all_degraded
         strength: 0.5
@@ -102,8 +109,10 @@ eval:
     - api_graph_degraded
     - manifest_degraded
     - manifest_noisy
+    - manifest_noisy_blind
     - manifest_zeroed
     - manifest_shuffled
+    - manifest_shuffled_blind
     - all_degraded
     - api_missing
     - graph_missing

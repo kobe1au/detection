@@ -267,7 +267,7 @@ class AEGDataset(Dataset):
                 out["aug"] = apply_aeg_view(clean, view=selected_view, strength=strength)
         else:
             out["aug"] = apply_aeg_view(clean, view="clean", strength=0.0)
-        if selected_view == "manifest_shuffled":
+        if selected_view in {"manifest_shuffled", "manifest_shuffled_blind"}:
             donor_idx = self.manifest_donor_indices[idx] if idx < len(self.manifest_donor_indices) else None
             if donor_idx is not None:
                 donor_path, donor_label = self.samples[donor_idx]
@@ -293,7 +293,7 @@ def aeg_collate_fn(items: list[dict[str, Data]]) -> dict[str, Any]:
     }
 
 
-def _copy_manifest_content(target: Data, donor: Data) -> None:
+def _copy_manifest_content(target: Data, donor: Data, *, blind: bool = False) -> None:
     target_mask = target.node_source == SOURCE_TYPES["manifest"]
     donor_mask = donor.node_source == SOURCE_TYPES["manifest"]
     if not bool(target_mask.any()):
@@ -313,11 +313,13 @@ def _copy_manifest_content(target: Data, donor: Data) -> None:
             continue
         repeat = donor_idx.repeat((int(target_idx.numel()) + int(donor_idx.numel()) - 1) // int(donor_idx.numel()))[: target_idx.numel()]
         target.x[target_idx] = donor.x[repeat]
-        target.node_quality[target_idx] = donor.node_quality[repeat]
         target.node_semantic[target_idx] = donor.node_semantic[repeat]
-    target.q_manifest = donor.q_manifest.clone()
-    target.pert_manifest = torch.tensor([1.0], dtype=torch.float32, device=target.x.device)
-    _zero_shuffled_manifest_edges(target)
+        if not blind:
+            target.node_quality[target_idx] = donor.node_quality[repeat]
+    if not blind:
+        target.q_manifest = donor.q_manifest.clone()
+        target.pert_manifest = torch.tensor([1.0], dtype=torch.float32, device=target.x.device)
+        _zero_shuffled_manifest_edges(target)
     clear_aggregate_apk_semantic(target)
     refresh_apk_node_quality(target)
     refresh_risk_node_quality(target)
@@ -347,7 +349,8 @@ def _zero_shuffled_manifest_edges(data: Data) -> None:
 
 def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data], donor_items: list[Data | None] | None = None) -> None:
     for idx, aug in enumerate(aug_items):
-        if int(aug.view_type_id.view(-1)[0].item()) != VIEW_TYPES["manifest_shuffled"]:
+        view_id = int(aug.view_type_id.view(-1)[0].item())
+        if view_id not in {VIEW_TYPES["manifest_shuffled"], VIEW_TYPES["manifest_shuffled_blind"]}:
             continue
         donor = donor_items[idx] if donor_items is not None and idx < len(donor_items) else None
         if donor is None:
@@ -355,7 +358,7 @@ def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data], dono
             # evidence instead of silently keeping the original.
             _zero_manifest_nodes(aug)
         else:
-            _copy_manifest_content(aug, donor)
+            _copy_manifest_content(aug, donor, blind=view_id == VIEW_TYPES["manifest_shuffled_blind"])
 
 
 def _build_manifest_donor_indices(

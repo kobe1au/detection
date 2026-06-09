@@ -73,6 +73,8 @@ def _conditional_cf_weight(clean_extra: dict[str, torch.Tensor], aug_extra: dict
             VIEW_TYPES["manifest_zeroed"],
             VIEW_TYPES["manifest_noisy"],
             VIEW_TYPES["manifest_shuffled"],
+            VIEW_TYPES["manifest_noisy_blind"],
+            VIEW_TYPES["manifest_shuffled_blind"],
             VIEW_TYPES["manifest_missing"],
         ],
         device=ref.device,
@@ -125,6 +127,8 @@ def _source_contrast_weights(
                 VIEW_TYPES["manifest_zeroed"],
                 VIEW_TYPES["manifest_noisy"],
                 VIEW_TYPES["manifest_shuffled"],
+                VIEW_TYPES["manifest_noisy_blind"],
+                VIEW_TYPES["manifest_shuffled_blind"],
                 VIEW_TYPES["manifest_missing"],
             ],
             device=ref.device,
@@ -171,21 +175,29 @@ def compute_aeg_loss(
     source_aug_weight = float(cfg.get("source_degraded_contrast_weight", 0.05))
     cross_source_weight = float(cfg.get("cross_source_contrast_weight", 0.03))
     cf_kl_weight = float(cfg.get("counterfactual_kl_weight", 0.05))
+    aug_ce_weight = float(cfg.get("aug_ce_weight", 0.0))
+    reliability_weighted = bool(cfg.get("reliability_weighted_contrast", True))
     temperature = float(cfg.get("temperature", 0.2))
 
     labels = labels.view(-1).long()
     ce = F.cross_entropy(clean_logits, labels)
+    aug_ce = clean_logits.new_tensor(0.0)
     clean_aug = clean_logits.new_tensor(0.0)
     source_aug = clean_logits.new_tensor(0.0)
     cf_kl = clean_logits.new_tensor(0.0)
     if aug_logits is not None and aug_extra is not None:
+        aug_ce = F.cross_entropy(aug_logits, labels)
+        fused_weight = _fused_contrast_weight(clean_extra, aug_extra, clean_logits) if reliability_weighted else None
         clean_aug = _info_nce(
             clean_extra["fused_emb"],
             aug_extra["fused_emb"],
             temperature,
-            _fused_contrast_weight(clean_extra, aug_extra, clean_logits),
+            fused_weight,
         )
-        code_weight, manifest_weight, risk_weight = _source_contrast_weights(clean_extra, aug_extra, clean_logits)
+        if reliability_weighted:
+            code_weight, manifest_weight, risk_weight = _source_contrast_weights(clean_extra, aug_extra, clean_logits)
+        else:
+            code_weight = manifest_weight = risk_weight = None
         source_terms = [
             _info_nce(clean_extra["method_emb"], aug_extra["method_emb"], temperature, code_weight),
             _info_nce(clean_extra["api_family_emb"], aug_extra["api_family_emb"], temperature, code_weight),
@@ -197,11 +209,16 @@ def compute_aeg_loss(
         cf_weight = _conditional_cf_weight(clean_extra, aug_extra, clean_logits)
         cf_kl = _weighted_symmetric_kl(clean_logits, aug_logits, cf_weight)
 
-    rel_weight = _reliability_weight(clean_extra).to(device=clean_logits.device, dtype=clean_logits.dtype)
+    rel_weight = (
+        _reliability_weight(clean_extra).to(device=clean_logits.device, dtype=clean_logits.dtype)
+        if reliability_weighted
+        else None
+    )
     cross_source = _info_nce(clean_extra["code_emb"], clean_extra["manifest_emb"], temperature, rel_weight)
 
     total = (
         ce_weight * ce
+        + aug_ce_weight * aug_ce
         + clean_aug_weight * clean_aug
         + source_aug_weight * source_aug
         + cross_source_weight * cross_source
@@ -210,6 +227,7 @@ def compute_aeg_loss(
     parts = {
         "loss": float(total.detach().item()),
         "ce": float(ce.detach().item()),
+        "aug_ce": float(aug_ce.detach().item()),
         "clean_degraded_contrast": float(clean_aug.detach().item()),
         "source_degraded_contrast": float(source_aug.detach().item()),
         "cross_source_contrast": float(cross_source.detach().item()),
@@ -219,5 +237,7 @@ def compute_aeg_loss(
         "source_degraded_contrast_weight": source_aug_weight,
         "cross_source_contrast_weight": cross_source_weight,
         "counterfactual_kl_weight": cf_kl_weight,
+        "aug_ce_weight": aug_ce_weight,
+        "reliability_weighted_contrast": float(reliability_weighted),
     }
     return total, parts

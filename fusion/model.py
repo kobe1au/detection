@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 
-from fusion.constants import NUM_EDGE_TYPES, NUM_NODE_TYPES, NUM_SOURCE_TYPES, NODE_TYPES, SOURCE_TYPES
+from fusion.constants import EDGE_TYPES, NUM_EDGE_TYPES, NUM_NODE_TYPES, NUM_SOURCE_TYPES, NODE_TYPES, SOURCE_TYPES
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
 
 
@@ -28,6 +28,23 @@ def _graph_scalar(data: Batch, name: str, default: float = 0.0) -> torch.Tensor:
         if out.numel() >= bsz:
             return out[:bsz]
     return torch.full((bsz,), float(default), dtype=torch.float32, device=data.x.device)
+
+
+def _resolve_type_ids(values: Any, table: dict[str, int], *, kind: str) -> tuple[int, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, (str, int)):
+        values = [values]
+    out: list[int] = []
+    for value in values:
+        if isinstance(value, str):
+            key = value.strip()
+            if key not in table:
+                raise ValueError(f"Unknown {kind} type name: {value!r}")
+            out.append(int(table[key]))
+        else:
+            out.append(int(value))
+    return tuple(sorted(set(out)))
 
 
 def _masked_mean(h: torch.Tensor, mask: torch.Tensor, batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
@@ -185,6 +202,8 @@ class AEGModel(nn.Module):
         use_edge_quality: bool = True,
         use_relation_types: bool = True,
         fusion_mode: str = "latent",
+        masked_node_types: list[str | int] | tuple[str | int, ...] | None = None,
+        masked_edge_types: list[str | int] | tuple[str | int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -195,6 +214,16 @@ class AEGModel(nn.Module):
         self.fusion_mode = str(fusion_mode or "latent").lower()
         if self.fusion_mode not in {"latent", "mean_pool"}:
             raise ValueError(f"Unsupported fusion_mode: {fusion_mode!r}")
+        masked_node_ids = torch.tensor(
+            _resolve_type_ids(masked_node_types, NODE_TYPES, kind="node"),
+            dtype=torch.long,
+        )
+        masked_edge_ids = torch.tensor(
+            _resolve_type_ids(masked_edge_types, EDGE_TYPES, kind="edge"),
+            dtype=torch.long,
+        )
+        self.register_buffer("masked_node_type_ids", masked_node_ids, persistent=False)
+        self.register_buffer("masked_edge_type_ids", masked_edge_ids, persistent=False)
         self.input_proj = nn.Linear(int(node_input_dim), hidden_dim)
         self.node_type_emb = nn.Embedding(NUM_NODE_TYPES, hidden_dim)
         self.source_emb = nn.Embedding(NUM_SOURCE_TYPES, hidden_dim)
@@ -228,6 +257,22 @@ class AEGModel(nn.Module):
             nn.Linear(hidden_dim, num_classes),
         )
 
+    def _effective_node_quality(self, data: Batch) -> torch.Tensor:
+        quality = data.node_quality.float().view(-1, 1).clamp(0.0, 1.0)
+        if self.masked_node_type_ids.numel() > 0:
+            masked_ids = self.masked_node_type_ids.to(device=data.x.device)
+            mask = torch.isin(data.node_type.long().to(data.x.device), masked_ids).view(-1, 1)
+            quality = torch.where(mask, torch.zeros_like(quality), quality)
+        return quality
+
+    def _effective_edge_quality(self, data: Batch) -> torch.Tensor:
+        edge_quality = data.edge_quality.float().to(data.x.device)
+        if self.masked_edge_type_ids.numel() > 0 and edge_quality.numel() > 0:
+            masked_ids = self.masked_edge_type_ids.to(device=data.x.device)
+            mask = torch.isin(data.edge_type.long().to(data.x.device), masked_ids)
+            edge_quality = torch.where(mask, torch.zeros_like(edge_quality), edge_quality)
+        return edge_quality
+
     def _initial_node_state(self, data: Batch) -> torch.Tensor:
         x = data.x.float()
         if x.size(1) != self.input_proj.in_features:
@@ -238,7 +283,7 @@ class AEGModel(nn.Module):
                 x = x[:, : self.input_proj.in_features]
         node_type = data.node_type.long().clamp(0, NUM_NODE_TYPES - 1)
         node_source = data.node_source.long().clamp(0, NUM_SOURCE_TYPES - 1)
-        quality = data.node_quality.float().view(-1, 1).clamp(0.0, 1.0)
+        quality = self._effective_node_quality(data)
         semantic = data.node_semantic.float()
         h = self.input_proj(x) + self.semantic_proj(semantic)
         if self.use_node_types:
@@ -256,9 +301,9 @@ class AEGModel(nn.Module):
         num_graphs = _batch_size(data)
         h = self._initial_node_state(data)
         edge_type = data.edge_type.long().to(data.x.device)
-        edge_quality = data.edge_quality.float().to(data.x.device)
+        edge_quality = self._effective_edge_quality(data)
         edge_source = data.edge_source.long().to(data.x.device)
-        node_quality = data.node_quality.float().to(data.x.device).view(-1, 1).clamp(0.0, 1.0)
+        node_quality = self._effective_node_quality(data).to(data.x.device)
         node_alive_mask = node_quality.view(-1) > 0
         node_weight = node_quality if self.use_node_quality else node_alive_mask.to(dtype=node_quality.dtype).view(-1, 1)
         edge_index = data.edge_index.to(data.x.device)
@@ -317,7 +362,7 @@ class AEGModel(nn.Module):
             (r_api * r_graph).sqrt()
             * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
         ).clamp(0.0, 1.0)
-        risk_rel = _masked_mean(data.node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
+        risk_rel = _masked_mean(node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
         global_rel = torch.stack([code_rel, r_manifest], dim=-1).amax(dim=-1)
         token_rel = torch.stack(
             [r_graph, r_api, r_manifest, r_manifest, risk_rel, r_api, global_rel],
@@ -413,4 +458,6 @@ def build_model(cfg: dict[str, Any], node_input_dim: int) -> AEGModel:
         use_edge_quality=bool(model_cfg.get("use_edge_quality", True)),
         use_relation_types=bool(model_cfg.get("use_relation_types", True)),
         fusion_mode=str(model_cfg.get("fusion_mode", "latent")),
+        masked_node_types=model_cfg.get("masked_node_types"),
+        masked_edge_types=model_cfg.get("masked_edge_types"),
     )
