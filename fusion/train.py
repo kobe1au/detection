@@ -153,7 +153,8 @@ def _make_dataset(cfg: dict[str, Any], split: str, *, aug: bool = False, view: s
         raise ValueError(f"data.{split}.csv is required")
     robust_cfg = cfg.get("robust", {}) or {}
     train_seed = int((cfg.get("train", {}) or {}).get("seed", 42))
-    eval_seed = int((cfg.get("eval", {}) or {}).get("seed", train_seed + 100_000))
+    # ✅ P0-2: eval_seed 完全独立,不派生自 train_seed
+    eval_seed = int((cfg.get("eval", {}) or {}).get("seed", 2026))
     dataset_seed = eval_seed if view else train_seed
     return AEGDataset(
         pt_dir,
@@ -180,7 +181,8 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
     workers = int(train_cfg.get("num_workers", 0))
     generator = torch.Generator()
     train_seed = int(train_cfg.get("seed", 42))
-    eval_seed = int((cfg.get("eval", {}) or {}).get("seed", train_seed + 100_000))
+    # ✅ P0-2: eval_seed 完全独立,不派生自 train_seed
+    eval_seed = int((cfg.get("eval", {}) or {}).get("seed", 2026))
     generator.manual_seed(train_seed if train else eval_seed)
     return DataLoader(
         dataset,

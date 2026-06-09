@@ -76,7 +76,7 @@ robust:
     - manifest_missing
 
 eval:
-  seed: 2026
+  seed: 2026  # ✅ 独立于 train.seed,保证多 seed 实验公平性
   robust_eval: true
   robust_val:
     enabled: true
