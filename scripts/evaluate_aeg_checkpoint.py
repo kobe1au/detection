@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import torch
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fusion.dataset import AEGDataset  # noqa: E402
 from fusion.constants import AEG_PAYLOAD_CONTRACT_FINGERPRINT  # noqa: E402
-from fusion.io_utils import load_aeg_payload  # noqa: E402
+from fusion.io_utils import load_aeg_payload, load_checkpoint  # noqa: E402
 from fusion.model import build_model  # noqa: E402
 from fusion.train import _device, _loader, _write_rows, evaluate  # noqa: E402
 
@@ -54,7 +53,7 @@ def _validate_scenario(dataset: AEGDataset, node_input_dim: int) -> None:
 
 
 def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
-    ckpt = torch.load(checkpoint, map_location="cpu")
+    ckpt = load_checkpoint(checkpoint, map_location="cpu")
     cfg = dict(ckpt.get("cfg") or {})
     if not cfg:
         raise ValueError("Checkpoint does not contain its training config")

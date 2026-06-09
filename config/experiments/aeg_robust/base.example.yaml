@@ -6,6 +6,7 @@ data:
   # - Windows example: D:/pts_aeg/train (shown below)
   strict_integrity: true
   enforce_package_isolation: true
+  enforce_build_fingerprint: warn
   train:
     pt_dir: D:/pts_aeg/train  # UPDATE THIS PATH
     csv: results/labels/train.csv

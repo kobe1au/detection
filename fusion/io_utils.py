@@ -1,4 +1,4 @@
-"""Safe I/O utilities for AEG payload loading."""
+"""Safe I/O utilities for AEG payload and checkpoint loading."""
 from __future__ import annotations
 
 import logging
@@ -13,6 +13,39 @@ from fusion.payload_contract import validate_aeg_payload
 LOGGER = logging.getLogger(__name__)
 
 
+def _compat_error_message(exc: BaseException) -> str:
+    return str(exc).lower()
+
+
+def _arg_unsupported(exc: BaseException, arg_name: str) -> bool:
+    message = _compat_error_message(exc)
+    return arg_name in message and (
+        "unexpected keyword" in message
+        or "invalid keyword" in message
+        or "not supported" in message
+        or "got an unexpected keyword argument" in message
+    )
+
+
+def _supports_retry_without_mmap(exc: BaseException) -> bool:
+    return _arg_unsupported(exc, "mmap")
+
+
+def _weights_only_unsupported(exc: BaseException) -> bool:
+    return _arg_unsupported(exc, "weights_only")
+
+
+def _weights_only_rejected(exc: BaseException) -> bool:
+    if _weights_only_unsupported(exc):
+        return False
+    message = _compat_error_message(exc)
+    return (
+        "weights only load failed" in message
+        or "unsupported global" in message
+        or "safe_globals" in message
+    )
+
+
 def load_aeg_payload(
     path: Path | str,
     *,
@@ -20,77 +53,115 @@ def load_aeg_payload(
     expected_node_feature_dim: int | None = None,
     weights_only: bool = True,
 ) -> dict[str, Any]:
-    """Load AEG PT file with defense-in-depth.
-    
-    This is the canonical safe loading function for all AEG payload files.
-    Use this instead of torch.load() directly to ensure security and consistency.
-    
-    Args:
-        path: Path to .pt file
-        validate: Whether to validate payload contract after load
-        expected_node_feature_dim: Optional node_x width expected by the caller
-        weights_only: Use weights_only=True for pickle safety (PyTorch 2.0+)
-    
-    Returns:
-        AEG payload dictionary
-        
-    Raises:
-        FileNotFoundError: If path doesn't exist
-        ValueError: If validation fails
-        
-    Security:
-        - Primary: weights_only=True restricts pickle deserialization (PyTorch 2.0+)
-        - Secondary: validate_aeg_payload checks schema/structure post-load
-        - Fallback: Graceful degradation for older PyTorch versions with warning
-        
-    Performance:
-        - Uses mmap=True for memory-mapped loading when available
-        - Reduces memory footprint for large PT files
-    """
+    """Load an AEG PT payload with fail-closed safe-loading semantics."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"PT file not found: {path}")
-    # torch.load(..., mmap=True) requires a string filename on current PyTorch.
-    # Passing a Path works without mmap but fails before the fallback otherwise.
     path_str = str(path)
-    
+
     if not weights_only:
-        # Legacy mode - only for explicitly trusted files
         LOGGER.warning(
-            "Loading %s without weights_only protection. "
-            "Only use this for trusted PT files.",
+            "Loading %s without weights_only protection. Only use this for trusted PT files.",
             path.name,
         )
         payload = torch.load(path_str, map_location="cpu")
     else:
-        # Try safe loading with progressive fallbacks
         try:
-            # PyTorch 2.0+: safe deserialization + memory-mapped loading
             payload = torch.load(
                 path_str,
                 map_location="cpu",
                 weights_only=True,
                 mmap=True,
             )
-        except (TypeError, ValueError):
+        except Exception as exc:
+            if _weights_only_unsupported(exc):
+                raise RuntimeError(
+                    "This PyTorch version does not support weights_only safe loading for AEG payloads. "
+                    "Upgrade PyTorch or explicitly opt into weights_only=False only for trusted files."
+                ) from exc
+            if not _supports_retry_without_mmap(exc):
+                raise
             try:
-                # Fallback 1: weights_only without mmap
                 payload = torch.load(
                     path_str,
                     map_location="cpu",
                     weights_only=True,
                 )
-            except TypeError:
-                # Fallback 2: legacy mode (no pickle safety)
-                LOGGER.warning(
-                    "PyTorch version does not support weights_only/mmap. "
-                    "Loading %s with legacy torch.load; only use trusted PT files.",
-                    path.name,
-                )
-                payload = torch.load(path_str, map_location="cpu")
-    
-    # Secondary validation (post-load structure check)
+            except Exception as retry_exc:
+                if _weights_only_unsupported(retry_exc):
+                    raise RuntimeError(
+                        "This PyTorch version does not support weights_only safe loading for AEG payloads. "
+                        "Upgrade PyTorch or explicitly opt into weights_only=False only for trusted files."
+                    ) from retry_exc
+                raise
+
     if validate:
         validate_aeg_payload(payload, expected_node_feature_dim=expected_node_feature_dim)
-    
+
     return payload
+
+
+def load_checkpoint(
+    path: Path | str,
+    *,
+    map_location: str | torch.device = "cpu",
+    weights_only: bool = True,
+) -> dict[str, Any]:
+    """Load a training checkpoint with best-effort safe loading and explicit fallback warnings."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    path_str = str(path)
+
+    if not weights_only:
+        LOGGER.warning(
+            "Loading checkpoint %s without weights_only protection. Only use this for trusted files.",
+            path.name,
+        )
+        checkpoint = torch.load(path_str, map_location=map_location)
+    else:
+        try:
+            checkpoint = torch.load(
+                path_str,
+                map_location=map_location,
+                weights_only=True,
+                mmap=True,
+            )
+        except Exception as exc:
+            if _supports_retry_without_mmap(exc):
+                try:
+                    checkpoint = torch.load(
+                        path_str,
+                        map_location=map_location,
+                        weights_only=True,
+                    )
+                except Exception as retry_exc:
+                    if _weights_only_unsupported(retry_exc) or _weights_only_rejected(retry_exc):
+                        LOGGER.warning(
+                            "Falling back to legacy torch.load for checkpoint %s due to safe-load incompatibility: %s",
+                            path.name,
+                            retry_exc,
+                        )
+                        checkpoint = torch.load(path_str, map_location=map_location)
+                    else:
+                        raise
+            elif _weights_only_unsupported(exc):
+                LOGGER.warning(
+                    "Falling back to legacy torch.load for checkpoint %s due to safe-load incompatibility: %s",
+                    path.name,
+                    exc,
+                )
+                checkpoint = torch.load(path_str, map_location=map_location)
+            elif _weights_only_rejected(exc):
+                LOGGER.warning(
+                    "Falling back to legacy torch.load for checkpoint %s due to safe-load rejection: %s",
+                    path.name,
+                    exc,
+                )
+                checkpoint = torch.load(path_str, map_location=map_location)
+            else:
+                raise
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint must be a dict, got {type(checkpoint).__name__}")
+    return checkpoint

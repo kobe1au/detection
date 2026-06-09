@@ -22,7 +22,12 @@
       "Bash(head -5 D:/pts_aeg/aeg_apk_scan_index.csv)",
       "Read(//d/pts_aeg/**)",
       "Bash(grep -c \"^train,\" D:/pts_aeg/aeg_apk_scan_index.csv)",
-      "Bash(awk '{print $5, $9}')"
+      "Bash(awk '{print $5, $9}')",
+      "Bash(git diff *)",
+      "Bash(pytest -q tests/test_aeg_smoke.py -k \"manifest_shuffle or build_fingerprint or contrastive_batch_size_one or zero_training_batches or load_checkpoint_round_trips or validate_aeg_pt_reports_build_fingerprints\")",
+      "PowerShell($py = Get-Command py -ErrorAction SilentlyContinue; $python = Get-Command python -ErrorAction SilentlyContinue; if \\($py\\) { & $py.Source -m pytest -q tests/test_aeg_smoke.py -k \"manifest_shuffle or build_fingerprint or contrastive_batch_size_one or zero_training_batches or load_checkpoint_round_trips or validate_aeg_pt_reports_build_fingerprints\" } elseif \\($python\\) { & $python.Source -m pytest -q tests/test_aeg_smoke.py -k \"manifest_shuffle or build_fingerprint or contrastive_batch_size_one or zero_training_batches or validate_aeg_pt_reports_build_fingerprints\" } else { Write-Error \"Neither py nor python launcher is available\" })",
+      "Bash(python -m pytest tests/test_aeg_smoke.py -k \"metadata or load_aeg_payload or load_checkpoint or build_fingerprint or manifest_shuffle or run_rejects\")",
+      "PowerShell(Get-Command py, python -ErrorAction SilentlyContinue)"
     ]
   }
 }

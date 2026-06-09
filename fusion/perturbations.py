@@ -102,6 +102,24 @@ def _set_scalar(data: Data, name: str, value: float) -> None:
     setattr(data, name, torch.tensor([float(value)], dtype=torch.float32, device=data.x.device))
 
 
+def _set_view_tracking(
+    data: Data,
+    *,
+    requested_view: str,
+    effective_view: str | None = None,
+    fallback: bool = False,
+) -> None:
+    requested_name = str(requested_view or "clean")
+    effective_name = str(effective_view or requested_name)
+    requested_id = VIEW_TYPES.get(requested_name, VIEW_TYPES["clean"])
+    effective_id = VIEW_TYPES.get(effective_name, VIEW_TYPES["clean"])
+    device = data.x.device
+    data.view_type_id = torch.tensor([requested_id], dtype=torch.long, device=device)
+    data.requested_view_type_id = torch.tensor([requested_id], dtype=torch.long, device=device)
+    data.effective_view_type_id = torch.tensor([effective_id], dtype=torch.long, device=device)
+    data.manifest_shuffle_fallback = torch.tensor([1 if fallback else 0], dtype=torch.long, device=device)
+
+
 def _refresh_align_after_code_perturb(data: Data) -> None:
     q_api = float(getattr(data, "q_api", torch.tensor([0.0])).view(-1)[0].item())
     q_graph = float(getattr(data, "q_graph", torch.tensor([0.0])).view(-1)[0].item())
@@ -286,7 +304,7 @@ def apply_aeg_view(data: Data, *, view: str, strength: float = 0.5) -> Data:
     out = data.clone()
     strength = _clamp_strength(strength)
     view = str(view or "clean")
-    out.view_type_id = torch.tensor([VIEW_TYPES.get(view, 0)], dtype=torch.long)
+    _set_view_tracking(out, requested_view=view)
     out.cf_weight = torch.tensor([0.0], dtype=torch.float32)
 
     if view == "clean" or strength <= 0:

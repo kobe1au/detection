@@ -166,6 +166,9 @@ def payload_to_data(
     data.package_name = str(payload.get("package_name") or "")
     data.split = str(payload.get("split") or "")
     data.view_type_id = torch.tensor([0], dtype=torch.long)
+    data.requested_view_type_id = torch.tensor([0], dtype=torch.long)
+    data.effective_view_type_id = torch.tensor([0], dtype=torch.long)
+    data.manifest_shuffle_fallback = torch.tensor([0], dtype=torch.long)
     data.cf_weight = torch.tensor([0.0], dtype=torch.float32)
     data.manifest_parse_ok = torch.tensor([1.0 if payload.get("manifest_parse_ok", True) else 0.0], dtype=torch.float32)
     data.dex_success_ratio = torch.tensor([float(payload.get("dex_success_ratio", 1.0) or 0.0)], dtype=torch.float32)
@@ -293,6 +296,9 @@ def aeg_collate_fn(items: list[dict[str, Data]]) -> dict[str, Any]:
         "aug": Batch.from_data_list(aug_items),
         "sid": [getattr(item, "sid", "") for item in clean_items],
         "manifest_donor_sid": [getattr(item.get("manifest_donor"), "sid", "") if item.get("manifest_donor") is not None else "" for item in items],
+        "requested_view_type_id": [int(getattr(item.get("aug", item["clean"]), "requested_view_type_id", getattr(item.get("aug", item["clean"]), "view_type_id")).view(-1)[0].item()) for item in items],
+        "effective_view_type_id": [int(getattr(item.get("aug", item["clean"]), "effective_view_type_id", getattr(item.get("aug", item["clean"]), "view_type_id")).view(-1)[0].item()) for item in items],
+        "manifest_shuffle_fallback": [int(getattr(item.get("aug", item["clean"]), "manifest_shuffle_fallback", torch.tensor([0])).view(-1)[0].item()) for item in items],
     }
 
 
@@ -360,8 +366,12 @@ def _apply_manifest_shuffle(clean_items: list[Data], aug_items: list[Data], dono
             # A one-sample split cannot supply a donor; use zeroed Manifest
             # evidence instead of silently keeping the original.
             _zero_manifest_nodes(aug)
+            aug.effective_view_type_id = torch.tensor([VIEW_TYPES["manifest_missing"]], dtype=torch.long, device=aug.x.device)
+            aug.manifest_shuffle_fallback = torch.tensor([1], dtype=torch.long, device=aug.x.device)
         else:
             _copy_manifest_content(aug, donor, blind=view_id == VIEW_TYPES["manifest_shuffled_blind"])
+            aug.effective_view_type_id = aug.view_type_id.clone().to(device=aug.x.device)
+            aug.manifest_shuffle_fallback = torch.tensor([0], dtype=torch.long, device=aug.x.device)
 
 
 def _build_manifest_donor_indices(

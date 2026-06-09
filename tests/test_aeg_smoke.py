@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import argparse
+import json
+import logging
+import shutil
 import sys
 import types
 import xml.etree.ElementTree as ET
@@ -15,12 +18,14 @@ from torch_geometric.data import Batch
 from fusion.aeg_builder import _compress_method_feature, build_aeg_payload
 from fusion.constants import AEG_SCHEMA_VERSION, EDGE_TYPES, NODE_TYPES, VIEW_TYPES
 from fusion.dataset import AEGDataset, AEGDatasetConfigError, aeg_collate_fn, payload_to_data
+from fusion.io_utils import load_aeg_payload, load_checkpoint
 from fusion.losses import _fused_contrast_weight, _source_contrast_weights, compute_aeg_loss
 from fusion.manifest_features import build_manifest_vocab, extract_manifest_record, vectorize_manifest_record
 from fusion.model import AEGModel, build_model
 from fusion.perturbations import apply_aeg_view
 from fusion.payload_contract import validate_aeg_payload
-from fusion.train import _validate_split_isolation, load_config
+from fusion.train import _validate_split_isolation, load_config, run
+import fusion.train as train_module
 
 
 def _manifest_record() -> dict:
@@ -78,6 +83,35 @@ def _payload() -> dict:
         },
         node_feature_dim=32,
     )
+
+
+def _variant_payload(
+    sid: str,
+    *,
+    package_name: str,
+    split: str = "train",
+    build_fingerprint: str = "test-build",
+) -> dict:
+    payload = dict(_payload())
+    payload["sid"] = sid
+    payload["sha256"] = sid
+    payload["package_name"] = package_name
+    payload["split"] = split
+    payload["aeg_build_fingerprint"] = build_fingerprint
+    return payload
+
+
+def _write_split(tmp_path: Path, split: str, rows: list[tuple[dict, int]]) -> tuple[Path, Path]:
+    pt_dir = tmp_path / split
+    pt_dir.mkdir()
+    csv_path = tmp_path / f"{split}.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "label"])
+        writer.writeheader()
+        for payload, label in rows:
+            torch.save(payload, pt_dir / f"{payload['sid']}.pt")
+            writer.writerow({"id": payload["sid"], "label": label})
+    return pt_dir, csv_path
 
 
 def test_aeg_builder_dataset_model_loss(tmp_path: Path):
@@ -244,6 +278,12 @@ def test_manifest_shuffle_uses_dataset_donor_with_batch_size_one(tmp_path: Path)
     batch = aeg_collate_fn([item])
     aug = batch["aug"].to_data_list()[0]
     assert batch["manifest_donor_sid"][0] == payload_b["sid"]
+    assert batch["requested_view_type_id"][0] == VIEW_TYPES["manifest_shuffled"]
+    assert batch["effective_view_type_id"][0] == VIEW_TYPES["manifest_shuffled"]
+    assert batch["manifest_shuffle_fallback"][0] == 0
+    assert aug.requested_view_type_id.item() == VIEW_TYPES["manifest_shuffled"]
+    assert aug.effective_view_type_id.item() == VIEW_TYPES["manifest_shuffled"]
+    assert aug.manifest_shuffle_fallback.item() == 0
     assert abs(float(aug.q_manifest.item()) - 0.25) < 1e-6
     assert aug.pert_manifest.item() == 1.0
     _, extra = AEGModel(node_input_dim=aug.x.size(1), hidden_dim=16, layers=1, num_latents=2)(
@@ -251,6 +291,29 @@ def test_manifest_shuffle_uses_dataset_donor_with_batch_size_one(tmp_path: Path)
     )
     assert extra["r_manifest"].item() == 0.0
     assert extra["manifest_reliability"].item() == 0.0
+
+
+def test_manifest_shuffle_falls_back_to_missing_without_donor(tmp_path: Path):
+    payload = _payload()
+    pt_dir, csv_path = _write_split(tmp_path, "train", [(payload, 1)])
+    ds = AEGDataset(
+        pt_dir,
+        csv_path,
+        train_aug=True,
+        aug_views=["manifest_shuffled"],
+        aug_strengths=[1.0],
+        aug_prob=1.0,
+    )
+    batch = aeg_collate_fn([ds[0]])
+    aug = batch["aug"].to_data_list()[0]
+    assert batch["manifest_donor_sid"][0] == ""
+    assert batch["requested_view_type_id"][0] == VIEW_TYPES["manifest_shuffled"]
+    assert batch["effective_view_type_id"][0] == VIEW_TYPES["manifest_missing"]
+    assert batch["manifest_shuffle_fallback"][0] == 1
+    assert aug.requested_view_type_id.item() == VIEW_TYPES["manifest_shuffled"]
+    assert aug.effective_view_type_id.item() == VIEW_TYPES["manifest_missing"]
+    assert aug.manifest_shuffle_fallback.item() == 1
+    assert aug.pert_manifest.item() == 1.0
 
 
 def test_manifest_shuffle_blind_keeps_reliability_scalars(tmp_path: Path):
@@ -489,21 +552,41 @@ def test_fused_contrast_weight_drops_when_all_sources_are_unreliable():
     assert torch.allclose(weight, torch.tensor([0.0, 0.3]))
 
 
-def test_aeg_config_loads():
-    cfg = load_config("config/experiments/aeg_robust/full/ours.yaml")
+def _prepare_local_aeg_experiment_configs(tmp_path: Path) -> Path:
+    src = Path("config/experiments/aeg_robust")
+    dst = tmp_path / "aeg_robust"
+    shutil.copytree(src, dst)
+    shutil.copy2(dst / "base.example.yaml", dst / "base.yaml")
+    return dst
+
+
+def test_aeg_config_loads(tmp_path: Path):
+    cfg_root = _prepare_local_aeg_experiment_configs(tmp_path)
+    cfg = load_config(cfg_root / "full/ours.yaml")
     assert cfg["model"]["hidden_dim"] == 128
     assert cfg["loss"]["clean_degraded_contrast_weight"] > 0.0
 
 
-def test_all_aeg_experiment_configs_load_and_have_unique_outputs():
+def test_all_aeg_experiment_configs_load_and_have_unique_outputs(tmp_path: Path):
+    cfg_root = _prepare_local_aeg_experiment_configs(tmp_path)
     outputs = set()
-    for path in sorted(Path("config/experiments/aeg_robust").rglob("*.yaml")):
+    for path in sorted(p for p in cfg_root.rglob("*.yaml") if not p.name.endswith(".example.yaml")):
         cfg = load_config(path)
         output = str(cfg["train"]["output_dir"])
         assert output not in outputs, f"duplicate output_dir: {output}"
         outputs.add(output)
         assert cfg["robust"]["manifest_donor_mode"] == "cyclic"
         assert int(cfg["eval"]["seed"]) == 2026
+
+
+def test_aeg_config_missing_base_shows_copy_from_example_guidance(tmp_path: Path):
+    cfg_root = tmp_path / "aeg_robust"
+    shutil.copytree(Path("config/experiments/aeg_robust"), cfg_root)
+    base_path = cfg_root / "base.yaml"
+    if base_path.exists():
+        base_path.unlink()
+    with pytest.raises(FileNotFoundError, match="Copy base.example.yaml to base.yaml"):
+        load_config(cfg_root / "full/ours.yaml")
 
 
 def test_diagnostic_slice_summarizer(tmp_path: Path):
@@ -984,23 +1067,520 @@ def test_package_name_overlap_across_splits_is_rejected(tmp_path: Path):
 
 
 def test_mixed_build_fingerprints_do_not_block_split_isolation(tmp_path: Path):
-    payload_train = _payload()
-    payload_val = _payload()
-    payload_val["sid"] = "b" * 64
-    payload_val["sha256"] = "b" * 64
-    payload_val["package_name"] = "com.example.other"
-    payload_val["aeg_build_fingerprint"] = "different-build"
+    payload_train = _variant_payload("a" * 64, package_name="com.example.sample", split="train")
+    payload_val = _variant_payload(
+        "b" * 64,
+        package_name="com.example.other",
+        split="val",
+        build_fingerprint="different-build",
+    )
 
     datasets = []
     for split, payload, label in (("train", payload_train, 1), ("val", payload_val, 0)):
-        pt_dir = tmp_path / split
-        pt_dir.mkdir()
-        torch.save(payload, pt_dir / f"{payload['sid']}.pt")
-        csv_path = tmp_path / f"{split}.csv"
-        with csv_path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["id", "label"])
-            writer.writeheader()
-            writer.writerow({"id": payload["sid"], "label": label})
+        pt_dir, csv_path = _write_split(tmp_path, split, [(payload, label)])
         datasets.append(AEGDataset(pt_dir, csv_path, split=split))
 
     _validate_split_isolation(*datasets, check_package=True)
+
+
+def test_build_fingerprint_policy_off_warn_and_strict(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    payload_train_a = _variant_payload("a" * 64, package_name="com.example.sample.a", split="train", build_fingerprint="build-a")
+    payload_train_b = _variant_payload("b" * 64, package_name="com.example.sample.b", split="train", build_fingerprint="build-b")
+    payload_val = _variant_payload("c" * 64, package_name="com.example.other", split="val", build_fingerprint="build-a")
+
+    train_dir, train_csv = _write_split(tmp_path, "train", [(payload_train_a, 1), (payload_train_b, 0)])
+    val_dir, val_csv = _write_split(tmp_path, "val", [(payload_val, 0)])
+    datasets = [
+        AEGDataset(train_dir, train_csv, split="train"),
+        AEGDataset(val_dir, val_csv, split="val"),
+    ]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        result_off = _validate_split_isolation(*datasets, check_package=True, build_fingerprint_policy="off")
+    assert result_off["build_fingerprint_policy"] == "off"
+    assert result_off["build_fingerprint_counts"]["train"] == {"build-a": 1, "build-b": 1}
+    assert "Mixed AEG build fingerprints detected" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        result_warn = _validate_split_isolation(*datasets, check_package=True, build_fingerprint_policy="warn")
+    assert result_warn["build_fingerprint_policy"] == "warn"
+    assert "Mixed AEG build fingerprints detected" in caplog.text
+
+    with pytest.raises(ValueError, match="Mixed AEG build fingerprints detected"):
+        _validate_split_isolation(*datasets, check_package=True, build_fingerprint_policy="strict")
+
+
+def test_run_rejects_contrastive_batch_size_one(tmp_path: Path):
+    payload_train = _variant_payload("a" * 64, package_name="com.example.train", split="train")
+    payload_val = _variant_payload("b" * 64, package_name="com.example.val", split="val")
+    payload_test = _variant_payload("c" * 64, package_name="com.example.test", split="test")
+
+    train_dir, train_csv = _write_split(tmp_path, "train", [(payload_train, 1)])
+    val_dir, val_csv = _write_split(tmp_path, "val", [(payload_val, 0)])
+    test_dir, test_csv = _write_split(tmp_path, "test", [(payload_test, 1)])
+
+    cfg = {
+        "data": {
+            "strict_integrity": True,
+            "enforce_package_isolation": True,
+            "enforce_build_fingerprint": "warn",
+            "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
+            "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
+            "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
+        },
+        "train": {
+            "output_dir": str(tmp_path / "run_batch1"),
+            "batch_size": 1,
+            "eval_batch_size": 1,
+            "epochs": 1,
+            "patience": 1,
+            "num_workers": 0,
+            "device": "cpu",
+        },
+        "model": {
+            "node_input_dim": 32,
+            "hidden_dim": 16,
+            "layers": 1,
+            "num_latents": 2,
+            "dropout": 0.0,
+            "num_classes": 2,
+        },
+        "loss": {
+            "clean_degraded_contrast_weight": 0.1,
+            "source_degraded_contrast_weight": 0.0,
+            "cross_source_contrast_weight": 0.0,
+        },
+        "robust": {"train_aug": False},
+        "eval": {"robust_eval": False},
+    }
+
+    with pytest.raises(ValueError, match="batch_size >= 2"):
+        run(cfg)
+
+
+
+def test_run_writes_failed_metadata_before_early_validation_errors(tmp_path: Path):
+    payload_train = _variant_payload("a" * 64, package_name="com.example.train", split="train")
+    payload_val = _variant_payload("b" * 64, package_name="com.example.val", split="val")
+    payload_test = _variant_payload("c" * 64, package_name="com.example.test", split="test")
+
+    train_dir, train_csv = _write_split(tmp_path, "train", [(payload_train, 1)])
+    val_dir, val_csv = _write_split(tmp_path, "val", [(payload_val, 0)])
+    test_dir, test_csv = _write_split(tmp_path, "test", [(payload_test, 1)])
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("train: {}\n", encoding="utf-8")
+    output_dir = tmp_path / "run_failed_metadata"
+
+    cfg = {
+        "data": {
+            "strict_integrity": True,
+            "enforce_package_isolation": True,
+            "enforce_build_fingerprint": "warn",
+            "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
+            "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
+            "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
+        },
+        "train": {
+            "output_dir": str(output_dir),
+            "batch_size": 1,
+            "eval_batch_size": 1,
+            "epochs": 1,
+            "patience": 1,
+            "num_workers": 0,
+            "device": "cpu",
+        },
+        "model": {
+            "node_input_dim": 32,
+            "hidden_dim": 16,
+            "layers": 1,
+            "num_latents": 2,
+            "dropout": 0.0,
+            "num_classes": 2,
+        },
+        "loss": {
+            "clean_degraded_contrast_weight": 0.1,
+            "source_degraded_contrast_weight": 0.0,
+            "cross_source_contrast_weight": 0.0,
+        },
+        "robust": {"train_aug": False},
+        "eval": {"robust_eval": False},
+    }
+
+    with pytest.raises(ValueError, match="batch_size >= 2"):
+        run(cfg, config_path=config_path)
+
+    metadata = json.loads((output_dir / "experiment_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["status"] == "failed"
+    assert metadata["config_path"] == str(config_path.resolve())
+    assert metadata["output_dir"] == str(output_dir.resolve())
+    assert metadata["data"]["enforce_build_fingerprint"] == "warn"
+    assert metadata["error"]["type"] == "ValueError"
+    assert "batch_size >= 2" in metadata["error"]["message"]
+
+
+
+def test_run_writes_completed_metadata_and_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FakeDataset:
+        def __init__(self, split: str, sample_path: Path):
+            self.split = split
+            self.samples = [(sample_path, 1)]
+
+        def __len__(self) -> int:
+            return 1
+
+    sample_path = tmp_path / "sample.pt"
+    sample_path.write_bytes(b"placeholder")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("train: {}\n", encoding="utf-8")
+    output_dir = tmp_path / "run_completed_metadata"
+    datasets = {
+        split: FakeDataset(split, sample_path) for split in ("train", "val", "test")
+    }
+
+    cfg = {
+        "data": {
+            "strict_integrity": True,
+            "enforce_package_isolation": True,
+            "enforce_build_fingerprint": "warn",
+            "train": {"pt_dir": str(tmp_path / "train"), "csv": str(tmp_path / "train.csv")},
+            "val": {"pt_dir": str(tmp_path / "val"), "csv": str(tmp_path / "val.csv")},
+            "test": {"pt_dir": str(tmp_path / "test"), "csv": str(tmp_path / "test.csv")},
+        },
+        "train": {
+            "output_dir": str(output_dir),
+            "batch_size": 1,
+            "eval_batch_size": 1,
+            "epochs": 1,
+            "patience": 1,
+            "num_workers": 0,
+            "device": "cpu",
+            "seed": 7,
+        },
+        "model": {
+            "hidden_dim": 16,
+            "layers": 1,
+            "num_latents": 2,
+            "dropout": 0.0,
+            "num_classes": 2,
+        },
+        "loss": {
+            "clean_degraded_contrast_weight": 0.0,
+            "source_degraded_contrast_weight": 0.0,
+            "cross_source_contrast_weight": 0.0,
+        },
+        "robust": {"train_aug": False},
+        "eval": {"robust_eval": False},
+    }
+
+    def fake_make_dataset(_cfg: dict, split: str, **_kwargs):
+        return datasets[split]
+
+    def fake_loader(_cfg: dict, dataset: FakeDataset, *, train: bool):
+        return {"split": dataset.split, "train": train}
+
+    def fake_train_one_epoch(*_args, **_kwargs):
+        return {"loss": 0.25}
+
+    def fake_evaluate(_model, loader_obj, _device, *, split_name: str, batch_key: str = "clean", dump_rows: bool = False):
+        metrics = {
+            "macro_f1": 0.75 if split_name == "val" else 0.8,
+            "ece": 0.1,
+        }
+        rows = []
+        if dump_rows:
+            rows = [
+                {
+                    "requested_view": "clean",
+                    "effective_view": "clean",
+                    "manifest_shuffle_fallback": 0,
+                    "sid": f"{split_name}-{batch_key}",
+                }
+            ]
+        return metrics, rows
+
+    monkeypatch.setattr(train_module, "_make_dataset", fake_make_dataset)
+    monkeypatch.setattr(train_module, "_validate_split_isolation", lambda *args, **kwargs: {
+        "build_fingerprint_policy": "warn",
+        "build_fingerprint_counts": {
+            "train": {"build-a": 1},
+            "val": {"build-a": 1},
+            "test": {"build-a": 1},
+        },
+    })
+    monkeypatch.setattr(train_module, "split_label_stats", lambda dataset: {"samples": len(dataset)})
+    monkeypatch.setattr(train_module, "_loader", fake_loader)
+    monkeypatch.setattr(train_module, "load_aeg_payload", lambda *args, **kwargs: {"node_x": torch.zeros(3, 4)})
+    monkeypatch.setattr(train_module, "build_model", lambda _cfg, node_input_dim: torch.nn.Linear(node_input_dim, 2))
+    monkeypatch.setattr(train_module, "train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(train_module, "evaluate", fake_evaluate)
+
+    summary = run(cfg, config_path=config_path)
+
+    metadata = json.loads((output_dir / "experiment_metadata.json").read_text(encoding="utf-8"))
+    assert summary["best_epoch"] == 1
+    assert metadata["status"] == "completed"
+    assert metadata["config_path"] == str(config_path.resolve())
+    assert metadata["output_dir"] == str(output_dir.resolve())
+    assert metadata["seed"] == 7
+    assert metadata["node_input_dim"] == 4
+    assert metadata["datasets"]["train"] == {"samples": 1}
+    assert metadata["aeg"]["build_fingerprint_counts"]["train"] == {"build-a": 1}
+    assert metadata["outputs"]["checkpoint"] == "best.pt"
+    assert metadata["outputs"]["history"] == "history.csv"
+    assert metadata["outputs"]["summary"] == "summary.json"
+    assert "diagnostics_val.csv" in metadata["outputs"]["diagnostics"]
+    assert "diagnostics_test_clean.csv" in metadata["outputs"]["diagnostics"]
+    assert metadata["results"]["test"]["macro_f1"] == 0.8
+    assert metadata["shuffle_fallback"]["diagnostics_test_clean.csv"]["fallback_rate"] == 0.0
+    assert (output_dir / "best.pt").exists()
+    assert (output_dir / "history.csv").exists()
+    assert (output_dir / "summary.json").exists()
+    assert (output_dir / "diagnostics_val.csv").exists()
+    assert (output_dir / "diagnostics_test_clean.csv").exists()
+
+
+
+def test_run_rejects_zero_training_batches_with_drop_last(tmp_path: Path):
+    payload_train = _variant_payload("a" * 64, package_name="com.example.train", split="train")
+    payload_val = _variant_payload("b" * 64, package_name="com.example.val", split="val")
+    payload_test = _variant_payload("c" * 64, package_name="com.example.test", split="test")
+
+    train_dir, train_csv = _write_split(tmp_path, "train", [(payload_train, 1)])
+    val_dir, val_csv = _write_split(tmp_path, "val", [(payload_val, 0)])
+    test_dir, test_csv = _write_split(tmp_path, "test", [(payload_test, 1)])
+
+    cfg = {
+        "data": {
+            "strict_integrity": True,
+            "enforce_package_isolation": True,
+            "enforce_build_fingerprint": "warn",
+            "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
+            "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
+            "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
+        },
+        "train": {
+            "output_dir": str(tmp_path / "run_drop_last"),
+            "batch_size": 2,
+            "eval_batch_size": 1,
+            "epochs": 1,
+            "patience": 1,
+            "num_workers": 0,
+            "device": "cpu",
+        },
+        "model": {
+            "node_input_dim": 32,
+            "hidden_dim": 16,
+            "layers": 1,
+            "num_latents": 2,
+            "dropout": 0.0,
+            "num_classes": 2,
+        },
+        "loss": {
+            "clean_degraded_contrast_weight": 0.1,
+            "source_degraded_contrast_weight": 0.0,
+            "cross_source_contrast_weight": 0.0,
+        },
+        "robust": {"train_aug": False},
+        "eval": {"robust_eval": False},
+    }
+
+    with pytest.raises(ValueError, match="would produce 0 training batches"):
+        run(cfg)
+
+
+def test_load_checkpoint_round_trips_saved_training_artifact(tmp_path: Path):
+    checkpoint_path = tmp_path / "best.pt"
+    payload = {
+        "model": {"weight": torch.tensor([1.0])},
+        "cfg": {"train": {"device": "cpu"}},
+        "node_input_dim": 32,
+        "aeg_build_fingerprint_counts": {"train": {"test-build": 1}},
+        "aeg_payload_contract_fingerprint": "contract",
+    }
+    torch.save(payload, checkpoint_path)
+
+    loaded = load_checkpoint(checkpoint_path, map_location="cpu")
+    assert loaded["node_input_dim"] == 32
+    assert torch.equal(loaded["model"]["weight"], torch.tensor([1.0]))
+
+
+def test_load_aeg_payload_retries_without_mmap_for_compatibility(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pt_path = tmp_path / "sample.pt"
+    pt_path.write_bytes(b"placeholder")
+    expected = _payload()
+    calls: list[dict[str, object]] = []
+
+    def fake_load(path: str, **kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise TypeError("torch.load() got an unexpected keyword argument 'mmap'")
+        return expected
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    loaded = load_aeg_payload(pt_path, validate=False)
+    assert loaded["sid"] == expected["sid"]
+    assert len(calls) == 2
+    assert calls[0]["weights_only"] is True
+    assert calls[0]["mmap"] is True
+    assert calls[1]["weights_only"] is True
+    assert "mmap" not in calls[1]
+
+
+
+def test_load_aeg_payload_errors_when_weights_only_is_unsupported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pt_path = tmp_path / "legacy_payload.pt"
+    pt_path.write_bytes(b"placeholder")
+
+    def fake_load(path: str, **kwargs):
+        raise TypeError("torch.load() got an unexpected keyword argument 'weights_only'")
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    with pytest.raises(RuntimeError, match="does not support weights_only safe loading"):
+        load_aeg_payload(pt_path, validate=False)
+
+
+
+def test_load_aeg_payload_fails_closed_on_weights_only_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pt_path = tmp_path / "unsafe.pt"
+    pt_path.write_bytes(b"placeholder")
+
+    def fake_load(path: str, **kwargs):
+        raise RuntimeError(
+            "Weights only load failed. Unsupported global: GLOBAL __main__.DangerousClass "
+            "was not an allowed global by default."
+        )
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    with pytest.raises(RuntimeError, match="Weights only load failed"):
+        load_aeg_payload(pt_path, validate=False)
+
+
+def test_load_checkpoint_falls_back_to_legacy_for_weights_only_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    checkpoint_path = tmp_path / "legacy.pt"
+    checkpoint_path.write_bytes(b"placeholder")
+    calls: list[dict[str, object]] = []
+
+    def fake_load(path: str, **kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Weights only load failed. Unsupported global: GLOBAL __main__.LegacyCheckpoint "
+                "was not an allowed global by default."
+            )
+        return {"model": {}, "cfg": {}, "node_input_dim": 32}
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    with caplog.at_level(logging.WARNING):
+        loaded = load_checkpoint(checkpoint_path, map_location="cpu")
+    assert loaded["node_input_dim"] == 32
+    assert len(calls) == 2
+    assert calls[0]["weights_only"] is True
+    assert calls[0]["mmap"] is True
+    assert calls[1] == {"map_location": "cpu"}
+    assert "Falling back to legacy torch.load for checkpoint legacy.pt" in caplog.text
+
+
+
+def test_load_checkpoint_falls_back_to_legacy_when_weights_only_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    checkpoint_path = tmp_path / "old_torch.pt"
+    checkpoint_path.write_bytes(b"placeholder")
+    calls: list[dict[str, object]] = []
+
+    def fake_load(path: str, **kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise TypeError("torch.load() got an unexpected keyword argument 'weights_only'")
+        return {"model": {}, "cfg": {}, "node_input_dim": 24}
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    with caplog.at_level(logging.WARNING):
+        loaded = load_checkpoint(checkpoint_path, map_location="cpu")
+    assert loaded["node_input_dim"] == 24
+    assert len(calls) == 2
+    assert calls[0]["weights_only"] is True
+    assert calls[0]["mmap"] is True
+    assert calls[1] == {"map_location": "cpu"}
+    assert "Falling back to legacy torch.load for checkpoint old_torch.pt" in caplog.text
+
+
+
+def test_load_checkpoint_retries_without_mmap_before_legacy_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    checkpoint_path = tmp_path / "compat.pt"
+    checkpoint_path.write_bytes(b"placeholder")
+    calls: list[dict[str, object]] = []
+
+    def fake_load(path: str, **kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise TypeError("torch.load() got an unexpected keyword argument 'mmap'")
+        if len(calls) == 2:
+            raise RuntimeError(
+                "Weights only load failed. Unsupported global: GLOBAL __main__.LegacyCheckpoint "
+                "was not an allowed global by default."
+            )
+        return {"model": {}, "cfg": {}, "node_input_dim": 16}
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    with caplog.at_level(logging.WARNING):
+        loaded = load_checkpoint(checkpoint_path, map_location="cpu")
+    assert loaded["node_input_dim"] == 16
+    assert len(calls) == 3
+    assert calls[0]["weights_only"] is True and calls[0]["mmap"] is True
+    assert calls[1]["weights_only"] is True and "mmap" not in calls[1]
+    assert calls[2] == {"map_location": "cpu"}
+    assert "Falling back to legacy torch.load for checkpoint compat.pt" in caplog.text
+
+
+def test_validate_aeg_pt_reports_build_fingerprints(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch):
+    from scripts import validate_aeg_pts as script
+
+    train_payload = _variant_payload("a" * 64, package_name="com.example.train", split="train", build_fingerprint="build-a")
+    val_payload = _variant_payload("b" * 64, package_name="com.example.val", split="val", build_fingerprint="build-b")
+
+    train_dir, train_csv = _write_split(tmp_path, "train", [(train_payload, 1)])
+    val_dir, val_csv = _write_split(tmp_path, "val", [(val_payload, 0)])
+    config_path = tmp_path / "extract.yaml"
+    config_path.write_text("dummy: true\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        script,
+        "_load_config",
+        lambda _path: {"dummy": True},
+    )
+    monkeypatch.setattr(
+        script,
+        "_parse_config",
+        lambda _raw_cfg, _args: {
+            "splits": ["train", "val"],
+            "out_dirs": {"train": train_dir, "val": val_dir},
+            "label_csvs": {"train": train_csv, "val": val_csv},
+            "node_feature_dim": 32,
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["validate_aeg_pts.py", "--config", str(config_path), "--all"])
+
+    code = script.main()
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Build fingerprints observed:" in out
+    assert "build-a: 1" in out
+    assert "build-b: 1" in out
+    assert "Build fingerprints by split:" in out
+    assert "[train] build-a=1" in out
+    assert "[val] build-b=1" in out
+    assert "Mixed build fingerprint examples:" in out
+    assert "<none>" in out or "[train]" not in out

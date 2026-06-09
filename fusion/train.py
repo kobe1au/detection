@@ -5,73 +5,34 @@ import csv
 import json
 import logging
 import math
+import platform
 import random
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import torch
-import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from fusion.config_utils import load_config
 from fusion.constants import (
     AEG_PAYLOAD_CONTRACT_FINGERPRINT,
     AEG_PAYLOAD_CONTRACT_VERSION,
     AEG_SCHEMA_TABLE_FINGERPRINT,
     AEG_SCHEMA_VERSION,
+    VIEW_TYPE_NAMES,
 )
 from fusion.dataset import AEGDataset, aeg_collate_fn, split_label_stats
-from fusion.io_utils import load_aeg_payload
+from fusion.io_utils import load_aeg_payload, load_checkpoint
 from fusion.losses import compute_aeg_loss
 from fusion.model import build_model
-from fusion.payload_contract import validate_aeg_payload
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-def deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    out = dict(base)
-    for key, value in (update or {}).items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = deep_update(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def load_yaml(path: str | Path) -> dict[str, Any]:
-    path = Path(path)
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def load_config(path: str | Path) -> dict[str, Any]:
-    """Load config with base inheritance.
-    
-    Raises FileNotFoundError with helpful message if config not found but .example exists.
-    """
-    path = Path(path)
-    if not path.exists():
-        example = path.parent / f"{path.stem}.example{path.suffix}"
-        if example.exists():
-            raise FileNotFoundError(
-                f"Config not found: {path}\n"
-                f"Copy {example.name} to {path.name} and update paths for your environment."
-            )
-        raise FileNotFoundError(f"Config not found: {path}")
-    
-    cfg = load_yaml(path)
-    bases = cfg.pop("base", None) or cfg.pop("bases", None) or []
-    if isinstance(bases, (str, Path)):
-        bases = [bases]
-    merged: dict[str, Any] = {}
-    for base in bases:
-        base_path = Path(base)
-        if not base_path.is_absolute():
-            base_path = path.parent / base_path
-        merged = deep_update(merged, load_config(base_path))
-    return deep_update(merged, cfg)
 
 
 def set_seed(seed: int) -> None:
@@ -147,6 +108,79 @@ def _ece(labels: list[int], probs: list[float], preds: list[int], *, bins: int =
         acc = sum(c for c, m in zip(correct, mask) if m) / n
         ece += (n / total) * abs(acc - conf)
     return float(ece)
+
+
+def _view_name(view_id: int) -> str:
+    if 0 <= int(view_id) < len(VIEW_TYPE_NAMES):
+        return str(VIEW_TYPE_NAMES[int(view_id)])
+    return f"unknown:{view_id}"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _git_info() -> dict[str, Any]:
+    def _run(*args: str) -> str:
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    commit = _run("git", "rev-parse", "HEAD")
+    branch = _run("git", "rev-parse", "--abbrev-ref", "HEAD")
+    dirty = bool(_run("git", "status", "--short"))
+    return {
+        "commit": commit,
+        "branch": branch,
+        "dirty": dirty,
+    }
+
+
+def _runtime_info(device: torch.device) -> dict[str, Any]:
+    try:
+        import torch_geometric  # type: ignore
+
+        pyg_version = str(getattr(torch_geometric, "__version__", ""))
+    except Exception:
+        pyg_version = ""
+    return {
+        "python": platform.python_version(),
+        "torch": str(torch.__version__),
+        "pyg": pyg_version,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_version": str(torch.version.cuda or ""),
+        "device": str(device),
+    }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _shuffle_fallback_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    requested = Counter(str(row.get("requested_view") or "") for row in rows)
+    effective = Counter(str(row.get("effective_view") or "") for row in rows)
+    fallback_count = sum(int(row.get("manifest_shuffle_fallback", 0) or 0) for row in rows)
+    requested_shuffle = sum(
+        1
+        for row in rows
+        if str(row.get("requested_view") or "") in {"manifest_shuffled", "manifest_shuffled_blind"}
+    )
+    true_shuffle = sum(
+        1
+        for row in rows
+        if str(row.get("requested_view") or "") in {"manifest_shuffled", "manifest_shuffled_blind"}
+        and str(row.get("effective_view") or "") == str(row.get("requested_view") or "")
+    )
+    return {
+        "requested_view_counts": dict(sorted((k, v) for k, v in requested.items() if k)),
+        "effective_view_counts": dict(sorted((k, v) for k, v in effective.items() if k)),
+        "requested_shuffle_count": int(requested_shuffle),
+        "true_shuffle_count": int(true_shuffle),
+        "fallback_count": int(fallback_count),
+        "fallback_rate": float(fallback_count / requested_shuffle) if requested_shuffle > 0 else 0.0,
+    }
 
 
 def _device(cfg: dict[str, Any]) -> torch.device:
@@ -244,6 +278,7 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
             "schema_fingerprint": str(payload.get("aeg_schema_fingerprint") or ""),
             "contract_version": int(payload.get("aeg_payload_contract_version", 0) or 0),
             "contract_fingerprint": str(payload.get("aeg_payload_contract_fingerprint") or ""),
+            "build_fingerprint": str(payload.get("aeg_build_fingerprint") or ""),
         }
     except Exception as exc:
         raise ValueError(f"Failed to load AEG PT metadata from {key}: {type(exc).__name__}: {exc}") from exc
@@ -251,14 +286,21 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
     return metadata
 
 
-def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True) -> None:
+def _validate_split_isolation(
+    *datasets: AEGDataset,
+    check_package: bool = True,
+    build_fingerprint_policy: str = "warn",
+) -> dict[str, Any]:
     seen: dict[str, str] = {}
     conflicts: list[tuple[str, str, str]] = []
     package_seen: dict[str, tuple[str, str]] = {}
     package_conflicts: list[tuple[str, str, str, str, str]] = []
     metadata_cache: dict[Path, dict[str, Any]] = {}
     invalid_metadata: list[tuple[str, str, str]] = []
+    split_fingerprints: dict[str, Counter[str]] = {}
     for dataset in datasets:
+        split_key = str(dataset.split or f"split_{len(split_fingerprints)}")
+        fingerprint_counter = split_fingerprints.setdefault(split_key, Counter())
         for path, _label in dataset.samples:
             sid = path.stem.lower()
             prev = seen.get(sid)
@@ -275,6 +317,8 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
             elif metadata["contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
                 invalid_metadata.append((sid, dataset.split, "contract_fingerprint_mismatch"))
 
+            fingerprint_counter[str(metadata.get("build_fingerprint") or "<missing>")] += 1
+
             if check_package:
                 package = metadata["package_name"]
                 if package:
@@ -283,7 +327,7 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
                         package_conflicts.append((package, package_prev[1], sid, package_prev[0], dataset.split))
                     else:
                         package_seen.setdefault(package, (dataset.split, sid))
-    
+
     if conflicts:
         raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
     if invalid_metadata:
@@ -293,6 +337,31 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
             "Package name overlap across splits: "
             f"count={len(package_conflicts)} examples={package_conflicts[:5]}"
         )
+
+    normalized_policy = str(build_fingerprint_policy or "warn").strip().lower()
+    if normalized_policy not in {"off", "warn", "strict"}:
+        raise ValueError(
+            "data.enforce_build_fingerprint must be one of {'off', 'warn', 'strict'}; "
+            f"got {build_fingerprint_policy!r}"
+        )
+    mixed_splits = {
+        split: dict(sorted(counter.items()))
+        for split, counter in split_fingerprints.items()
+        if len(counter) > 1
+    }
+    if mixed_splits:
+        message = f"Mixed AEG build fingerprints detected: {mixed_splits}"
+        if normalized_policy == "strict":
+            raise ValueError(message)
+        if normalized_policy == "warn":
+            LOGGER.warning(message)
+
+    return {
+        "build_fingerprint_policy": normalized_policy,
+        "build_fingerprint_counts": {
+            split: dict(sorted(counter.items())) for split, counter in split_fingerprints.items()
+        },
+    }
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -418,6 +487,11 @@ def evaluate(
                     "has_dynamic_loading": int(data.has_dynamic_loading[idx].item()),
                     "has_native": int(data.has_native[idx].item()),
                     "has_string_encryption_hint": int(data.has_string_encryption_hint[idx].item()),
+                    "requested_view_type_id": int(data.requested_view_type_id[idx].item()) if hasattr(data, "requested_view_type_id") else 0,
+                    "effective_view_type_id": int(data.effective_view_type_id[idx].item()) if hasattr(data, "effective_view_type_id") else int(data.view_type_id[idx].item()),
+                    "requested_view": _view_name(int(data.requested_view_type_id[idx].item()) if hasattr(data, "requested_view_type_id") else 0),
+                    "effective_view": _view_name(int(data.effective_view_type_id[idx].item()) if hasattr(data, "effective_view_type_id") else int(data.view_type_id[idx].item())),
+                    "manifest_shuffle_fallback": int(data.manifest_shuffle_fallback[idx].item()) if hasattr(data, "manifest_shuffle_fallback") else 0,
                     "manifest_donor_sid": batch.get("manifest_donor_sid", [""] * y.numel())[idx]
                     if idx < len(batch.get("manifest_donor_sid", []))
                     else "",
@@ -521,14 +595,17 @@ def _checkpoint_score(
     return score / max(total_weight, 1e-8)
 
 
-def run(cfg: dict[str, Any]) -> dict[str, Any]:
+def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[str, Any]:
     logging.basicConfig(level=logging.INFO)
     train_cfg = cfg.get("train", {}) or {}
+    data_cfg = cfg.get("data", {}) or {}
+    robust_cfg = cfg.get("robust", {}) or {}
     seed = int(train_cfg.get("seed", 42))
     set_seed(seed)
     device = _device(cfg)
     out_dir = Path(train_cfg.get("output_dir", "results/aeg_robust/run"))
     out_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = out_dir / "experiment_metadata.json"
 
     loss_cfg = cfg.get("loss", {}) or {}
     contrast_weights = [
@@ -536,128 +613,225 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
         float(loss_cfg.get("source_degraded_contrast_weight", 0.05)),
         float(loss_cfg.get("cross_source_contrast_weight", 0.03)),
     ]
-    batch_size = int(train_cfg.get("batch_size", 24))
-    
-    if any(w > 0 for w in contrast_weights) and batch_size < 2:
-        raise ValueError(
-            f"Contrastive learning requires batch_size >= 2, got {batch_size}. "
-            f"InfoNCE will return 0 when batch_size=1. "
-            f"Either increase batch_size or disable contrast (set weights to 0)."
-        )
-
-    train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
-    val_ds = _make_dataset(cfg, "val", aug=False)
-    
-    # P0-2: Check for zero-batch scenario with drop_last=True
     contrast_enabled = any(w > 0 for w in contrast_weights)
-    if contrast_enabled and len(train_ds) < batch_size:
-        raise ValueError(
-            f"Contrastive training with drop_last=True requires len(train_ds) >= batch_size; "
-            f"got len(train_ds)={len(train_ds)} batch_size={batch_size}. "
-            f"This would produce 0 training batches."
-        )
-    
-    data_cfg = cfg.get("data", {}) or {}
-    _validate_split_isolation(
-        train_ds,
-        val_ds,
-        check_package=bool(data_cfg.get("enforce_package_isolation", True)),
-    )
-    LOGGER.info("Train stats: %s", split_label_stats(train_ds))
-    LOGGER.info("Val stats: %s", split_label_stats(val_ds))
+    batch_size = int(train_cfg.get("batch_size", 24))
+    resolved_config_path = str(Path(config_path).resolve()) if config_path else ""
 
-    train_loader = _loader(cfg, train_ds, train=True)
-    val_loader = _loader(cfg, val_ds, train=False)
-    robust_val_loaders = _robust_val_loaders(cfg)
-    
-    # Use unified safe loading
-    first_payload = load_aeg_payload(train_ds.samples[0][0], validate=True)
-    node_input_dim = int(first_payload["node_x"].size(1))
-    aeg_build_fingerprint = str(first_payload["aeg_build_fingerprint"])
-    model = build_model(cfg, node_input_dim).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(train_cfg.get("lr", 3e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 1e-2)),
-    )
+    def _resolved_optional_path(value: Any) -> str:
+        return str(Path(value).resolve()) if value else ""
 
-    best_score = -1.0
-    best_epoch = 0
-    patience = int(train_cfg.get("patience", 8))
-    history: list[dict[str, Any]] = []
-    for epoch in range(1, int(train_cfg.get("epochs", 60)) + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, cfg, epoch)
-        val_metrics, _ = evaluate(model, val_loader, device, split_name="val")
-        val_robust_metrics: dict[str, dict[str, float]] = {}
-        for name, _weight, loader_obj in robust_val_loaders:
-            metrics, _ = evaluate(model, loader_obj, device, split_name=f"val_{name}", batch_key="aug")
-            val_robust_metrics[name] = metrics
-        score = _checkpoint_score(cfg, val_metrics, val_robust_metrics, robust_val_loaders)
-        row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_loss.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
-        for name, metrics in val_robust_metrics.items():
-            for key, value in metrics.items():
-                row[f"val_{name}_{key}"] = value
-        row["checkpoint_score"] = score
-        history.append(row)
-        LOGGER.info(
-            "epoch=%s val_macro_f1=%.4f checkpoint_score=%.4f train_loss=%.4f",
-            epoch,
-            val_metrics.get("macro_f1", 0.0),
-            score,
-            train_loss.get("loss", 0.0),
-        )
-        if score > best_score:
-            best_score = score
-            best_epoch = epoch
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "cfg": cfg,
-                    "epoch": epoch,
-                    "score": best_score,
-                    "node_input_dim": node_input_dim,
-                    "aeg_build_fingerprint": aeg_build_fingerprint,
-                    "aeg_payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
-                },
-                out_dir / "best.pt",
+    split_paths = {
+        split: {
+            "pt_dir": _resolved_optional_path((data_cfg.get(split, {}) or {}).get("pt_dir") or data_cfg.get(f"{split}_pt_dir", "")),
+            "csv": _resolved_optional_path((data_cfg.get(split, {}) or {}).get("csv") or (data_cfg.get(split, {}) or {}).get("label_csv") or data_cfg.get(f"{split}_csv", "")),
+        }
+        for split in ("train", "val", "test")
+    }
+    metadata: dict[str, Any] = {
+        "status": "started",
+        "started_at_utc": _utc_now_iso(),
+        "config_path": resolved_config_path,
+        "output_dir": str(out_dir.resolve()),
+        "seed": seed,
+        "train": {
+            "device": str(device),
+            "batch_size": batch_size,
+            "eval_batch_size": int(train_cfg.get("eval_batch_size", batch_size)),
+            "drop_last": bool(contrast_enabled),
+            "contrast_enabled": bool(contrast_enabled),
+            "epochs": int(train_cfg.get("epochs", 60)),
+            "patience": int(train_cfg.get("patience", 8)),
+        },
+        "data": {
+            "strict_integrity": bool(data_cfg.get("strict_integrity", True)),
+            "enforce_package_isolation": bool(data_cfg.get("enforce_package_isolation", True)),
+            "enforce_build_fingerprint": str(data_cfg.get("enforce_build_fingerprint", "warn")),
+            "splits": split_paths,
+        },
+        "runtime": _runtime_info(device),
+        "git": _git_info(),
+        "aeg": {
+            "schema_version": AEG_SCHEMA_VERSION,
+            "schema_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
+            "payload_contract_version": AEG_PAYLOAD_CONTRACT_VERSION,
+            "payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
+        },
+    }
+    _write_json(metadata_path, metadata)
+
+    try:
+        if contrast_enabled and batch_size < 2:
+            raise ValueError(
+                f"Contrastive learning requires batch_size >= 2, got {batch_size}. "
+                f"InfoNCE will return 0 when batch_size=1. "
+                f"Either increase batch_size or disable contrast (set weights to 0)."
             )
-        elif epoch - best_epoch >= patience:
-            LOGGER.info("Early stopping at epoch %s; best epoch %s", epoch, best_epoch)
-            break
 
-    ckpt = torch.load(out_dir / "best.pt", map_location=device)
-    model.load_state_dict(ckpt["model"])
-    val_metrics, val_rows = evaluate(model, val_loader, device, split_name="val_best", dump_rows=True)
-    test_ds = _make_dataset(cfg, "test", aug=False)
-    _validate_split_isolation(
-        train_ds,
-        val_ds,
-        test_ds,
-        check_package=bool(data_cfg.get("enforce_package_isolation", True)),
-    )
-    LOGGER.info("Test stats: %s", split_label_stats(test_ds))
-    test_loader = _loader(cfg, test_ds, train=False)
-    test_metrics, test_rows = evaluate(model, test_loader, device, split_name="test", dump_rows=True)
-    summary: dict[str, Any] = {"best_epoch": best_epoch, "best_score": best_score, "val": val_metrics, "test": test_metrics}
+        train_ds = _make_dataset(cfg, "train", aug=bool(robust_cfg.get("train_aug", True)))
+        val_ds = _make_dataset(cfg, "val", aug=False)
+        test_ds = _make_dataset(cfg, "test", aug=False)
+        if contrast_enabled and len(train_ds) < batch_size:
+            raise ValueError(
+                f"Contrastive training with drop_last=True requires len(train_ds) >= batch_size; "
+                f"got len(train_ds)={len(train_ds)} batch_size={batch_size}. "
+                f"This would produce 0 training batches."
+            )
 
-    robust_results: dict[str, dict[str, float]] = {}
-    if bool((cfg.get("eval", {}) or {}).get("robust_eval", True)):
-        for name, loader in _robust_eval_loaders(cfg, "test"):
-            metrics, rows = evaluate(model, loader, device, split_name=f"test_{name}", batch_key="aug", dump_rows=True)
-            robust_results[name] = metrics
-            _write_rows(out_dir / f"diagnostics_test_{name.replace('@', '_')}.csv", rows)
-    summary["robust_test"] = robust_results
+        split_isolation = _validate_split_isolation(
+            train_ds,
+            val_ds,
+            test_ds,
+            check_package=bool(data_cfg.get("enforce_package_isolation", True)),
+            build_fingerprint_policy=str(data_cfg.get("enforce_build_fingerprint", "warn")),
+        )
+        train_stats = split_label_stats(train_ds)
+        val_stats = split_label_stats(val_ds)
+        test_stats = split_label_stats(test_ds)
+        LOGGER.info("Train stats: %s", train_stats)
+        LOGGER.info("Val stats: %s", val_stats)
+        LOGGER.info("Test stats: %s", test_stats)
 
-    _write_rows(out_dir / "diagnostics_val.csv", val_rows)
-    _write_rows(out_dir / "diagnostics_test_clean.csv", test_rows)
-    with (out_dir / "history.csv").open("w", encoding="utf-8", newline="") as f:
-        if history:
-            writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
-            writer.writeheader()
-            writer.writerows(history)
-    with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    return summary
+        train_loader = _loader(cfg, train_ds, train=True)
+        val_loader = _loader(cfg, val_ds, train=False)
+        robust_val_loaders = _robust_val_loaders(cfg)
+
+        first_payload = load_aeg_payload(train_ds.samples[0][0], validate=True)
+        node_input_dim = int(first_payload["node_x"].size(1))
+        model = build_model(cfg, node_input_dim).to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(train_cfg.get("lr", 3e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 1e-2)),
+        )
+
+        metadata["node_input_dim"] = node_input_dim
+        metadata["data"]["enforce_build_fingerprint"] = split_isolation["build_fingerprint_policy"]
+        metadata["datasets"] = {
+            "train": train_stats,
+            "val": val_stats,
+            "test": test_stats,
+        }
+        metadata["aeg"] = {
+            **dict(metadata.get("aeg") or {}),
+            "build_fingerprint_counts": split_isolation["build_fingerprint_counts"],
+        }
+        _write_json(metadata_path, metadata)
+        best_score = -1.0
+        best_epoch = 0
+        patience = int(train_cfg.get("patience", 8))
+        history: list[dict[str, Any]] = []
+        for epoch in range(1, int(train_cfg.get("epochs", 60)) + 1):
+            train_loss = train_one_epoch(model, train_loader, optimizer, device, cfg, epoch)
+            val_metrics, _ = evaluate(model, val_loader, device, split_name="val")
+            val_robust_metrics: dict[str, dict[str, float]] = {}
+            for name, _weight, loader_obj in robust_val_loaders:
+                metrics, _ = evaluate(model, loader_obj, device, split_name=f"val_{name}", batch_key="aug")
+                val_robust_metrics[name] = metrics
+            score = _checkpoint_score(cfg, val_metrics, val_robust_metrics, robust_val_loaders)
+            row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_loss.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
+            for name, metrics in val_robust_metrics.items():
+                for key, value in metrics.items():
+                    row[f"val_{name}_{key}"] = value
+            row["checkpoint_score"] = score
+            history.append(row)
+            LOGGER.info(
+                "epoch=%s val_macro_f1=%.4f checkpoint_score=%.4f train_loss=%.4f",
+                epoch,
+                val_metrics.get("macro_f1", 0.0),
+                score,
+                train_loss.get("loss", 0.0),
+            )
+            if score > best_score:
+                best_score = score
+                best_epoch = epoch
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "cfg": cfg,
+                        "epoch": epoch,
+                        "score": best_score,
+                        "node_input_dim": node_input_dim,
+                        "aeg_build_fingerprint_counts": split_isolation["build_fingerprint_counts"],
+                        "aeg_payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
+                        "build_fingerprint_policy": split_isolation["build_fingerprint_policy"],
+                    },
+                    out_dir / "best.pt",
+                )
+            elif epoch - best_epoch >= patience:
+                LOGGER.info("Early stopping at epoch %s; best epoch %s", epoch, best_epoch)
+                break
+
+        ckpt = load_checkpoint(out_dir / "best.pt", map_location=device)
+        model.load_state_dict(ckpt["model"])
+        val_metrics, val_rows = evaluate(model, val_loader, device, split_name="val_best", dump_rows=True)
+        test_loader = _loader(cfg, test_ds, train=False)
+        test_metrics, test_rows = evaluate(model, test_loader, device, split_name="test", dump_rows=True)
+        summary: dict[str, Any] = {"best_epoch": best_epoch, "best_score": best_score, "val": val_metrics, "test": test_metrics}
+
+        diagnostics_files: list[str] = []
+        diagnostics_shuffle: dict[str, Any] = {}
+
+        def _record_diagnostics(name: str, rows: list[dict[str, Any]]) -> None:
+            diagnostics_files.append(name)
+            diagnostics_shuffle[name] = _shuffle_fallback_summary(rows)
+
+        robust_results: dict[str, dict[str, float]] = {}
+        if bool((cfg.get("eval", {}) or {}).get("robust_eval", True)):
+            for name, loader in _robust_eval_loaders(cfg, "test"):
+                metrics, rows = evaluate(model, loader, device, split_name=f"test_{name}", batch_key="aug", dump_rows=True)
+                robust_results[name] = metrics
+                filename = f"diagnostics_test_{name.replace('@', '_')}.csv"
+                _write_rows(out_dir / filename, rows)
+                _record_diagnostics(filename, rows)
+        summary["robust_test"] = robust_results
+
+        _write_rows(out_dir / "diagnostics_val.csv", val_rows)
+        _record_diagnostics("diagnostics_val.csv", val_rows)
+        _write_rows(out_dir / "diagnostics_test_clean.csv", test_rows)
+        _record_diagnostics("diagnostics_test_clean.csv", test_rows)
+        with (out_dir / "history.csv").open("w", encoding="utf-8", newline="") as f:
+            if history:
+                writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+                writer.writeheader()
+                writer.writerows(history)
+        with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        metadata.update(
+            {
+                "status": "completed",
+                "completed_at_utc": _utc_now_iso(),
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+                "outputs": {
+                    "checkpoint": "best.pt",
+                    "history": "history.csv",
+                    "summary": "summary.json",
+                    "diagnostics": diagnostics_files,
+                },
+                "results": {
+                    "val": val_metrics,
+                    "test": test_metrics,
+                    "robust_test": robust_results,
+                },
+                "shuffle_fallback": diagnostics_shuffle,
+            }
+        )
+        _write_json(metadata_path, metadata)
+        return summary
+    except Exception as exc:
+        metadata.update(
+            {
+                "status": "failed",
+                "failed_at_utc": _utc_now_iso(),
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        )
+        _write_json(metadata_path, metadata)
+        raise
 
 
 def parse_args() -> argparse.Namespace:
@@ -668,7 +842,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run(load_config(args.config))
+    run(load_config(args.config), config_path=args.config)
 
 
 if __name__ == "__main__":

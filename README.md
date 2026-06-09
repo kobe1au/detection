@@ -75,6 +75,20 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
+Validate generated PT files, payload schema compatibility, and build fingerprint
+consistency before training:
+
+```bash
+python scripts/validate_aeg_pts.py \
+  --config config/extract_aeg.yaml \
+  --sample-per-split 100
+```
+
+Use `--all` for a full pass. The validator reports CSV/PT id mismatches, node
+feature dimension mismatches, schema versions, overall build fingerprint counts,
+per-split build fingerprint counts, and example files for any split that mixes
+multiple build fingerprints.
+
 Generate train PT files later without rebuilding the frozen Manifest
 vocabulary:
 
@@ -86,7 +100,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume validates the payload contract and node feature dimension before reusing existing PT files. Build fingerprints are kept as diagnostic metadata, not as a hard training-time blocker.
+The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume validates the payload contract and node feature dimension before reusing existing PT files. Build fingerprints are recorded as experiment-integrity metadata by default (`warn`), and can be escalated to a strict preflight gate when you need fully homogeneous PT builds.
 
 Extraction first scans invoke targets for all methods, selects the methods kept
 by the configured graph budget, and only then builds expensive local CFG
@@ -123,11 +137,19 @@ would truncate the hint channels and make the ablation ineffective.
 Training uses strict CSV/PT integrity by default. If `results/labels/{train,val,test}.csv` contains ids without corresponding AEG `.pt` files, or a PT folder contains extra samples not in its CSV, training fails instead of silently changing the split size.
 Training also rejects repeated `package_name` values across train/val/test by
 default (`data.enforce_package_isolation=true`) to reduce package-level split
-leakage.
+leakage. Build fingerprint consistency is a separate experiment-integrity
+policy controlled by `data.enforce_build_fingerprint`:
+
+- `off`: record build fingerprint distributions only.
+- `warn` (default): continue training but emit a warning if any split mixes
+  multiple `aeg_build_fingerprint` values.
+- `strict`: fail fast if any split mixes multiple build fingerprints.
 
 ## Train
 
-Edit `config/experiments/aeg_robust/base.yaml` so `data.{train,val,test}.pt_dir` and label CSV paths point to your generated AEG PT files.
+1. Copy `config/experiments/aeg_robust/base.example.yaml` to `config/experiments/aeg_robust/base.yaml`.
+2. Edit the local `base.yaml` so `data.{train,val,test}.pt_dir` and label CSV paths point to your generated AEG PT files.
+3. Run one of the experiment configs below.
 
 Run the full method:
 
@@ -144,6 +166,10 @@ python run.py i2
 python run.py i3
 python run.py full_seeds
 ```
+
+If `base.yaml` is missing, both `python -m fusion.train ...` and
+`python scripts/build_aeg_pts_direct.py ...` fail with a copy-from-example
+message instead of silently using a tracked repository-local base file.
 
 Checkpoint selection uses a validation-only composite score by default: clean validation macro-F1 plus representative robust validation views. Test and robust-test metrics are computed only after the best checkpoint is selected.
 
@@ -169,6 +195,7 @@ Each training run writes:
 
 ```text
 best.pt
+experiment_metadata.json
 history.csv
 summary.json
 diagnostics_val.csv
@@ -176,7 +203,17 @@ diagnostics_test_clean.csv
 diagnostics_test_<view>_<strength>.csv
 ```
 
-Diagnostics include reliability scalars, code-Manifest similarity/conflict, and latent attention mass over method, API-family, permission, component, risk, static-hint, and global tokens.
+- `summary.json` is the compact metric summary for the completed run.
+- `experiment_metadata.json` is written at run start, updated on success/failure,
+  and records resolved config/data paths, runtime + git environment, dataset
+  stats, payload/schema fingerprints, build fingerprint distributions, emitted
+  diagnostics files, and final test/robust-test results.
+
+Diagnostics include reliability scalars, code-Manifest similarity/conflict,
+latent attention mass over method, API-family, permission, component, risk,
+static-hint, and global tokens. For manifest shuffle evaluations, diagnostics
+also record the requested view, the effective view, whether shuffle fell back to
+`manifest_missing`, and the donor sid when one was available.
 
 Aggregate synthetic robustness and real-failure slices after a run:
 
@@ -201,3 +238,20 @@ python scripts/evaluate_aeg_checkpoint.py \
   --config config/eval_obfuscapk.yaml \
   --output-dir results/aeg_robust/full/ours/external
 ```
+
+## Safe loading and trust boundaries
+
+AEG payload loading uses `load_aeg_payload()` in fail-closed mode:
+`torch.load(..., weights_only=True, mmap=True)` is tried first, then retried
+without `mmap` only when the local PyTorch build does not support that
+argument. If weights-only loading rejects unsafe globals or other non-tensor
+objects, payload loading does **not** fall back to legacy `torch.load(...)`.
+
+Checkpoint loading uses `load_checkpoint()`, which still prefers
+`weights_only=True` but can fall back to legacy `torch.load(...)` with an
+explicit warning for trusted project-generated checkpoints that require older
+pickle objects.
+
+Contract validation checks AEG payload structure after deserialization, but it
+is not a substitute for artifact provenance. For untrusted PT files, also verify
+external checksums or signatures before loading them.

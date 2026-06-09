@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import yaml
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from fusion.config_utils import load_config as _load_config  # noqa: E402
 from fusion.constants import (  # noqa: E402
     AEG_EXTRACTION_PIPELINE_VERSION,
     AEG_PAYLOAD_CONTRACT_FINGERPRINT,
@@ -33,36 +33,6 @@ from fusion.payload_contract import validate_aeg_payload  # noqa: E402
 
 _WORKER_CFG: dict[str, Any] | None = None
 _WORKER_VOCAB: dict[str, Any] | None = None
-
-
-def _load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    out = dict(base)
-    for key, value in (update or {}).items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_update(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def _load_config(path: Path) -> dict[str, Any]:
-    path = path.resolve()
-    cfg = _load_yaml(path)
-    bases = cfg.pop("base", None) or cfg.pop("bases", None) or []
-    if isinstance(bases, (str, Path)):
-        bases = [bases]
-    merged: dict[str, Any] = {}
-    for base in bases:
-        base_path = Path(base)
-        if not base_path.is_absolute():
-            base_path = path.parent / base_path
-        merged = _deep_update(merged, _load_config(base_path))
-    return _deep_update(merged, cfg)
 
 
 def _resolve_path(value: str | Path, base: Path = PROJECT_ROOT) -> Path:
