@@ -75,8 +75,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-Validate generated PT files, payload schema compatibility, and build fingerprint
-consistency before training:
+Validate generated PT files and payload schema compatibility before training:
 
 ```bash
 python scripts/validate_aeg_pts.py \
@@ -85,9 +84,7 @@ python scripts/validate_aeg_pts.py \
 ```
 
 Use `--all` for a full pass. The validator reports CSV/PT id mismatches, node
-feature dimension mismatches, schema versions, overall build fingerprint counts,
-per-split build fingerprint counts, and example files for any split that mixes
-multiple build fingerprints.
+feature dimension mismatches, schema versions, and payload contract errors.
 
 Generate train PT files later without rebuilding the frozen Manifest
 vocabulary:
@@ -100,7 +97,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume validates the payload contract and node feature dimension before reusing existing PT files. Build fingerprints are recorded as experiment-integrity metadata by default (`warn`), and can be escalated to a strict preflight gate when you need fully homogeneous PT builds.
+The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume validates the payload contract and node feature dimension before reusing existing PT files.
 
 Extraction first scans invoke targets for all methods, selects the methods kept
 by the configured graph budget, and only then builds expensive local CFG
@@ -137,19 +134,14 @@ would truncate the hint channels and make the ablation ineffective.
 Training uses strict CSV/PT integrity by default. If `results/labels/{train,val,test}.csv` contains ids without corresponding AEG `.pt` files, or a PT folder contains extra samples not in its CSV, training fails instead of silently changing the split size.
 Training also rejects repeated `package_name` values across train/val/test by
 default (`data.enforce_package_isolation=true`) to reduce package-level split
-leakage. Build fingerprint consistency is a separate experiment-integrity
-policy controlled by `data.enforce_build_fingerprint`:
-
-- `off`: record build fingerprint distributions only.
-- `warn` (default): continue training but emit a warning if any split mixes
-  multiple `aeg_build_fingerprint` values.
-- `strict`: fail fast if any split mixes multiple build fingerprints.
+leakage.
 
 ## Train
 
-1. Copy `config/experiments/aeg_robust/base.example.yaml` to `config/experiments/aeg_robust/base.yaml`.
-2. Edit the local `base.yaml` so `data.{train,val,test}.pt_dir` and label CSV paths point to your generated AEG PT files.
-3. Run one of the experiment configs below.
+1. Edit `config/experiments/aeg_robust/base.example.yaml` or override its paths
+   so `data.{train,val,test}.pt_dir` and label CSV paths point to your generated
+   AEG PT files.
+2. Run one of the experiment configs below.
 
 Run the full method:
 
@@ -206,7 +198,7 @@ diagnostics_test_<view>_<strength>.csv
 - `summary.json` is the compact metric summary for the completed run.
 - `experiment_metadata.json` is written at run start, updated on success/failure,
   and records resolved config/data paths, runtime + git environment, dataset
-  stats, payload/schema fingerprints, build fingerprint distributions, emitted
+  stats, payload/schema contract details, emitted
   diagnostics files, and final test/robust-test results.
 
 Diagnostics include reliability scalars, code-Manifest similarity/conflict,

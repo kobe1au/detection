@@ -18,15 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from fusion.config_utils import load_config as _load_config  # noqa: E402
-from fusion.constants import (  # noqa: E402
-    AEG_EXTRACTION_PIPELINE_VERSION,
-    AEG_PAYLOAD_CONTRACT_FINGERPRINT,
-    AEG_PAYLOAD_CONTRACT_VERSION,
-    AEG_SCHEMA_TABLE_FINGERPRINT,
-    AEG_SCHEMA_TABLES,
-    AEG_SCHEMA_VERSION,
-    stable_table_hash,
-)
+from fusion.constants import AEG_PAYLOAD_CONTRACT_VERSION, AEG_SCHEMA_VERSION, stable_table_hash  # noqa: E402
 from fusion.io_utils import load_aeg_payload  # noqa: E402
 from fusion.payload_contract import validate_aeg_payload  # noqa: E402
 
@@ -48,15 +40,6 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def _sha256_text_file(path: Path) -> str:
-    if not path.exists():
-        return ""
-    # Normalize line endings so semantically identical Windows/Linux checkouts
-    # produce the same AEG build fingerprint.
-    text = path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _silence_third_party_logs() -> None:
     try:
         from loguru import logger
@@ -64,61 +47,6 @@ def _silence_third_party_logs() -> None:
         logger.remove()
     except Exception:
         pass
-
-
-def _build_fingerprint(cfg: dict[str, Any], vocab: dict[str, Any]) -> str:
-    source_paths = [
-        "scripts/build_aeg_pts_direct.py",
-        "fusion/constants.py",
-        "fusion/aeg_builder.py",
-        "fusion/manifest_features.py",
-        "fusion/payload_contract.py",
-        "fusion/semantic_categories.py",
-        "fusion/quality.py",
-        "extract/extract_graph_api.py",
-    ]
-    source_hashes = {path: _sha256_text_file(PROJECT_ROOT / path) for path in source_paths}
-    config_keys = [
-        "manifest_dim",
-        "node_feature_dim",
-        "vocab_size",
-        "sensitive_hops",
-        "max_methods_per_dex",
-        "max_methods_per_apk",
-        "fallback_max_methods",
-        "fallback_policy",
-        "use_graph_behavior_hints",
-        "graph_behavior_hint_start",
-        "graph_behavior_hint_dim",
-        "num_api_buckets",
-        "max_api_events_per_dex",
-        "max_api_events_per_apk",
-        "max_api_events_per_method",
-        "api_event_scope",
-        "framework_only",
-        "include_descriptor",
-        "keep_method_names",
-        "keep_api_tokens",
-        "storage_dtype",
-    ]
-    payload = {
-        "extraction_pipeline_version": AEG_EXTRACTION_PIPELINE_VERSION,
-        "payload_contract_version": AEG_PAYLOAD_CONTRACT_VERSION,
-        "payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
-        "schema_version": AEG_SCHEMA_VERSION,
-        "schema_table_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
-        "schema_tables": AEG_SCHEMA_TABLES,
-        "config": {key: cfg.get(key) for key in config_keys},
-        "manifest_vocab": {
-            "categories": vocab.get("categories") or [],
-            "permission_vocab": vocab.get("permission_vocab") or [],
-            "intent_vocab": vocab.get("intent_vocab") or [],
-            "feature_vocab": vocab.get("feature_vocab") or [],
-            "metadata": vocab.get("metadata") or {},
-        },
-        "source_hashes": source_hashes,
-    }
-    return stable_table_hash(payload)
 
 
 def _resolve_split_dirs(data: dict[str, Any], splits: list[str]) -> dict[str, Path]:
@@ -909,7 +837,6 @@ def _process_one(
             "num_dex_failed": failed,
             "method_budget_per_dex": method_budget_per_dex,
             "api_event_budget_per_dex": api_budget_per_dex,
-            "aeg_build_fingerprint": cfg.get("build_fingerprint", ""),
             "use_graph_behavior_hints": bool(cfg.get("use_graph_behavior_hints", False)),
             "graph_behavior_hint_start": int(cfg["graph_behavior_hint_start"]),
             "graph_behavior_hint_dim": int(cfg["graph_behavior_hint_dim"]),
@@ -1070,7 +997,6 @@ def run(args: argparse.Namespace) -> None:
     if cfg["vocab_only"]:
         print(f"Manifest vocab ready: {cfg['vocab_path']}")
         return
-    cfg["build_fingerprint"] = _build_fingerprint(cfg, vocab)
 
     resume_rows: list[dict[str, str]] = []
     pending_jobs: list[dict[str, Any]] = []

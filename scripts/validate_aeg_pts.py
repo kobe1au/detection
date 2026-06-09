@@ -84,7 +84,6 @@ def validate_one_pt(path: Path, *, expected_dim: int) -> tuple[bool, list[str], 
         "sid": path.stem.lower(),
         "node_dim": None,
         "schema_version": "",
-        "build_fingerprint": "<missing>",
     }
 
     try:
@@ -107,7 +106,6 @@ def validate_one_pt(path: Path, *, expected_dim: int) -> tuple[bool, list[str], 
 
     schema_version = payload.get("schema_version") or payload.get("aeg_schema_version") or ""
     info["schema_version"] = str(schema_version)
-    info["build_fingerprint"] = str(payload.get("aeg_build_fingerprint") or "<missing>")
 
     return len(errors) == 0, errors, info
 
@@ -155,12 +153,9 @@ def main() -> int:
     errors: list[str] = []
     node_dim_counter: Counter[int] = Counter()
     schema_counter: Counter[str] = Counter()
-    build_fingerprint_counter: Counter[str] = Counter()
 
     csv_ids_by_split: dict[str, set[str]] = {}
     pt_ids_by_split: dict[str, set[str]] = {}
-    build_fingerprint_by_split: dict[str, Counter[str]] = {}
-    build_fingerprint_examples: dict[str, dict[str, list[str]]] = {}
 
     for split in splits:
         csv_path = label_csvs.get(split)
@@ -186,8 +181,6 @@ def main() -> int:
 
         csv_ids_by_split[split] = csv_ids
         pt_ids_by_split[split] = pt_ids
-        split_fingerprint_counter = build_fingerprint_by_split.setdefault(split, Counter())
-        split_fingerprint_examples.setdefault(split, {})
 
         csv_only = sorted(csv_ids - pt_ids)
         pt_only = sorted(pt_ids - csv_ids)
@@ -216,13 +209,6 @@ def main() -> int:
                 node_dim_counter[int(info["node_dim"])] += 1
             if info.get("schema_version"):
                 schema_counter[str(info["schema_version"])] += 1
-            if info.get("node_dim") is not None or info.get("schema_version"):
-                fingerprint = str(info.get("build_fingerprint") or "<missing>")
-                build_fingerprint_counter[fingerprint] += 1
-                split_fingerprint_counter[fingerprint] += 1
-                examples = build_fingerprint_examples[split].setdefault(fingerprint, [])
-                if len(examples) < 5:
-                    examples.append(path.name)
 
             if not ok:
                 split_load_errors += len(item_errors)
@@ -234,12 +220,6 @@ def main() -> int:
                         return 2
 
         print(f"  loaded_file_errors: {split_load_errors}")
-        if split_fingerprint_counter:
-            print("  build_fingerprints:")
-            for fingerprint, count in split_fingerprint_counter.most_common():
-                print(f"    {fingerprint}: {count}")
-        else:
-            print("  build_fingerprints: <none>")
         print()
 
     # 跨 split 重复检查
@@ -269,44 +249,6 @@ def main() -> int:
     else:
         print("  <none>")
 
-    print("Build fingerprints observed:")
-    if build_fingerprint_counter:
-        for fingerprint, count in build_fingerprint_counter.most_common():
-            print(f"  {fingerprint}: {count}")
-    else:
-        print("  <none>")
-
-    print("Build fingerprints by split:")
-    if build_fingerprint_by_split:
-        for split in splits:
-            counter = build_fingerprint_by_split.get(split, Counter())
-            if not counter:
-                print(f"  [{split}] <none>")
-                continue
-            joined = ", ".join(f"{fingerprint}={count}" for fingerprint, count in counter.most_common())
-            print(f"  [{split}] {joined}")
-    else:
-        print("  <none>")
-
-    mixed_fingerprint_splits = {
-        split: counter
-        for split, counter in build_fingerprint_by_split.items()
-        if len(counter) > 1
-    }
-    print("Mixed build fingerprint examples:")
-    if mixed_fingerprint_splits:
-        for split in splits:
-            counter = mixed_fingerprint_splits.get(split)
-            if not counter:
-                continue
-            print(f"  [{split}]")
-            for fingerprint, _count in counter.most_common():
-                examples = build_fingerprint_examples.get(split, {}).get(fingerprint, [])
-                print(f"    {fingerprint}: examples={examples[:5]}")
-    else:
-        print("  <none>")
-
-    print()
     print(f"errors={len(errors)}")
     for e in errors[:50]:
         print(f"[ERROR] {e}")

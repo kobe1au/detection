@@ -53,6 +53,7 @@ def validate_aeg_payload(
 ) -> None:
     if not isinstance(payload, dict):
         raise AEGPayloadContractError("AEG payload must be a dictionary")
+
     missing = [key for key in AEG_REQUIRED_PAYLOAD_FIELDS if key not in payload]
     if missing:
         raise AEGPayloadContractError(f"AEG payload is missing required fields: {missing}")

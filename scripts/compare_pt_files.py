@@ -35,14 +35,6 @@ def compare_pt_files(old_pt_path, new_pt_path):
     print("🔑 关键元数据对比")
     print("=" * 80)
 
-    # Build fingerprint
-    old_fp = old_data.get("aeg_build_fingerprint", "MISSING")
-    new_fp = new_data.get("aeg_build_fingerprint", "MISSING")
-    print(f"\naeg_build_fingerprint:")
-    print(f"  旧: {old_fp[:50]}..." if isinstance(old_fp, str) and len(old_fp) > 50 else f"  旧: {old_fp}")
-    print(f"  新: {new_fp[:50]}..." if isinstance(new_fp, str) and len(new_fp) > 50 else f"  新: {new_fp}")
-    print(f"  {'✅ 相同' if old_fp == new_fp else '❌ 不同 (正常,代码已修改)'}")
-
     # Schema version
     old_sv = old_data.get("schema_version")
     new_sv = new_data.get("schema_version")
@@ -98,7 +90,7 @@ def compare_pt_files(old_pt_path, new_pt_path):
     print("=" * 80)
 
     if all_match and not only_old and not only_new and old_sv == new_sv:
-        print("\n✅ 除了 build_fingerprint 外,所有内容完全一致")
+        print("\n✅ 新旧PT关键结构完全一致")
         print("✅ 新旧PT文件格式兼容,可以混用")
         print("✅ 修改后的 resume 逻辑可以正确识别旧PT文件")
     else:

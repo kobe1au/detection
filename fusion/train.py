@@ -278,7 +278,6 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
             "schema_fingerprint": str(payload.get("aeg_schema_fingerprint") or ""),
             "contract_version": int(payload.get("aeg_payload_contract_version", 0) or 0),
             "contract_fingerprint": str(payload.get("aeg_payload_contract_fingerprint") or ""),
-            "build_fingerprint": str(payload.get("aeg_build_fingerprint") or ""),
         }
     except Exception as exc:
         raise ValueError(f"Failed to load AEG PT metadata from {key}: {type(exc).__name__}: {exc}") from exc
@@ -289,18 +288,14 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
 def _validate_split_isolation(
     *datasets: AEGDataset,
     check_package: bool = True,
-    build_fingerprint_policy: str = "warn",
-) -> dict[str, Any]:
+) -> None:
     seen: dict[str, str] = {}
     conflicts: list[tuple[str, str, str]] = []
     package_seen: dict[str, tuple[str, str]] = {}
     package_conflicts: list[tuple[str, str, str, str, str]] = []
     metadata_cache: dict[Path, dict[str, Any]] = {}
     invalid_metadata: list[tuple[str, str, str]] = []
-    split_fingerprints: dict[str, Counter[str]] = {}
     for dataset in datasets:
-        split_key = str(dataset.split or f"split_{len(split_fingerprints)}")
-        fingerprint_counter = split_fingerprints.setdefault(split_key, Counter())
         for path, _label in dataset.samples:
             sid = path.stem.lower()
             prev = seen.get(sid)
@@ -316,8 +311,6 @@ def _validate_split_isolation(
                 invalid_metadata.append((sid, dataset.split, f"contract_version={metadata['contract_version']}"))
             elif metadata["contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
                 invalid_metadata.append((sid, dataset.split, "contract_fingerprint_mismatch"))
-
-            fingerprint_counter[str(metadata.get("build_fingerprint") or "<missing>")] += 1
 
             if check_package:
                 package = metadata["package_name"]
@@ -337,31 +330,6 @@ def _validate_split_isolation(
             "Package name overlap across splits: "
             f"count={len(package_conflicts)} examples={package_conflicts[:5]}"
         )
-
-    normalized_policy = str(build_fingerprint_policy or "warn").strip().lower()
-    if normalized_policy not in {"off", "warn", "strict"}:
-        raise ValueError(
-            "data.enforce_build_fingerprint must be one of {'off', 'warn', 'strict'}; "
-            f"got {build_fingerprint_policy!r}"
-        )
-    mixed_splits = {
-        split: dict(sorted(counter.items()))
-        for split, counter in split_fingerprints.items()
-        if len(counter) > 1
-    }
-    if mixed_splits:
-        message = f"Mixed AEG build fingerprints detected: {mixed_splits}"
-        if normalized_policy == "strict":
-            raise ValueError(message)
-        if normalized_policy == "warn":
-            LOGGER.warning(message)
-
-    return {
-        "build_fingerprint_policy": normalized_policy,
-        "build_fingerprint_counts": {
-            split: dict(sorted(counter.items())) for split, counter in split_fingerprints.items()
-        },
-    }
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -645,7 +613,6 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
         "data": {
             "strict_integrity": bool(data_cfg.get("strict_integrity", True)),
             "enforce_package_isolation": bool(data_cfg.get("enforce_package_isolation", True)),
-            "enforce_build_fingerprint": str(data_cfg.get("enforce_build_fingerprint", "warn")),
             "splits": split_paths,
         },
         "runtime": _runtime_info(device),
@@ -677,12 +644,11 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
                 f"This would produce 0 training batches."
             )
 
-        split_isolation = _validate_split_isolation(
+        _validate_split_isolation(
             train_ds,
             val_ds,
             test_ds,
             check_package=bool(data_cfg.get("enforce_package_isolation", True)),
-            build_fingerprint_policy=str(data_cfg.get("enforce_build_fingerprint", "warn")),
         )
         train_stats = split_label_stats(train_ds)
         val_stats = split_label_stats(val_ds)
@@ -705,15 +671,10 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
         )
 
         metadata["node_input_dim"] = node_input_dim
-        metadata["data"]["enforce_build_fingerprint"] = split_isolation["build_fingerprint_policy"]
         metadata["datasets"] = {
             "train": train_stats,
             "val": val_stats,
             "test": test_stats,
-        }
-        metadata["aeg"] = {
-            **dict(metadata.get("aeg") or {}),
-            "build_fingerprint_counts": split_isolation["build_fingerprint_counts"],
         }
         _write_json(metadata_path, metadata)
         best_score = -1.0
@@ -751,9 +712,7 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
                         "epoch": epoch,
                         "score": best_score,
                         "node_input_dim": node_input_dim,
-                        "aeg_build_fingerprint_counts": split_isolation["build_fingerprint_counts"],
                         "aeg_payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
-                        "build_fingerprint_policy": split_isolation["build_fingerprint_policy"],
                     },
                     out_dir / "best.pt",
                 )

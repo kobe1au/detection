@@ -79,7 +79,6 @@ def _payload() -> dict:
             "dex_success_ratio": 1.0,
             "num_dex_total": 1,
             "num_dex_success": 1,
-            "aeg_build_fingerprint": "test-build",
         },
         node_feature_dim=32,
     )
@@ -90,14 +89,12 @@ def _variant_payload(
     *,
     package_name: str,
     split: str = "train",
-    build_fingerprint: str = "test-build",
 ) -> dict:
     payload = dict(_payload())
     payload["sid"] = sid
     payload["sha256"] = sid
     payload["package_name"] = package_name
     payload["split"] = split
-    payload["aeg_build_fingerprint"] = build_fingerprint
     return payload
 
 
@@ -556,7 +553,6 @@ def _prepare_local_aeg_experiment_configs(tmp_path: Path) -> Path:
     src = Path("config/experiments/aeg_robust")
     dst = tmp_path / "aeg_robust"
     shutil.copytree(src, dst)
-    shutil.copy2(dst / "base.example.yaml", dst / "base.yaml")
     return dst
 
 
@@ -579,14 +575,14 @@ def test_all_aeg_experiment_configs_load_and_have_unique_outputs(tmp_path: Path)
         assert int(cfg["eval"]["seed"]) == 2026
 
 
-def test_aeg_config_missing_base_shows_copy_from_example_guidance(tmp_path: Path):
+def test_aeg_configs_do_not_require_local_base_yaml(tmp_path: Path):
     cfg_root = tmp_path / "aeg_robust"
     shutil.copytree(Path("config/experiments/aeg_robust"), cfg_root)
     base_path = cfg_root / "base.yaml"
     if base_path.exists():
         base_path.unlink()
-    with pytest.raises(FileNotFoundError, match="Copy base.example.yaml to base.yaml"):
-        load_config(cfg_root / "full/ours.yaml")
+    cfg = load_config(cfg_root / "full/ours.yaml")
+    assert cfg["train"]["output_dir"] == "results/aeg_robust/full/ours"
 
 
 def test_diagnostic_slice_summarizer(tmp_path: Path):
@@ -905,16 +901,6 @@ def test_aeg_apk_scan_index_marks_zero_and_content_mismatch(tmp_path: Path):
     assert [row["status"] for row in rows] == ["content_hash_mismatch", "zero_byte"]
 
 
-def test_source_hash_is_stable_across_line_endings(tmp_path: Path):
-    from scripts.build_aeg_pts_direct import _sha256_text_file
-
-    lf = tmp_path / "lf.py"
-    crlf = tmp_path / "crlf.py"
-    lf.write_bytes(b"a = 1\nb = 2\n")
-    crlf.write_bytes(b"a = 1\r\nb = 2\r\n")
-    assert _sha256_text_file(lf) == _sha256_text_file(crlf)
-
-
 def test_aeg_payload_omits_large_intermediate_features_by_default():
     payload = _payload()
     for key in (
@@ -956,8 +942,7 @@ def test_generated_payload_contract_validation():
     from scripts.build_aeg_pts_direct import _validate_payload_for_save
 
     payload = _payload()
-    payload["aeg_build_fingerprint"] = "build"
-    cfg = {"node_feature_dim": int(payload["node_x"].size(1)), "build_fingerprint": "build"}
+    cfg = {"node_feature_dim": int(payload["node_x"].size(1))}
     job = {"sha256": payload["sid"]}
     _validate_payload_for_save(payload, cfg, job)
     broken = dict(payload)
@@ -1000,7 +985,6 @@ def test_compact_storage_round_trips_to_training_dtypes():
     record = _manifest_record()
     vocab = build_manifest_vocab([record], max_permissions=8, max_intents=8, max_features=4)
     manifest_payload = vectorize_manifest_record(record, vocab, manifest_dim=32)
-    base = _payload()
     compact = build_aeg_payload(
         sid=record["sha256"],
         apk_name=record["apk_name"],
@@ -1024,7 +1008,6 @@ def test_compact_storage_round_trips_to_training_dtypes():
             "dex_success_ratio": 1.0,
             "num_dex_total": 1,
             "num_dex_success": 1,
-            "aeg_build_fingerprint": base["aeg_build_fingerprint"],
         },
         node_feature_dim=32,
         storage_dtype="float16",
@@ -1066,52 +1049,6 @@ def test_package_name_overlap_across_splits_is_rejected(tmp_path: Path):
         _validate_split_isolation(train_ds, val_ds, check_package=True)
 
 
-def test_mixed_build_fingerprints_do_not_block_split_isolation(tmp_path: Path):
-    payload_train = _variant_payload("a" * 64, package_name="com.example.sample", split="train")
-    payload_val = _variant_payload(
-        "b" * 64,
-        package_name="com.example.other",
-        split="val",
-        build_fingerprint="different-build",
-    )
-
-    datasets = []
-    for split, payload, label in (("train", payload_train, 1), ("val", payload_val, 0)):
-        pt_dir, csv_path = _write_split(tmp_path, split, [(payload, label)])
-        datasets.append(AEGDataset(pt_dir, csv_path, split=split))
-
-    _validate_split_isolation(*datasets, check_package=True)
-
-
-def test_build_fingerprint_policy_off_warn_and_strict(tmp_path: Path, caplog: pytest.LogCaptureFixture):
-    payload_train_a = _variant_payload("a" * 64, package_name="com.example.sample.a", split="train", build_fingerprint="build-a")
-    payload_train_b = _variant_payload("b" * 64, package_name="com.example.sample.b", split="train", build_fingerprint="build-b")
-    payload_val = _variant_payload("c" * 64, package_name="com.example.other", split="val", build_fingerprint="build-a")
-
-    train_dir, train_csv = _write_split(tmp_path, "train", [(payload_train_a, 1), (payload_train_b, 0)])
-    val_dir, val_csv = _write_split(tmp_path, "val", [(payload_val, 0)])
-    datasets = [
-        AEGDataset(train_dir, train_csv, split="train"),
-        AEGDataset(val_dir, val_csv, split="val"),
-    ]
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        result_off = _validate_split_isolation(*datasets, check_package=True, build_fingerprint_policy="off")
-    assert result_off["build_fingerprint_policy"] == "off"
-    assert result_off["build_fingerprint_counts"]["train"] == {"build-a": 1, "build-b": 1}
-    assert "Mixed AEG build fingerprints detected" not in caplog.text
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        result_warn = _validate_split_isolation(*datasets, check_package=True, build_fingerprint_policy="warn")
-    assert result_warn["build_fingerprint_policy"] == "warn"
-    assert "Mixed AEG build fingerprints detected" in caplog.text
-
-    with pytest.raises(ValueError, match="Mixed AEG build fingerprints detected"):
-        _validate_split_isolation(*datasets, check_package=True, build_fingerprint_policy="strict")
-
-
 def test_run_rejects_contrastive_batch_size_one(tmp_path: Path):
     payload_train = _variant_payload("a" * 64, package_name="com.example.train", split="train")
     payload_val = _variant_payload("b" * 64, package_name="com.example.val", split="val")
@@ -1125,7 +1062,6 @@ def test_run_rejects_contrastive_batch_size_one(tmp_path: Path):
         "data": {
             "strict_integrity": True,
             "enforce_package_isolation": True,
-            "enforce_build_fingerprint": "warn",
             "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
             "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
             "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
@@ -1177,7 +1113,6 @@ def test_run_writes_failed_metadata_before_early_validation_errors(tmp_path: Pat
         "data": {
             "strict_integrity": True,
             "enforce_package_isolation": True,
-            "enforce_build_fingerprint": "warn",
             "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
             "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
             "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
@@ -1215,7 +1150,6 @@ def test_run_writes_failed_metadata_before_early_validation_errors(tmp_path: Pat
     assert metadata["status"] == "failed"
     assert metadata["config_path"] == str(config_path.resolve())
     assert metadata["output_dir"] == str(output_dir.resolve())
-    assert metadata["data"]["enforce_build_fingerprint"] == "warn"
     assert metadata["error"]["type"] == "ValueError"
     assert "batch_size >= 2" in metadata["error"]["message"]
 
@@ -1243,7 +1177,6 @@ def test_run_writes_completed_metadata_and_outputs(tmp_path: Path, monkeypatch: 
         "data": {
             "strict_integrity": True,
             "enforce_package_isolation": True,
-            "enforce_build_fingerprint": "warn",
             "train": {"pt_dir": str(tmp_path / "train"), "csv": str(tmp_path / "train.csv")},
             "val": {"pt_dir": str(tmp_path / "val"), "csv": str(tmp_path / "val.csv")},
             "test": {"pt_dir": str(tmp_path / "test"), "csv": str(tmp_path / "test.csv")},
@@ -1301,14 +1234,7 @@ def test_run_writes_completed_metadata_and_outputs(tmp_path: Path, monkeypatch: 
         return metrics, rows
 
     monkeypatch.setattr(train_module, "_make_dataset", fake_make_dataset)
-    monkeypatch.setattr(train_module, "_validate_split_isolation", lambda *args, **kwargs: {
-        "build_fingerprint_policy": "warn",
-        "build_fingerprint_counts": {
-            "train": {"build-a": 1},
-            "val": {"build-a": 1},
-            "test": {"build-a": 1},
-        },
-    })
+    monkeypatch.setattr(train_module, "_validate_split_isolation", lambda *args, **kwargs: None)
     monkeypatch.setattr(train_module, "split_label_stats", lambda dataset: {"samples": len(dataset)})
     monkeypatch.setattr(train_module, "_loader", fake_loader)
     monkeypatch.setattr(train_module, "load_aeg_payload", lambda *args, **kwargs: {"node_x": torch.zeros(3, 4)})
@@ -1326,7 +1252,6 @@ def test_run_writes_completed_metadata_and_outputs(tmp_path: Path, monkeypatch: 
     assert metadata["seed"] == 7
     assert metadata["node_input_dim"] == 4
     assert metadata["datasets"]["train"] == {"samples": 1}
-    assert metadata["aeg"]["build_fingerprint_counts"]["train"] == {"build-a": 1}
     assert metadata["outputs"]["checkpoint"] == "best.pt"
     assert metadata["outputs"]["history"] == "history.csv"
     assert metadata["outputs"]["summary"] == "summary.json"
@@ -1355,7 +1280,6 @@ def test_run_rejects_zero_training_batches_with_drop_last(tmp_path: Path):
         "data": {
             "strict_integrity": True,
             "enforce_package_isolation": True,
-            "enforce_build_fingerprint": "warn",
             "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
             "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
             "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
@@ -1396,7 +1320,6 @@ def test_load_checkpoint_round_trips_saved_training_artifact(tmp_path: Path):
         "model": {"weight": torch.tensor([1.0])},
         "cfg": {"train": {"device": "cpu"}},
         "node_input_dim": 32,
-        "aeg_build_fingerprint_counts": {"train": {"test-build": 1}},
         "aeg_payload_contract_fingerprint": "contract",
     }
     torch.save(payload, checkpoint_path)
@@ -1545,11 +1468,11 @@ def test_load_checkpoint_retries_without_mmap_before_legacy_fallback(
     assert "Falling back to legacy torch.load for checkpoint compat.pt" in caplog.text
 
 
-def test_validate_aeg_pt_reports_build_fingerprints(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch):
+def test_validate_aeg_pt_reports_schema_and_node_dimensions(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch):
     from scripts import validate_aeg_pts as script
 
-    train_payload = _variant_payload("a" * 64, package_name="com.example.train", split="train", build_fingerprint="build-a")
-    val_payload = _variant_payload("b" * 64, package_name="com.example.val", split="val", build_fingerprint="build-b")
+    train_payload = _variant_payload("a" * 64, package_name="com.example.train", split="train")
+    val_payload = _variant_payload("b" * 64, package_name="com.example.val", split="val")
 
     train_dir, train_csv = _write_split(tmp_path, "train", [(train_payload, 1)])
     val_dir, val_csv = _write_split(tmp_path, "val", [(val_payload, 0)])
@@ -1576,11 +1499,8 @@ def test_validate_aeg_pt_reports_build_fingerprints(tmp_path: Path, capsys: pyte
     code = script.main()
     out = capsys.readouterr().out
     assert code == 0
-    assert "Build fingerprints observed:" in out
-    assert "build-a: 1" in out
-    assert "build-b: 1" in out
-    assert "Build fingerprints by split:" in out
-    assert "[train] build-a=1" in out
-    assert "[val] build-b=1" in out
-    assert "Mixed build fingerprint examples:" in out
-    assert "<none>" in out or "[train]" not in out
+    assert "Node feature dims observed:" in out
+    assert "dim=32: 2" in out
+    assert "Schema versions observed:" in out
+    assert str(AEG_SCHEMA_VERSION) in out
+    assert "RESULT: PASS" in out

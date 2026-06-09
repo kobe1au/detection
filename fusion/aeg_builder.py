@@ -443,7 +443,6 @@ def build_aeg_payload(
     payload = {
         "schema_version": AEG_SCHEMA_VERSION,
         "aeg_schema_fingerprint": AEG_SCHEMA_TABLE_FINGERPRINT,
-        "aeg_build_fingerprint": str(direct_meta.get("aeg_build_fingerprint", "")),
         "aeg_payload_contract_version": AEG_PAYLOAD_CONTRACT_VERSION,
         "aeg_payload_contract_fingerprint": AEG_PAYLOAD_CONTRACT_FINGERPRINT,
         "sid": sid,

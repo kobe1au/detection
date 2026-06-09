@@ -1,4 +1,4 @@
-base: ../base.yaml
+base: ../base.example.yaml
 
 train:
   output_dir: results/aeg_robust/i1/typed_source_quality
