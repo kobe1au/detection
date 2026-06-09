@@ -21,6 +21,7 @@ from fusion.constants import (
     AEG_SCHEMA_VERSION,
 )
 from fusion.dataset import AEGDataset, aeg_collate_fn, split_label_stats
+from fusion.io_utils import load_aeg_payload
 from fusion.losses import compute_aeg_loss
 from fusion.model import build_model
 from fusion.payload_contract import validate_aeg_payload
@@ -236,8 +237,7 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
     if key in cache:
         return cache[key]
     try:
-        payload = torch.load(key, map_location="cpu")
-        validate_aeg_payload(payload)
+        payload = load_aeg_payload(key, validate=True)
         metadata = {
             "package_name": str(payload.get("package_name") or "").strip().lower(),
             "schema_version": int(payload.get("schema_version", 0) or 0),
@@ -274,6 +274,7 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
                 invalid_metadata.append((sid, dataset.split, f"contract_version={metadata['contract_version']}"))
             elif metadata["contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
                 invalid_metadata.append((sid, dataset.split, "contract_fingerprint_mismatch"))
+
             if check_package:
                 package = metadata["package_name"]
                 if package:
@@ -282,6 +283,7 @@ def _validate_split_isolation(*datasets: AEGDataset, check_package: bool = True)
                         package_conflicts.append((package, package_prev[1], sid, package_prev[0], dataset.split))
                     else:
                         package_seen.setdefault(package, (dataset.split, sid))
+    
     if conflicts:
         raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
     if invalid_metadata:
@@ -311,10 +313,24 @@ def train_one_epoch(
     model.train()
     use_aug = bool((cfg.get("robust", {}) or {}).get("train_aug", True))
     grad_clip = float((cfg.get("train", {}) or {}).get("grad_clip", 1.0))
+    loss_cfg = cfg.get("loss", {}) or {}
+    contrast_enabled = any(
+        float(loss_cfg.get(key, 0.0)) > 0.0
+        for key in (
+            "clean_degraded_contrast_weight",
+            "source_degraded_contrast_weight",
+            "cross_source_contrast_weight",
+        )
+    )
     totals: dict[str, float] = {}
     steps = 0
     for batch in tqdm(loader, desc=f"train {epoch}", leave=False):
         batch = _move_batch(batch, device)
+        if contrast_enabled and int(batch["clean"].y.view(-1).numel()) < 2:
+            raise RuntimeError(
+                "Contrastive training received a local batch with fewer than 2 samples. "
+                "Increase batch_size, disable contrastive losses, or adjust the sampler/drop_last setting."
+            )
         optimizer.zero_grad(set_to_none=True)
         clean_logits, clean_extra = model(batch["clean"])
         aug_logits = aug_extra = None
@@ -335,6 +351,15 @@ def train_one_epoch(
         for key, value in parts.items():
             totals[key] = totals.get(key, 0.0) + float(value)
         steps += 1
+    
+    # P0-2: Detect zero-batch training (silent failure when drop_last=True and dataset too small)
+    if steps == 0:
+        raise RuntimeError(
+            "No training batches were produced. This can happen when "
+            "drop_last=True and len(dataset) < batch_size. "
+            "Check batch_size, drop_last, and dataset size."
+        )
+    
     return {key: value / max(1, steps) for key, value in totals.items()}
 
 
@@ -522,6 +547,16 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
 
     train_ds = _make_dataset(cfg, "train", aug=bool((cfg.get("robust", {}) or {}).get("train_aug", True)))
     val_ds = _make_dataset(cfg, "val", aug=False)
+    
+    # P0-2: Check for zero-batch scenario with drop_last=True
+    contrast_enabled = any(w > 0 for w in contrast_weights)
+    if contrast_enabled and len(train_ds) < batch_size:
+        raise ValueError(
+            f"Contrastive training with drop_last=True requires len(train_ds) >= batch_size; "
+            f"got len(train_ds)={len(train_ds)} batch_size={batch_size}. "
+            f"This would produce 0 training batches."
+        )
+    
     data_cfg = cfg.get("data", {}) or {}
     _validate_split_isolation(
         train_ds,
@@ -534,7 +569,9 @@ def run(cfg: dict[str, Any]) -> dict[str, Any]:
     train_loader = _loader(cfg, train_ds, train=True)
     val_loader = _loader(cfg, val_ds, train=False)
     robust_val_loaders = _robust_val_loaders(cfg)
-    first_payload = torch.load(train_ds.samples[0][0], map_location="cpu")
+    
+    # Use unified safe loading
+    first_payload = load_aeg_payload(train_ds.samples[0][0], validate=True)
     node_input_dim = int(first_payload["node_x"].size(1))
     aeg_build_fingerprint = str(first_payload["aeg_build_fingerprint"])
     model = build_model(cfg, node_input_dim).to(device)

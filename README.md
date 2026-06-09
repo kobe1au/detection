@@ -86,7 +86,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume only reuses PT files whose schema table fingerprint and build fingerprint match the current extractor, Manifest vocabulary, and AEG construction code.
+The script writes `aeg_pt_index.csv` under `data.out_root`. Failed APKs are recorded in the same index with `status=failed`; generation does not stop unless `execution.fail_on_error=true`. APKs not present in the configured label CSV are skipped and written to `aeg_ignored_apks.csv`. Resume validates the payload contract and node feature dimension before reusing existing PT files. Build fingerprints are kept as diagnostic metadata, not as a hard training-time blocker.
 
 Extraction first scans invoke targets for all methods, selects the methods kept
 by the configured graph budget, and only then builds expensive local CFG
@@ -105,8 +105,8 @@ extractor debugging because either substantially increases PT storage.
 
 Every generated PT is checked against a versioned payload contract before it
 is saved. Dataset loading and training preflight repeat that validation and
-reject missing fields, invalid tensor shapes, mixed build fingerprints, or
-mixed contract versions instead of silently padding malformed samples. The
+reject missing fields, invalid tensor shapes, schema mismatches, or mixed
+contract versions instead of silently padding malformed samples. The
 compact contract retains the typed graph, reliability values, semantic
 aggregates, package/year metadata, Manifest parse status, multi-DEX extraction
 status, and behavior-risk slice flags needed by the three proposed methods and

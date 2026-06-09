@@ -27,6 +27,7 @@ from fusion.constants import (  # noqa: E402
     AEG_SCHEMA_VERSION,
     stable_table_hash,
 )
+from fusion.io_utils import load_aeg_payload  # noqa: E402
 from fusion.payload_contract import validate_aeg_payload  # noqa: E402
 
 
@@ -836,7 +837,7 @@ def _resume_existing(job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, str]
     if not out_path.exists():
         return None
     try:
-        existing = torch.load(out_path, map_location="cpu")
+        existing = load_aeg_payload(out_path, validate=False)
 
         # ✅ Check schema version (affects PT structure)
         if existing.get("schema_version") != AEG_SCHEMA_VERSION:

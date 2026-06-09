@@ -16,6 +16,7 @@ from fusion.constants import (
     SOURCE_TYPES,
     VIEW_TYPES,
 )
+from fusion.io_utils import load_aeg_payload
 from fusion.payload_contract import AEGPayloadContractError, validate_aeg_payload
 from fusion.perturbations import (
     apply_aeg_view,
@@ -245,48 +246,12 @@ class AEGDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _safe_load(self, path: Path) -> dict:
-        """Load AEG PT file with defense-in-depth.
-        
-        Defense layers:
-        - Primary: weights_only=True restricts pickle deserialization (PyTorch 2.0+)
-        - Secondary: validate_payload_on_load checks schema/structure post-load
-        
-        Note: Neither layer prevents content-level semantic tampering.
-        For untrusted sources, verify external checksums before loading.
-        """
-        try:
-            payload = torch.load(
-                path,
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
-        except TypeError:
-            try:
-                payload = torch.load(
-                    path,
-                    map_location="cpu",
-                    weights_only=True,
-                )
-            except TypeError:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "This PyTorch version does not support weights_only/mmap. "
-                    "Loading %s with legacy torch.load; only use trusted PT files.",
-                    path.name,
-                )
-                payload = torch.load(path, map_location="cpu")
-        
-        if self.validate_payload_on_load:
-            validate_aeg_payload(payload)
-        
-        return payload
-
     def __getitem__(self, idx: int) -> dict[str, Data]:
         path, label = self.samples[idx]
-        payload = self._safe_load(path)
-        clean = payload_to_data(payload, label=label, validate_payload=self.validate_payload_on_load)
+        # Use centralized safe loading; validation handled by load_aeg_payload
+        payload = load_aeg_payload(path, validate=self.validate_payload_on_load)
+        # Skip redundant validation in payload_to_data since load_aeg_payload already validated
+        clean = payload_to_data(payload, label=label, validate_payload=False)
         out = {"clean": clean}
         selected_view = "clean"
         if self.train_aug and float(torch.rand(()).item()) < self.aug_prob and self.aug_views:
@@ -309,11 +274,11 @@ class AEGDataset(Dataset):
             donor_idx = self.manifest_donor_indices[idx] if idx < len(self.manifest_donor_indices) else None
             if donor_idx is not None:
                 donor_path, donor_label = self.samples[donor_idx]
-                donor_payload = self._safe_load(donor_path)
+                donor_payload = load_aeg_payload(donor_path, validate=self.validate_payload_on_load)
                 out["manifest_donor"] = payload_to_data(
                     donor_payload,
                     label=donor_label,
-                    validate_payload=self.validate_payload_on_load,
+                    validate_payload=False,
                 )
         return out
 

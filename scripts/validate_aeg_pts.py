@@ -17,7 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from scripts.build_aeg_pts_direct import _load_config, _parse_config  # noqa: E402
-from fusion.payload_contract import validate_aeg_payload  # noqa: E402
+from fusion.io_utils import load_aeg_payload  # noqa: E402
 
 
 def _norm_id(value: Any) -> str:
@@ -87,9 +87,9 @@ def validate_one_pt(path: Path, *, expected_dim: int) -> tuple[bool, list[str], 
     }
 
     try:
-        payload = torch.load(path, map_location="cpu")
+        payload = load_aeg_payload(path, validate=True, expected_node_feature_dim=expected_dim)
     except Exception as exc:
-        return False, [f"torch.load failed: {type(exc).__name__}: {exc}"], info
+        return False, [f"payload load failed: {type(exc).__name__}: {exc}"], info
 
     if not isinstance(payload, dict):
         return False, [f"payload is not dict: {type(payload)}"], info
@@ -106,14 +106,6 @@ def validate_one_pt(path: Path, *, expected_dim: int) -> tuple[bool, list[str], 
 
     schema_version = payload.get("schema_version") or payload.get("aeg_schema_version") or ""
     info["schema_version"] = str(schema_version)
-
-    try:
-        try:
-            validate_aeg_payload(payload, expected_node_feature_dim=expected_dim)
-        except TypeError:
-            validate_aeg_payload(payload)
-    except Exception as exc:
-        errors.append(f"payload contract failed: {type(exc).__name__}: {exc}")
 
     return len(errors) == 0, errors, info
 

@@ -5,6 +5,13 @@ import torch
 from pathlib import Path
 import sys
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from fusion.io_utils import load_aeg_payload  # noqa: E402
+
 def compare_pt_files(old_pt_path, new_pt_path):
     """详细对比两个PT文件"""
 
@@ -14,8 +21,8 @@ def compare_pt_files(old_pt_path, new_pt_path):
 
     # 加载文件
     try:
-        old_data = torch.load(old_pt_path, map_location="cpu")
-        new_data = torch.load(new_pt_path, map_location="cpu")
+        old_data = load_aeg_payload(old_pt_path, validate=True)
+        new_data = load_aeg_payload(new_pt_path, validate=True)
     except Exception as e:
         print(f"❌ 加载失败: {e}")
         return

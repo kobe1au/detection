@@ -16,8 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fusion.dataset import AEGDataset  # noqa: E402
 from fusion.constants import AEG_PAYLOAD_CONTRACT_FINGERPRINT  # noqa: E402
+from fusion.io_utils import load_aeg_payload  # noqa: E402
 from fusion.model import build_model  # noqa: E402
-from fusion.payload_contract import validate_aeg_payload  # noqa: E402
 from fusion.train import _device, _loader, _write_rows, evaluate  # noqa: E402
 
 
@@ -44,18 +44,13 @@ def _expected_training_contract(ckpt: dict[str, Any], cfg: dict[str, Any]) -> in
         return node_input_dim
     train_data = ((cfg.get("data", {}) or {}).get("train", {}) or {})
     pt_dir = _resolve(train_data.get("pt_dir", ""))
-    payload = torch.load(_first_pt(pt_dir), map_location="cpu")
-    validate_aeg_payload(payload)
+    payload = load_aeg_payload(_first_pt(pt_dir), validate=True)
     return int(payload["node_x"].size(1))
 
 
 def _validate_scenario(dataset: AEGDataset, node_input_dim: int) -> None:
     for path, _label in dataset.samples:
-        payload = torch.load(path, map_location="cpu")
-        validate_aeg_payload(
-            payload,
-            expected_node_feature_dim=node_input_dim,
-        )
+        load_aeg_payload(path, validate=True, expected_node_feature_dim=node_input_dim)
 
 
 def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
