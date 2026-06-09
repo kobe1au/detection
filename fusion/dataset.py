@@ -302,10 +302,15 @@ def aeg_collate_fn(items: list[dict[str, Data]]) -> dict[str, Any]:
     }
 
 
-def _copy_manifest_content(target: Data, donor: Data, *, blind: bool = False) -> bool:
+def _copy_manifest_content(target: Data, donor: Data | None, *, blind: bool = False) -> bool:
     target_mask = target.node_source == SOURCE_TYPES["manifest"]
-    donor_mask = donor.node_source == SOURCE_TYPES["manifest"]
 
+    if donor is None:
+        _zero_manifest_nodes(target)
+        return False
+
+    donor_mask = donor.node_source == SOURCE_TYPES["manifest"]
+    
     if not bool(target_mask.any()):
         _zero_manifest_nodes(target)
         return False
