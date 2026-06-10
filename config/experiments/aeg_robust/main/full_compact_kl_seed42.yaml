@@ -1,7 +1,11 @@
 base: ../base.yaml
 
 train:
-  output_dir: results/aeg_robust/main/full_compact_kl
+  seed: 42
+  output_dir: results/aeg_robust/main/full_compact_kl_seed42
+
+eval:
+  seed: 2026
 
 loss:
   mode: compact_kl

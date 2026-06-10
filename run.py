@@ -13,9 +13,9 @@ PYTHON_BIN = os.getenv("PYTHON_BIN", "python")
 CONFIG_DIR = Path("config/experiments/aeg_robust")
 
 ALIASES = {
-    "ours": "main/full_compact_kl.yaml",
-    "full": "main/full_compact_kl.yaml",
-    "final": "main/full_compact_kl.yaml",
+    "ours": "main/full_compact_kl_seed42.yaml",
+    "full": "main/full_compact_kl_seed42.yaml",
+    "final": "main/full_compact_kl_seed42.yaml",
     "compact": "loss/compact_kl.yaml",
     "compact_kl": "loss/compact_kl.yaml",
     "plain_kl": "loss/plain_kl.yaml",
@@ -24,7 +24,7 @@ ALIASES = {
 
 GROUPS = {
     "main": [
-        "main/full_compact_kl.yaml",
+        "main/full_compact_kl_seed42.yaml",
     ],
     "loss": [
         "loss/ce_only.yaml",
@@ -48,13 +48,14 @@ GROUPS = {
         "r3_fusion/mean_fusion.yaml",
     ],
     "full_seeds": [
-        "main/full_compact_kl.yaml",
-        # 后面如果你建 seed 配置，再加：
-        # "main/full_compact_kl_seed43.yaml",
-        # "main/full_compact_kl_seed44.yaml",
+        "main/full_compact_kl_seed42.yaml",
+        "main/full_compact_kl_seed43.yaml",
+        "main/full_compact_kl_seed44.yaml",
     ],
     "all": [
-        "main/full_compact_kl.yaml",
+        "main/full_compact_kl_seed42.yaml",
+        "main/full_compact_kl_seed43.yaml",
+        "main/full_compact_kl_seed44.yaml",
         "loss/ce_only.yaml",
         "loss/plain_kl.yaml",
         "loss/compact_kl.yaml",

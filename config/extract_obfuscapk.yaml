@@ -1,0 +1,48 @@
+base: extract_aeg.yaml
+
+data:
+  splits:
+    - rebuild
+    - rename
+    - string_encrypt
+    - reflection
+    - call_indirection
+    - control_flow
+    - junk_code
+    - manifest_noise
+  split_dirs:
+    rebuild: D:/obfuscapk_benchmark/apks/rebuild
+    rename: D:/obfuscapk_benchmark/apks/rename
+    string_encrypt: D:/obfuscapk_benchmark/apks/string_encrypt
+    reflection: D:/obfuscapk_benchmark/apks/reflection
+    call_indirection: D:/obfuscapk_benchmark/apks/call_indirection
+    control_flow: D:/obfuscapk_benchmark/apks/control_flow
+    junk_code: D:/obfuscapk_benchmark/apks/junk_code
+    manifest_noise: D:/obfuscapk_benchmark/apks/manifest_noise
+  out_root: D:/pts_obfuscapk
+  out_dirs:
+    rebuild: D:/pts_obfuscapk/rebuild
+    rename: D:/pts_obfuscapk/rename
+    string_encrypt: D:/pts_obfuscapk/string_encrypt
+    reflection: D:/pts_obfuscapk/reflection
+    call_indirection: D:/pts_obfuscapk/call_indirection
+    control_flow: D:/pts_obfuscapk/control_flow
+    junk_code: D:/pts_obfuscapk/junk_code
+    manifest_noise: D:/pts_obfuscapk/manifest_noise
+  # Obfuscated APK hashes differ from the clean test hashes. Keep a separate
+  # mapping from obfuscated hashes to original labels for external evaluation.
+  label_csvs: null
+  filter_to_label_csv: false
+  require_all_label_ids: false
+
+manifest:
+  # Always reuse the canonical train-only vocabulary.
+  vocab_path: config/manifest_vocab_aeg.yaml
+  rebuild_vocab: false
+
+execution:
+  workers: 4
+  hash_workers: 2
+  resume: true
+  fail_on_error: false
+  allow_empty_splits: true
