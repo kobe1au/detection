@@ -1,0 +1,11 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/r3_fusion/no_reliability_bias
+
+model:
+  reliability_bias_weight: 0.0
+
+loss:
+  mode: compact_kl
+  consistency_weight: 0.05

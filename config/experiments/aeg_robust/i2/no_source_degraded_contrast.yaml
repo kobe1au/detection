@@ -1,7 +1,0 @@
-base: multiview_contrast.yaml
-
-train:
-  output_dir: results/aeg_robust/i2/no_source_degraded_contrast
-
-loss:
-  source_degraded_contrast_weight: 0.0

@@ -1,0 +1,11 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/r1_graph/no_edge_quality
+
+model:
+  use_edge_quality: false
+
+loss:
+  mode: compact_kl
+  consistency_weight: 0.05

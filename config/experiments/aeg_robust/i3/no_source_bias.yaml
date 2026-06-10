@@ -1,7 +1,0 @@
-base: ../full/ours.yaml
-
-train:
-  output_dir: results/aeg_robust/i3/no_source_bias
-
-model:
-  source_bias_weight: 0.0

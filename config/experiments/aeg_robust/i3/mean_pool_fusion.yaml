@@ -1,7 +1,0 @@
-base: ../full/ours.yaml
-
-train:
-  output_dir: results/aeg_robust/i3/mean_pool_fusion
-
-model:
-  fusion_mode: mean_pool

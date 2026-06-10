@@ -1,0 +1,23 @@
+base: ../main/full_compact_kl.yaml
+
+train:
+  output_dir: results/aeg_robust/robust/synthetic_full
+
+eval:
+  robust_eval: true
+  robust_views:
+    - api_degraded
+    - graph_degraded
+    - api_graph_degraded
+    - manifest_noisy
+    - manifest_shuffled
+    - manifest_noisy_blind
+    - manifest_shuffled_blind
+    - api_missing
+    - graph_missing
+    - manifest_missing
+    - all_degraded
+  perturb_strengths:
+    - 0.1
+    - 0.3
+    - 0.5

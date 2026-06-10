@@ -1,0 +1,11 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/r1_graph/no_alignment
+
+model:
+  use_alignment_edges: false
+
+loss:
+  mode: compact_kl
+  consistency_weight: 0.05

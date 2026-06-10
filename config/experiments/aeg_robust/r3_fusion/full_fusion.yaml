@@ -1,0 +1,8 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/r3_fusion/full_fusion
+
+loss:
+  mode: compact_kl
+  consistency_weight: 0.05

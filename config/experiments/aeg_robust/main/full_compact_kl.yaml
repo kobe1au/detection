@@ -1,0 +1,10 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/main/full_compact_kl
+
+loss:
+  mode: compact_kl
+  ce_weight: 1.0
+  consistency_weight: 0.05
+  aug_ce_weight: 0.0

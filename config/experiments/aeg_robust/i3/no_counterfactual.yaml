@@ -1,7 +1,0 @@
-base: ../full/ours.yaml
-
-train:
-  output_dir: results/aeg_robust/i3/no_counterfactual
-
-loss:
-  counterfactual_kl_weight: 0.0

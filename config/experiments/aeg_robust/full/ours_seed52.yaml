@@ -1,5 +1,0 @@
-base: ours.yaml
-
-train:
-  seed: 52
-  output_dir: results/aeg_robust/full/ours_seed52

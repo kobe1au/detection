@@ -1,4 +1,0 @@
-base: ../base.example.yaml
-
-train:
-  output_dir: results/aeg_robust/full/ours

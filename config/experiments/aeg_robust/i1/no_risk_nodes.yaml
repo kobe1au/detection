@@ -1,9 +1,0 @@
-base: typed_source_quality.yaml
-
-train:
-  output_dir: results/aeg_robust/i1/no_risk_nodes
-
-model:
-  masked_node_types:
-    - RISK_SEMANTIC
-
