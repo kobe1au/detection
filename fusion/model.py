@@ -60,6 +60,16 @@ def _masked_mean(h: torch.Tensor, mask: torch.Tensor, batch: torch.Tensor, num_g
     count.index_add_(0, batch[mask], torch.ones((int(mask.sum()), 1), dtype=h.dtype, device=h.device))
     return out / count.clamp_min(1.0)
 
+def _masked_presence(mask: torch.Tensor, batch: torch.Tensor, num_graphs: int, ref: torch.Tensor) -> torch.Tensor:
+    mask = mask.view(-1).bool()
+    out = ref.new_zeros((num_graphs,))
+    if bool(mask.any()):
+        out.index_add_(
+            0,
+            batch[mask],
+            torch.ones((int(mask.sum()),), dtype=ref.dtype, device=ref.device),
+        )
+    return (out > 0).to(dtype=ref.dtype)
 
 def _masked_semantic_mean(data: Batch, mask: torch.Tensor, num_graphs: int) -> torch.Tensor:
     sem = getattr(data, "node_semantic", None)
@@ -333,6 +343,13 @@ class AEGModel(nn.Module):
         risk_nodes = (data.node_type == NODE_TYPES["RISK_SEMANTIC"]) & node_alive_mask
         string_hint_nodes = (data.node_type == NODE_TYPES["STRING_HINT"]) & node_alive_mask
 
+        method_avail = _masked_presence(method_nodes, data.batch, num_graphs, h)
+        api_family_avail = _masked_presence(api_family_nodes, data.batch, num_graphs, h)
+        permission_avail = _masked_presence(permission_nodes, data.batch, num_graphs, h)
+        component_avail = _masked_presence(component_nodes, data.batch, num_graphs, h)
+        risk_avail = _masked_presence(risk_nodes, data.batch, num_graphs, h)
+        string_hint_avail = _masked_presence(string_hint_nodes, data.batch, num_graphs, h)
+
         method_emb = _masked_mean(h, method_nodes, data.batch, num_graphs)
         api_family_emb = _masked_mean(h, api_family_nodes, data.batch, num_graphs)
         permission_emb = _masked_mean(h, permission_nodes, data.batch, num_graphs)
@@ -386,7 +403,15 @@ class AEGModel(nn.Module):
         risk_rel = _masked_mean(node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
         global_rel = torch.stack([code_rel, r_manifest], dim=-1).amax(dim=-1)
         token_rel = torch.stack(
-            [r_graph, r_api, r_manifest, r_manifest, risk_rel, r_api, global_rel],
+            [
+                r_graph * method_avail,
+                r_api * api_family_avail,
+                r_manifest * permission_avail,
+                r_manifest * component_avail,
+                risk_rel * risk_avail,
+                r_api * string_hint_avail,
+                global_rel,
+            ],
             dim=-1,
         ).clamp(0.0, 1.0)
         tokens = torch.stack(
