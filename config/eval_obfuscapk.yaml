@@ -5,24 +5,32 @@ scenarios:
   rebuild:
     pt_dir: D:/pts_obfuscapk/rebuild
     csv: results/labels_obfuscapk/rebuild.csv
+    strict_integrity: false
   rename:
     pt_dir: D:/pts_obfuscapk/rename
     csv: results/labels_obfuscapk/rename.csv
+    strict_integrity: false
   string_encrypt:
     pt_dir: D:/pts_obfuscapk/string_encrypt
     csv: results/labels_obfuscapk/string_encrypt.csv
+    strict_integrity: false
   reflection:
     pt_dir: D:/pts_obfuscapk/reflection
     csv: results/labels_obfuscapk/reflection.csv
+    strict_integrity: false
   call_indirection:
     pt_dir: D:/pts_obfuscapk/call_indirection
     csv: results/labels_obfuscapk/call_indirection.csv
+    strict_integrity: false
   control_flow:
     pt_dir: D:/pts_obfuscapk/control_flow
     csv: results/labels_obfuscapk/control_flow.csv
+    strict_integrity: false
   junk_code:
     pt_dir: D:/pts_obfuscapk/junk_code
     csv: results/labels_obfuscapk/junk_code.csv
+    strict_integrity: false
   manifest_noise:
     pt_dir: D:/pts_obfuscapk/manifest_noise
     csv: results/labels_obfuscapk/manifest_noise.csv
+    strict_integrity: false

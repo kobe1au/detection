@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
 from typing import Any
-
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,64 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 def _resolve(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _read_external_metadata(csv_path: Path) -> dict[str, dict[str, str]]:
+    """Read optional external-evaluation metadata keyed by obfuscated sample id.
+
+    The Obfuscapk label builder writes:
+      id, sha256, label, year, split, source_id, apk_name
+
+    Here:
+      id / sha256   = obfuscated APK hash / PT sid
+      source_id     = original clean APK hash
+    """
+    mapping: dict[str, dict[str, str]] = {}
+    if not csv_path.exists():
+        return mapping
+
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sample_id = str(row.get("id") or row.get("sha256") or "").strip().lower()
+            if not sample_id:
+                continue
+
+            source_id = str(row.get("source_id") or "").strip().lower()
+            apk_name = str(row.get("apk_name") or "").strip()
+            scenario = str(row.get("split") or "").strip()
+
+            mapping[sample_id] = {
+                "source_id": source_id,
+                "apk_name": apk_name,
+                "scenario": scenario,
+            }
+
+            sha256 = str(row.get("sha256") or "").strip().lower()
+            if sha256 and sha256 not in mapping:
+                mapping[sha256] = mapping[sample_id]
+
+    return mapping
+
+
+def _attach_external_metadata(
+    rows: list[dict[str, Any]],
+    metadata: dict[str, dict[str, str]],
+    scenario_name: str,
+) -> list[dict[str, Any]]:
+    """Attach source_id and scenario metadata to diagnostics rows."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        sid = str(item.get("sid") or "").strip().lower()
+        meta = metadata.get(sid, {})
+
+        item["source_id"] = meta.get("source_id", "")
+        item["apk_name"] = meta.get("apk_name", "")
+        item["scenario"] = meta.get("scenario") or str(scenario_name)
+
+        out.append(item)
+    return out
 
 
 def _first_pt(path: Path) -> Path:
@@ -70,15 +128,17 @@ def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
     model.load_state_dict(ckpt["model"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
+
     summary: dict[str, Any] = {}
     for name, item in scenarios.items():
         pt_dir = _resolve(item["pt_dir"])
         csv_path = _resolve(item["csv"])
+        strict_integrity = bool(item.get("strict_integrity", False))
         dataset = AEGDataset(
             pt_dir,
             csv_path,
             split=str(name),
-            strict_integrity=True,
+            strict_integrity=strict_integrity,
             validate_payload_on_load=False,
         )
         _validate_scenario(dataset, node_input_dim)
@@ -89,6 +149,10 @@ def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
             split_name=f"external_{name}",
             dump_rows=True,
         )
+
+        external_meta = _read_external_metadata(csv_path)
+        rows = _attach_external_metadata(rows, external_meta, str(name))
+
         summary[str(name)] = metrics
         _write_rows(output_dir / f"diagnostics_test_external_{name}.csv", rows)
     with (output_dir / "summary_external.json").open("w", encoding="utf-8") as f:

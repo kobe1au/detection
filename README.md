@@ -66,8 +66,8 @@ config/
     extract_aeg_val_test.yaml
     extract_aeg_train_only.yaml
     extract_aeg_behavior_hints.yaml
-    extract_obfuscapk.yaml
-
+    
+  extract_obfuscapk.yaml
   eval_obfuscapk.yaml
 
   experiments/aeg_robust/
