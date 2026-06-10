@@ -349,6 +349,11 @@ class AEGModel(nn.Module):
         component_avail = _masked_presence(component_nodes, data.batch, num_graphs, h)
         risk_avail = _masked_presence(risk_nodes, data.batch, num_graphs, h)
         string_hint_avail = _masked_presence(string_hint_nodes, data.batch, num_graphs, h)
+        code_avail = torch.maximum(
+            torch.maximum(method_avail, api_family_avail),
+            string_hint_avail,
+        )
+        manifest_avail = torch.maximum(permission_avail, component_avail)
 
         method_emb = _masked_mean(h, method_nodes, data.batch, num_graphs)
         api_family_emb = _masked_mean(h, api_family_nodes, data.batch, num_graphs)
@@ -384,30 +389,35 @@ class AEGModel(nn.Module):
         # q_align is a soft correspondence-quality cue, not proof that API and
         # graph semantics must agree. It therefore modulates rather than gates
         # the code-side reliability.
-        # code_rel = (
-        #     (r_api * r_graph).sqrt()
-        #     * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
-        # ).clamp(0.0, 1.0)
 
         product = r_api.clamp_min(0.0) * r_graph.clamp_min(0.0)
         code_rel_nonzero = (
             product.clamp_min(1e-12).sqrt()
             * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
         )
-        code_rel = torch.where(
+        raw_code_rel = torch.where(
             product > 0,
             code_rel_nonzero,
             torch.zeros_like(code_rel_nonzero),
         ).clamp(0.0, 1.0)
 
-        risk_rel = _masked_mean(node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
-        global_rel = torch.stack([code_rel, r_manifest], dim=-1).amax(dim=-1)
+        code_rel = (raw_code_rel * code_avail).clamp(0.0, 1.0)
+        manifest_rel = (r_manifest * manifest_avail).clamp(0.0, 1.0)
+
+        risk_rel = _masked_mean(
+            node_quality.float().view(-1, 1),
+            risk_nodes,
+            data.batch,
+            num_graphs,
+        ).view(-1)
+
+        global_rel = torch.stack([code_rel, manifest_rel], dim=-1).amax(dim=-1)
         token_rel = torch.stack(
             [
                 r_graph * method_avail,
                 r_api * api_family_avail,
-                r_manifest * permission_avail,
-                r_manifest * component_avail,
+                manifest_rel * permission_avail,
+                manifest_rel * component_avail,
                 risk_rel * risk_avail,
                 r_api * string_hint_avail,
                 global_rel,
@@ -477,7 +487,7 @@ class AEGModel(nn.Module):
             "r_graph": r_graph.detach(),
             "r_manifest": r_manifest.detach(),
             "code_reliability": code_rel.detach(),
-            "manifest_reliability": r_manifest.detach(),
+            "manifest_reliability": manifest_rel.detach(),
             "view_type_id": effective_view.detach(),
             "requested_view_type_id": requested_view.detach(),
             "effective_view_type_id": effective_view.detach(),

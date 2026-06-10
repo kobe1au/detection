@@ -19,7 +19,7 @@ from fusion.aeg_builder import _compress_method_feature, build_aeg_payload
 from fusion.constants import AEG_SCHEMA_VERSION, EDGE_TYPES, NODE_TYPES, VIEW_TYPES
 from fusion.dataset import AEGDataset, AEGDatasetConfigError, aeg_collate_fn, payload_to_data
 from fusion.io_utils import load_aeg_payload, load_checkpoint
-from fusion.losses import _fused_contrast_weight, _source_contrast_weights, compute_aeg_loss
+from fusion.losses import compute_aeg_loss
 from fusion.manifest_features import build_manifest_vocab, extract_manifest_record, vectorize_manifest_record
 from fusion.model import AEGModel, build_model
 from fusion.perturbations import apply_aeg_view
@@ -140,7 +140,9 @@ def test_aeg_builder_dataset_model_loss(tmp_path: Path):
 
     assert clean_logits.shape == (1, 2)
     assert torch.isfinite(loss)
-    assert parts["clean_degraded_contrast"] >= 0.0
+    assert parts["consistency"] >= 0.0
+    assert parts["weighted_consistency"] >= 0.0
+    assert parts["loss_mode"] == "compact_kl"
     assert "attention_mass" in clean_extra
 
 
@@ -486,24 +488,14 @@ def test_manifest_record_extracts_package_name(monkeypatch, tmp_path: Path):
     assert record["package_name"] == "com.example.app"
 
 
-def test_corrupted_source_contrast_weights_drop_untrusted_source():
-    ref = torch.zeros((2, 2))
-    clean = {
-        "code_reliability": torch.ones(2),
-        "manifest_reliability": torch.ones(2),
-    }
-    aug = {
-        "code_reliability": torch.ones(2),
-        "manifest_reliability": torch.ones(2),
-        "view_type_id": torch.full((2,), VIEW_TYPES["manifest_shuffled"], dtype=torch.long),
-    }
-    code_weight, manifest_weight, risk_weight = _source_contrast_weights(clean, aug, ref)
-    assert torch.all(code_weight == 1)
-    assert torch.all(manifest_weight == 0)
-    assert torch.all(risk_weight == 1)
+def _prepare_local_aeg_experiment_configs(tmp_path: Path) -> Path:
+    src = Path("config/experiments/aeg_robust")
+    dst = tmp_path / "aeg_robust"
+    shutil.copytree(src, dst)
+    return dst
 
 
-def test_loss_supports_unweighted_contrast_and_augmented_ce():
+def test_loss_modes_are_supported():
     payload = _payload()
     batch = Batch.from_data_list(
         [
@@ -513,47 +505,37 @@ def test_loss_supports_unweighted_contrast_and_augmented_ce():
     )
     model = AEGModel(node_input_dim=batch.x.size(1), hidden_dim=16, layers=1, num_latents=2)
     clean_logits, clean_extra = model(batch)
-    aug = Batch.from_data_list([apply_aeg_view(item, view="api_degraded", strength=0.5) for item in batch.to_data_list()])
-    aug_logits, aug_extra = model(aug)
-    loss, parts = compute_aeg_loss(
-        clean_logits,
-        batch.y.view(-1),
-        clean_extra,
-        aug_logits=aug_logits,
-        aug_extra=aug_extra,
-        loss_cfg={
-            "aug_ce_weight": 1.0,
-            "reliability_weighted_contrast": False,
-            "clean_degraded_contrast_weight": 0.1,
-            "source_degraded_contrast_weight": 0.1,
-            "cross_source_contrast_weight": 0.1,
-        },
+    aug = Batch.from_data_list(
+        [apply_aeg_view(item, view="api_degraded", strength=0.5) for item in batch.to_data_list()]
     )
-    assert torch.isfinite(loss)
-    assert parts["aug_ce"] >= 0.0
-    assert parts["aug_ce_weight"] == 1.0
-    assert parts["reliability_weighted_contrast"] == 0.0
+    aug_logits, aug_extra = model(aug)
+
+    for mode in ["ce_only", "plain_kl", "compact_kl"]:
+        loss, parts = compute_aeg_loss(
+            clean_logits,
+            batch.y.view(-1),
+            clean_extra,
+            aug_logits=aug_logits,
+            aug_extra=aug_extra,
+            loss_cfg={"mode": mode, "ce_weight": 1.0, "consistency_weight": 0.05},
+        )
+        assert torch.isfinite(loss)
+        assert parts["loss_mode"] == mode
 
 
-def test_fused_contrast_weight_drops_when_all_sources_are_unreliable():
-    ref = torch.zeros((2, 2))
-    clean = {
-        "code_reliability": torch.ones(2),
-        "manifest_reliability": torch.ones(2),
-    }
-    aug = {
-        "code_reliability": torch.tensor([0.0, 0.2]),
-        "manifest_reliability": torch.tensor([0.0, 0.3]),
-    }
-    weight = _fused_contrast_weight(clean, aug, ref)
-    assert torch.allclose(weight, torch.tensor([0.0, 0.3]))
+def test_kl_modes_require_augmented_view():
+    payload = _payload()
+    batch = Batch.from_data_list([payload_to_data(payload, label=1)])
+    model = AEGModel(node_input_dim=batch.x.size(1), hidden_dim=16, layers=1, num_latents=2)
+    clean_logits, clean_extra = model(batch)
 
-
-def _prepare_local_aeg_experiment_configs(tmp_path: Path) -> Path:
-    src = Path("config/experiments/aeg_robust")
-    dst = tmp_path / "aeg_robust"
-    shutil.copytree(src, dst)
-    return dst
+    with pytest.raises(ValueError, match="requires augmented logits"):
+        compute_aeg_loss(
+            clean_logits,
+            batch.y.view(-1),
+            clean_extra,
+            loss_cfg={"mode": "compact_kl"},
+        )
 
 
 def test_aeg_config_loads(tmp_path: Path):
