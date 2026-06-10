@@ -153,6 +153,12 @@ def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
         external_meta = _read_external_metadata(csv_path)
         rows = _attach_external_metadata(rows, external_meta, str(name))
 
+        num_rows = len(rows)
+        num_with_source_id = sum(1 for row in rows if str(row.get("source_id") or "").strip())
+        metrics["num_rows"] = num_rows
+        metrics["num_with_source_id"] = num_with_source_id
+        metrics["source_id_match_rate"] = num_with_source_id / num_rows if num_rows else 0.0
+
         summary[str(name)] = metrics
         _write_rows(output_dir / f"diagnostics_test_external_{name}.csv", rows)
     with (output_dir / "summary_external.json").open("w", encoding="utf-8") as f:

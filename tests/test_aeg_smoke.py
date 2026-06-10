@@ -697,6 +697,60 @@ def test_obfuscapk_extract_config_loads():
     assert cfg["manifest"]["rebuild_vocab"] is False
 
 
+def test_summarize_obfuscapk_pairs(tmp_path):
+    clean = tmp_path / "diagnostics_test_clean.csv"
+    external_dir = tmp_path / "external"
+    output_dir = tmp_path / "pairs"
+    external_dir.mkdir()
+
+    src = "a" * 64
+    obf = "b" * 64
+
+    clean.write_text(
+        "sid,label,pred,prob_malware\n"
+        f"{src},1,1,0.90\n",
+        encoding="utf-8",
+    )
+
+    (external_dir / "diagnostics_test_external_rebuild.csv").write_text(
+        "sid,source_id,label,pred,prob_malware,scenario,apk_name\n"
+        f"{obf},{src},1,0,0.40,rebuild,sample.apk\n",
+        encoding="utf-8",
+    )
+
+    from scripts.summarize_obfuscapk_pairs import run
+
+    run(clean, external_dir, output_dir)
+
+    summary = (output_dir / "summary_pairs.csv").read_text(encoding="utf-8")
+    assert "rebuild" in summary
+    assert "flip_rate" in summary
+    assert "1.0" in summary
+
+
+def test_external_metadata_mapping_reads_source_id(tmp_path):
+    csv_path = tmp_path / "external.csv"
+    obf = "b" * 64
+    src = "a" * 64
+    csv_path.write_text(
+        "id,sha256,label,year,split,source_id,apk_name\n"
+        f"{obf},{obf},1,2024,rebuild,{src},sample.apk\n",
+        encoding="utf-8",
+    )
+
+    from scripts.evaluate_aeg_checkpoint import _read_external_metadata, _attach_external_metadata
+
+    meta = _read_external_metadata(csv_path)
+    assert meta[obf]["source_id"] == src
+    assert meta[obf]["scenario"] == "rebuild"
+    assert meta[obf]["apk_name"] == "sample.apk"
+
+    rows = [{"sid": obf, "label": 1, "pred": 1}]
+    rows = _attach_external_metadata(rows, meta, "rebuild")
+    assert rows[0]["source_id"] == src
+    assert rows[0]["scenario"] == "rebuild"
+
+
 def test_extract_behavior_hint_config_is_explicit_ablation():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 

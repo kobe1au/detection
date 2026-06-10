@@ -222,7 +222,6 @@ data:
   train:
     pt_dir: D:/pts_aeg/train
     csv: results/labels/train.csv
-
   val:
     pt_dir: D:/pts_aeg/val
     csv: results/labels/val.csv
@@ -666,6 +665,7 @@ scenarios:
   rebuild:
     pt_dir: D:/pts_obfuscapk/rebuild
     csv: results/labels_obfuscapk/rebuild.csv
+    strict_integrity: false
   rename:
     pt_dir: D:/pts_obfuscapk/rename
     csv: results/labels_obfuscapk/rename.csv
