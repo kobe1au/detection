@@ -1,7 +1,0 @@
-metric,value
-label_rows,10336
-apk_files,10336
-missing_label_ids,0
-extra_filename_ids,0
-status:ok,10334
-status:sha256_mismatch,2
