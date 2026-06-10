@@ -1,98 +1,104 @@
 # Source-Aware APK Evidence Graph Malware Detection
 
-This repository implements a robust Android malware detection pipeline based on **source-aware APK evidence graphs** and **reliability-aware multi-view KL consistency learning**.
+本项目实现了一个面向 Android 恶意软件检测的鲁棒性检测框架，核心方法基于 **源感知 APK 异构证据图** 与 **可靠性感知多视图 KL 一致性学习**。
 
-The current active mainline is **not contrastive learning**. The current objective is:
-
-```text
-Cross-entropy classification
-+ optional clean/degraded-view KL consistency
-+ reliability-aware consistency weighting
-```
-
-Supported loss modes:
+当前主线已经不再是 contrastive learning / InfoNCE。当前训练目标是：
 
 ```text
-ce_only      CE only
-plain_kl     CE + unweighted clean/degraded KL consistency
-compact_kl   CE + reliability-aware clean/degraded KL consistency
+交叉熵分类损失
++ 可选的 clean / degraded 视图 KL 一致性约束
++ 可靠性感知的一致性权重
 ```
 
-## Main Contributions
-
-This project is organized around three main ideas.
-
-1. **Source-aware APK heterogeneous evidence graph modeling**
-
-   APK evidence is represented as a typed heterogeneous graph. The graph integrates code evidence, Manifest declaration evidence, derived risk semantics, string/static hints, and cross-source alignment evidence.
-
-2. **Reliability-aware multi-view KL consistency learning**
-
-   The model is trained with clean and degraded graph views. Instead of using InfoNCE or batch-wise contrastive learning, the current method uses KL consistency between clean and perturbed predictions. The consistency strength is adjusted according to view type, counterfactual weight, and observable code/Manifest reliability.
-
-3. **Counterfactual reliability-aware latent fusion with Manifest shortcut suppression**
-
-   The model fuses method, API-family, permission, component, risk, string-hint, and global graph tokens. Fusion is guided by reliability, source information, and code-Manifest conflict so that Manifest evidence is not treated as an unconditional shortcut under corrupted or shuffled Manifest scenarios.
-
-## Repository Layout
+当前支持的 loss 模式为：
 
 ```text
-extract/
-  extract_graph_api.py              Reusable DEX/API/call-graph extractor
-
-fusion/
-  aeg_builder.py                    Builds versioned APK evidence graph payloads
-  config_utils.py                   YAML config loader with base inheritance
-  constants.py                      Node, edge, source, and view definitions
-  dataset.py                        AEG Dataset, augmentation, and PyG collation
-  io_utils.py                       Safe AEG payload and checkpoint loading
-  losses.py                         CE + plain/reliability-weighted KL consistency
-  manifest_features.py              Manifest parsing, vocabulary, and vectorization
-  model.py                          Typed graph encoder + reliability-aware latent fusion
-  perturbations.py                  Clean/degraded graph-view perturbations
-  train.py                          Training, validation, robust evaluation, diagnostics
-
-scripts/
-  build_aeg_pts_direct.py           APK -> AEG .pt builder
-  build_obfuscapk_label_csvs.py     Build labels for external Obfuscapk evaluation
-  evaluate_aeg_checkpoint.py        Evaluate a trained checkpoint on external PT scenarios
-  validate_aeg_pts.py               PT/schema/contract validator
-  summarize_aeg_diagnostics.py      Diagnostics summarization
-
-config/
-  extract/
-    extract_aeg.yaml
-    extract_aeg_vocab_train_only.yaml
-    extract_aeg_val_test.yaml
-    extract_aeg_train_only.yaml
-    extract_aeg_behavior_hints.yaml
-    
-  extract_obfuscapk.yaml
-  eval_obfuscapk.yaml
-
-  experiments/aeg_robust/
-    base.yaml                       Shared experiment template
-    main/                           Full method, including seed42/43/44 configs
-    loss/                           CE-only / Plain-KL / Compact-KL experiments
-    r1_graph/                       Graph/source/evidence ablations
-    r3_fusion/                      Reliability/fusion ablations
-
-tests/
-  test_aeg_smoke.py                 Smoke tests for payloads, model, losses, configs
+ce_only      仅使用交叉熵分类损失
+plain_kl     交叉熵 + 普通 clean/degraded KL 一致性
+compact_kl   交叉熵 + 可靠性感知 clean/degraded KL 一致性
 ```
 
-## Active Mainline
+---
 
-The active mainline is:
+## 1. 方法概述
+
+本项目围绕三个核心设计展开。
+
+### 1.1 源感知 APK 异构证据图建模
+
+APK 被建模为一个带有节点类型、边类型、证据源和质量信息的异构证据图。
+
+图中融合的证据包括：
+
+```text
+代码侧证据
+Manifest 声明证据
+派生风险语义节点
+字符串 / 静态 hint 证据
+代码与 Manifest 之间的对齐证据
+```
+
+该设计用于替代只依赖单一 API 序列、单一权限特征或单一 Manifest 特征的传统检测方式。
+
+### 1.2 可靠性感知多视图 KL 一致性学习
+
+模型在 clean graph view 和 degraded graph view 之间施加预测一致性约束。
+
+当前方法不使用 InfoNCE，也不依赖 batch 内负样本，而是使用 KL consistency。
+
+其中：
+
+```text
+plain_kl   使用普通 clean/degraded KL 一致性
+compact_kl 根据 API / graph / Manifest 可靠性与扰动类型调整一致性权重
+```
+
+这样可以避免 batch size 过小导致 contrastive loss 不稳定的问题，也更贴合论文中的“可靠性感知一致性学习”主线。
+
+### 1.3 可靠性与冲突感知的 latent fusion
+
+模型会把多类证据编码成 latent tokens，例如：
+
+```text
+method token
+API-family token
+permission token
+component token
+risk token
+string-hint token
+global token
+```
+
+融合时会考虑：
+
+```text
+代码侧可靠性
+Manifest 侧可靠性
+证据源 bias
+代码-Manifest 冲突
+不同证据 token 的 availability
+```
+
+目标是降低模型对 Manifest shortcut 的过度依赖，使模型在 Manifest 被污染、打乱、缺失或隐藏污染标记时仍然保持较好鲁棒性。
+
+---
+
+## 2. 当前主线状态
+
+当前有效主线为：
 
 ```text
 Source-aware AEG
 + reliability-aware latent fusion
 + CE / Plain-KL / Compact-KL objectives
-+ robust validation and diagnostics
++ robust validation
++ synthetic robust evaluation
++ Obfuscapk external evaluation
 ```
 
-The old contrastive-learning objective is no longer active. Avoid using or reintroducing experiment names based on:
+旧的 contrastive 主线已经不再使用。
+
+不要再把当前方法描述为：
 
 ```text
 InfoNCE
@@ -103,18 +109,71 @@ cross-source contrast
 counterfactual contrastive loss
 ```
 
-Use the current terminology instead:
+应统一描述为：
 
 ```text
-multi-view KL consistency
-reliability-aware consistency weighting
+多视图 KL 一致性学习
+可靠性感知一致性权重
 Manifest shortcut suppression
-source-aware evidence graph modeling
+源感知异构证据图建模
+真实混淆外部泛化评估
 ```
 
-## Build AEG PT Files
+---
 
-Build or rebuild the Manifest vocabulary from the train split only:
+## 3. 仓库结构
+
+```text
+extract/
+  extract_graph_api.py                  DEX / API / 调用图提取逻辑
+
+fusion/
+  aeg_builder.py                        构建 APK Evidence Graph payload
+  config_utils.py                       YAML 配置加载与 base 继承
+  constants.py                          节点类型、边类型、证据源、视图定义
+  dataset.py                            AEG Dataset、增强、PyG batch collate
+  io_utils.py                           安全加载 AEG payload 和 checkpoint
+  losses.py                             CE + Plain-KL / Compact-KL 一致性损失
+  manifest_features.py                  Manifest 解析、词表、向量化
+  model.py                              类型图编码器 + 可靠性感知 latent fusion
+  perturbations.py                      clean/degraded graph view 扰动逻辑
+  train.py                              训练、验证、鲁棒评估、diagnostics 输出
+
+scripts/
+  build_aeg_pts_direct.py               APK -> AEG .pt 构建脚本
+  build_obfuscapk_label_csvs.py         构建 Obfuscapk 外部评估标签 CSV
+  evaluate_aeg_checkpoint.py            使用已训练 checkpoint 评估外部 PT 场景
+  summarize_obfuscapk_pairs.py          clean-vs-obfuscated 配对 flip-rate 统计
+  validate_aeg_pts.py                   PT/schema/contract 校验
+  summarize_aeg_diagnostics.py          diagnostics 汇总
+
+config/
+  extract/
+    extract_aeg.yaml
+    extract_aeg_vocab_train_only.yaml
+    extract_aeg_val_test.yaml
+    extract_aeg_train_only.yaml
+    extract_aeg_behavior_hints.yaml
+
+  extract_obfuscapk.yaml
+  eval_obfuscapk.yaml
+
+  experiments/aeg_robust/
+    base.yaml                           共享实验模板
+    main/                               full compact-KL 主方法 seed42/43/44
+    loss/                               CE-only / Plain-KL / Compact-KL 消融
+    r1_graph/                           图结构 / 证据源 / 质量信息消融
+    r3_fusion/                          可靠性 / 冲突感知 fusion 消融
+
+tests/
+  test_aeg_smoke.py                     payload / model / loss / config / runner smoke tests
+```
+
+---
+
+## 4. 构建 AEG PT 数据
+
+### 4.1 使用 train split 重建 Manifest 词表并构建 PT
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
@@ -124,7 +183,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-Resume later without rebuilding the vocabulary:
+### 4.2 断点续跑，不重建词表
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
@@ -134,7 +193,9 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-If disk space cannot hold train PT files yet, build only the train-derived Manifest vocabulary first:
+### 4.3 只构建 train-derived Manifest 词表
+
+如果磁盘空间或时间不够，可以先只构建词表：
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
@@ -144,7 +205,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-Then generate validation and test PT files with the frozen train vocabulary:
+### 4.4 使用冻结词表构建 val/test
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
@@ -154,7 +215,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-Generate train PT files later without rebuilding the frozen Manifest vocabulary:
+### 4.5 后续单独构建 train PT
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
@@ -164,7 +225,11 @@ python scripts/build_aeg_pts_direct.py \
   --workers 8
 ```
 
-Validate generated PT files before training:
+---
+
+## 5. 校验 AEG PT
+
+训练前建议先抽样校验 PT：
 
 ```bash
 python scripts/validate_aeg_pts.py \
@@ -172,56 +237,44 @@ python scripts/validate_aeg_pts.py \
   --sample-per-split 100
 ```
 
-Use `--all` for a full validation pass.
+完整校验：
 
-The validator checks:
-
-```text
-CSV/PT id consistency
-node feature dimensions
-schema versions
-payload contract versions
-required tensor fields
-split isolation
-package-name isolation when enabled
+```bash
+python scripts/validate_aeg_pts.py \
+  --config config/extract/extract_aeg.yaml \
+  --all
 ```
 
-## Data Integrity and Trust Boundaries
-
-Training uses strict CSV/PT integrity by default.
-
-The training pipeline rejects:
+校验内容包括：
 
 ```text
-CSV ids without corresponding AEG .pt files
-extra PT samples not listed in the split CSV
-sample id overlap across train/val/test
-package_name overlap across train/val/test when enabled
-schema version mismatch
-payload contract mismatch
-invalid tensor shapes
-missing required fields
+CSV/PT id 是否一致
+节点特征维度是否合法
+schema version 是否匹配
+payload contract 是否匹配
+必要 tensor 字段是否存在
+train/val/test 是否存在样本泄漏
+package_name 是否跨 split 重复
 ```
 
-AEG payload loading uses `load_aeg_payload()` in fail-closed mode. It first tries safe tensor loading and validates the payload contract after deserialization.
+---
 
-This validation is not a substitute for artifact provenance. For untrusted PT files, verify external checksums or signatures before loading.
+## 6. 实验配置
 
-## Experiment Configuration
-
-The shared experiment template is:
+共享实验模板为：
 
 ```text
 config/experiments/aeg_robust/base.yaml
 ```
 
-Before training, edit the data paths in `base.yaml` or use your own copied configuration so that these paths point to generated AEG PT files and label CSV files:
+需要先修改其中的数据路径，例如：
 
 ```yaml
 data:
   train:
     pt_dir: D:/pts_aeg/train
     csv: results/labels/train.csv
+
   val:
     pt_dir: D:/pts_aeg/val
     csv: results/labels/val.csv
@@ -231,7 +284,7 @@ data:
     csv: results/labels/test.csv
 ```
 
-The default training loss in `base.yaml` should use the full method:
+当前推荐的主方法 loss：
 
 ```yaml
 loss:
@@ -241,14 +294,14 @@ loss:
   aug_ce_weight: 0.0
 ```
 
-For `plain_kl` and `compact_kl`, training augmentation must be enabled:
+对于 `plain_kl` 和 `compact_kl`，训练增强必须开启：
 
 ```yaml
 robust:
   train_aug: true
 ```
 
-For `ce_only`, augmentation can be disabled to avoid an unnecessary second forward pass:
+对于 `ce_only`，可以关闭增强，避免多跑一次 forward：
 
 ```yaml
 robust:
@@ -258,7 +311,7 @@ loss:
   mode: ce_only
 ```
 
-Recommended explicit model block for reproducibility:
+推荐显式保留 model block，以保证论文复现性：
 
 ```yaml
 model:
@@ -283,22 +336,24 @@ model:
   allow_node_dim_adapt: false
 ```
 
-## Train the Full Method
+---
 
-Run the default full method with seed 42:
+## 7. 训练主方法
+
+### 7.1 训练 seed42 主方法
 
 ```bash
 python -m fusion.train \
   --config config/experiments/aeg_robust/main/full_compact_kl_seed42.yaml
 ```
 
-Run through the experiment runner:
+### 7.2 使用 runner 训练主方法
 
 ```bash
 python run.py final
 ```
 
-Equivalent aliases:
+等价 alias：
 
 ```bash
 python run.py ours
@@ -306,15 +361,17 @@ python run.py full
 python run.py compact
 ```
 
-## Experiment Runner
+---
 
-`run.py` resolves experiment aliases and groups under:
+## 8. 实验 runner
+
+`run.py` 会在以下目录下解析实验配置：
 
 ```text
 config/experiments/aeg_robust/
 ```
 
-Useful single targets:
+可用单实验入口：
 
 ```bash
 python run.py final
@@ -323,7 +380,7 @@ python run.py plain_kl
 python run.py compact_kl
 ```
 
-Useful groups:
+可用实验组：
 
 ```bash
 python run.py main
@@ -334,55 +391,48 @@ python run.py r3_fusion
 python run.py all
 ```
 
-Preview resolved configs without training:
+dry-run 查看将要运行的配置：
 
 ```bash
 python run.py all --dry-run
 ```
 
-Expected active groups:
+当前实验组语义：
 
 ```text
-main        Full compact-KL method, seed42
-full_seeds  Full compact-KL method, seed42/43/44
-loss        CE-only, Plain-KL, Compact-KL, and consistency-weight variants
-r1_graph    Graph/source/evidence ablations
-r3_fusion   Reliability and fusion ablations
-all         Main + loss + graph + fusion experiment set
+main        full compact-KL seed42
+full_seeds  full compact-KL seed42/43/44
+loss        CE-only / Plain-KL / Compact-KL / consistency weight sweep
+r1_graph    图结构、证据源、节点/边质量、对齐边、风险节点消融
+r3_fusion   可靠性 bias、冲突 bias、mean fusion 消融
+all         full seeds + loss + graph ablation + fusion ablation
 ```
 
-The old `i1/i2/i3` and contrastive-loss experiment names are no longer part of the active mainline.
+旧的 `i1/i2/i3`、`full/ours.yaml`、`multiview_contrast.yaml` 不再是当前实验入口。
 
-## Core Experiments
+---
 
-### 1. Main Method
+## 9. 核心实验设计
+
+### 9.1 主方法实验
 
 ```bash
 python run.py final
 ```
 
-Primary config:
+主配置：
 
 ```text
 config/experiments/aeg_robust/main/full_compact_kl_seed42.yaml
 ```
 
-Full method:
-
-```text
-Source-aware AEG encoder
-Reliability-aware latent fusion
-Reliability-weighted clean/degraded KL consistency
-Robust validation checkpoint selection
-```
-
-For three-seed reporting:
+三随机种子实验：
 
 ```bash
 python run.py full_seeds
 ```
 
-Expected configs:
+对应配置：
 
 ```text
 config/experiments/aeg_robust/main/full_compact_kl_seed42.yaml
@@ -390,41 +440,37 @@ config/experiments/aeg_robust/main/full_compact_kl_seed43.yaml
 config/experiments/aeg_robust/main/full_compact_kl_seed44.yaml
 ```
 
-### 2. Loss Ablation
+### 9.2 Loss 消融
 
 ```bash
 python run.py loss
 ```
 
-This group compares:
+比较：
 
 ```text
 CE-only
-Plain KL consistency
-Reliability-weighted KL consistency
-Compact-KL with weaker consistency weight
-Compact-KL with stronger consistency weight
+Plain-KL
+Compact-KL
+Compact-KL w=0.02
+Compact-KL w=0.10
 ```
 
-Expected interpretation:
+核心结论应证明：
 
 ```text
-CE-only      Tests the classifier without multi-view consistency
-Plain-KL     Tests whether clean/degraded consistency helps
-Compact-KL   Tests whether reliability-aware weighting improves robustness
+Plain-KL 相比 CE-only 提升鲁棒性；
+Compact-KL 相比 Plain-KL 在退化视图下更稳定；
+过强或过弱 consistency weight 都可能影响性能。
 ```
 
-The key thesis claim should be supported by robust-view metrics, especially under API/graph degradation, Manifest corruption, missing evidence, and all-degraded views.
-
-### 3. Source-Aware Graph Ablation
+### 9.3 图结构与证据源消融
 
 ```bash
 python run.py r1_graph
 ```
 
-This group tests the contribution of typed/source/quality-aware graph modeling.
-
-Typical ablations:
+包括：
 
 ```text
 code_only
@@ -436,9 +482,9 @@ no_alignment
 no_risk_nodes
 ```
 
-The strict single-source baselines use `masked_node_types`.
+严格单源实验使用 `masked_node_types`。
 
-For example, `code_only` masks Manifest-side and derived risk nodes:
+`code_only` 通常 mask：
 
 ```yaml
 model:
@@ -449,7 +495,7 @@ model:
     - RISK_SEMANTIC
 ```
 
-`manifest_only` masks code-side and derived risk nodes:
+`manifest_only` 通常 mask：
 
 ```yaml
 model:
@@ -460,17 +506,15 @@ model:
     - RISK_SEMANTIC
 ```
 
-`no_risk_nodes` separately tests the contribution of derived risk semantic nodes.
+`no_risk_nodes` 单独验证派生风险语义节点的贡献。
 
-### 4. Fusion and Shortcut-Suppression Ablation
+### 9.4 Fusion 消融
 
 ```bash
 python run.py r3_fusion
 ```
 
-This group tests the contribution of reliability-aware and conflict-aware latent fusion.
-
-Typical ablations:
+包括：
 
 ```text
 no_reliability_bias
@@ -478,7 +522,7 @@ no_conflict_bias
 mean_fusion
 ```
 
-The most important robust views for this group are:
+重点观察：
 
 ```text
 manifest_noisy
@@ -488,13 +532,13 @@ manifest_shuffled_blind
 manifest_missing
 ```
 
-The goal is to show that the full fusion mechanism is more stable when Manifest evidence is corrupted, shuffled, or missing.
+目标是证明可靠性与冲突感知 fusion 可以降低 Manifest shortcut 依赖。
 
-## Robust Evaluation
+---
 
-Robust evaluation is enabled by default in the experiment template.
+## 10. 内部鲁棒评估
 
-Default robust views include:
+默认 robust views 包括：
 
 ```text
 api_degraded
@@ -510,26 +554,26 @@ manifest_missing
 all_degraded
 ```
 
-Recommended reported metrics:
+建议报告指标：
 
 ```text
 Clean Macro-F1
 Robust Macro-F1 per view
 Robust average Macro-F1
 AUC
-Average precision
+Average Precision
 ECE
-Brier score
-Robustness drop / degradation rate
+Brier Score
+Robustness Drop
 ```
 
-The default checkpoint metric is `robust_composite`, which combines clean validation performance and representative robust validation views.
+checkpoint 选择建议使用 `robust_composite`，即 clean validation 与代表性 robust validation 的综合指标。
 
-Test and robust-test metrics are computed only after the best checkpoint is selected.
+---
 
-## Outputs
+## 11. 训练输出
 
-Each training run writes:
+每次训练通常输出：
 
 ```text
 best.pt
@@ -541,46 +585,28 @@ diagnostics_test_clean.csv
 diagnostics_test_<view>_<strength>.csv
 ```
 
-`summary.json` contains compact final metrics.
-
-`history.csv` contains per-epoch training and validation metrics.
-
-`experiment_metadata.json` is written at run start and updated on success or failure. It records:
+其中：
 
 ```text
-resolved config path
-output directory
-seed
-runtime environment
-git commit/branch/dirty status
-dataset statistics
-schema and payload contract versions
-best epoch
-best score
-result files
-final validation/test/robust-test metrics
+summary.json               最终指标摘要
+history.csv                每个 epoch 的训练和验证记录
+experiment_metadata.json   实验配置、环境、git 信息、数据集统计、best epoch、最终结果
+diagnostics_*.csv          样本级预测、可靠性、attention、扰动信息
 ```
 
-## Diagnostics
-
-Diagnostics include:
+diagnostics 中建议重点分析：
 
 ```text
-prediction
-malware probability
-clean/perturbed view ids
-requested/effective robust view names
-reliability scalars
-code-Manifest similarity
-code-Manifest conflict
-latent attention mass over evidence tokens
-Manifest shuffle fallback status
-Manifest donor sid when available
-```
-
-The latent attention columns include:
-
-```text
+sid
+label
+pred
+prob_malware
+q_api
+q_graph
+q_manifest
+code_reliability
+manifest_reliability
+code_manifest_conflict
 attn_method
 attn_api_family
 attn_permission
@@ -590,9 +616,9 @@ attn_string_hint
 attn_global
 ```
 
-These diagnostics are intended to support analysis of Manifest shortcut suppression and source-aware evidence usage.
+---
 
-Summarize diagnostics after a run:
+## 12. diagnostics 汇总
 
 ```bash
 python scripts/summarize_aeg_diagnostics.py \
@@ -600,21 +626,27 @@ python scripts/summarize_aeg_diagnostics.py \
   --min-count 20
 ```
 
-## External Obfuscapk Evaluation
+该脚本用于分析不同 robust view 下的可靠性、attention 分布和退化影响。
 
-Internal robust views are useful for controlled mechanism evaluation, but they are still synthetic. For external robustness, use an Obfuscapk-style benchmark as a held-out evaluation set.
+---
 
-Recommended design:
+## 13. Obfuscapk 外部真实混淆评估
+
+内部 robust views 是 synthetic perturbations，适合机制验证，但仍属于内部模拟。
+
+为了增强论文可信度，建议额外使用 Obfuscapk 风格的真实混淆外部评估。
+
+实验定位：
 
 ```text
-Do not train on Obfuscapk samples
-Do not tune hyperparameters on Obfuscapk samples
-Use Obfuscapk only for final external robustness evaluation
-Use the frozen train Manifest vocabulary
-Report obfuscation success rate and extraction success rate
+不参与训练
+不参与调参
+只用于最终 external robustness evaluation
+使用 train split 冻结的 Manifest vocab
+报告混淆成功率、构图成功率、配对成功率
 ```
 
-### Step 1: Build Obfuscapk label CSVs
+### 13.1 构建 Obfuscapk label CSV
 
 ```bash
 python scripts/build_obfuscapk_label_csvs.py \
@@ -623,9 +655,7 @@ python scripts/build_obfuscapk_label_csvs.py \
   --output-dir results/labels_obfuscapk
 ```
 
-The expected label CSVs should map obfuscated APKs back to their clean labels.
-
-Recommended columns:
+当前 label CSV 推荐字段：
 
 ```text
 id
@@ -637,9 +667,18 @@ source_id
 apk_name
 ```
 
-### Step 2: Build AEG PT files for Obfuscapk scenarios
+其中：
 
-Use the frozen train vocabulary. Do not rebuild the Manifest vocabulary from Obfuscapk data.
+```text
+id / sha256   混淆后 APK hash
+source_id     原始 clean APK hash
+split         Obfuscapk scenario 名称
+apk_name      混淆后 APK 文件名
+```
+
+### 13.2 构建 Obfuscapk AEG PT
+
+使用冻结 train vocab，不要从 Obfuscapk 数据重建 vocab。
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
@@ -649,7 +688,7 @@ python scripts/build_aeg_pts_direct.py \
   --workers 4
 ```
 
-### Step 3: Evaluate a trained checkpoint
+### 13.3 评估已训练 checkpoint
 
 ```bash
 python scripts/evaluate_aeg_checkpoint.py \
@@ -658,7 +697,7 @@ python scripts/evaluate_aeg_checkpoint.py \
   --output-dir results/aeg_robust/main/full_compact_kl_seed42/external
 ```
 
-`config/eval_obfuscapk.yaml` should contain a `scenarios` mapping, for example:
+`config/eval_obfuscapk.yaml` 示例：
 
 ```yaml
 scenarios:
@@ -666,65 +705,209 @@ scenarios:
     pt_dir: D:/pts_obfuscapk/rebuild
     csv: results/labels_obfuscapk/rebuild.csv
     strict_integrity: false
+
   rename:
     pt_dir: D:/pts_obfuscapk/rename
     csv: results/labels_obfuscapk/rename.csv
+    strict_integrity: false
+
   string_encrypt:
     pt_dir: D:/pts_obfuscapk/string_encrypt
     csv: results/labels_obfuscapk/string_encrypt.csv
+    strict_integrity: false
+
   reflection:
     pt_dir: D:/pts_obfuscapk/reflection
     csv: results/labels_obfuscapk/reflection.csv
+    strict_integrity: false
+
   call_indirection:
     pt_dir: D:/pts_obfuscapk/call_indirection
     csv: results/labels_obfuscapk/call_indirection.csv
+    strict_integrity: false
+
   control_flow:
     pt_dir: D:/pts_obfuscapk/control_flow
     csv: results/labels_obfuscapk/control_flow.csv
+    strict_integrity: false
+
   junk_code:
     pt_dir: D:/pts_obfuscapk/junk_code
     csv: results/labels_obfuscapk/junk_code.csv
+    strict_integrity: false
+
   manifest_noise:
     pt_dir: D:/pts_obfuscapk/manifest_noise
     csv: results/labels_obfuscapk/manifest_noise.csv
+    strict_integrity: false
 ```
 
-### Recommended Obfuscapk Report
-
-Report:
+`strict_integrity: false` 用于外部真实测试场景，因为 Obfuscapk 可能存在：
 
 ```text
-number of attempted APKs
-number of successfully obfuscated APKs
-number of successfully converted AEG PTs
-benign/malware counts
-per-scenario sample counts
-clean test Macro-F1
-obfuscated test Macro-F1
-absolute F1 drop
-relative F1 drop
+混淆成功但标签无法映射
+标签存在但 PT 构建失败
+PT 存在但不在 CSV 中
+```
+
+外部评估阶段通常只评估“有标签且成功构图”的交集样本。
+
+---
+
+## 14. Obfuscapk clean-vs-obfuscated 配对统计
+
+在 external evaluation 后，使用配对统计脚本：
+
+```bash
+python scripts/summarize_obfuscapk_pairs.py \
+  --clean results/aeg_robust/main/full_compact_kl_seed42/diagnostics_test_clean.csv \
+  --external-dir results/aeg_robust/main/full_compact_kl_seed42/external \
+  --output-dir results/aeg_robust/main/full_compact_kl_seed42/external_pairs
+```
+
+该脚本按如下规则配对：
+
+```text
+clean diagnostics:
+  sid = 原始 clean APK hash
+
+external diagnostics:
+  sid       = 混淆后 APK hash
+  source_id = 原始 clean APK hash
+
+join key:
+  clean.sid == external.source_id
+```
+
+输出目录：
+
+```text
+external_pairs/
+  paired_rebuild.csv
+  paired_rename.csv
+  paired_string_encrypt.csv
+  paired_reflection.csv
+  paired_call_indirection.csv
+  paired_control_flow.csv
+  paired_junk_code.csv
+  paired_manifest_noise.csv
+  paired_all.csv
+  summary_pairs.csv
+  summary_pairs.json
+```
+
+建议报告指标：
+
+```text
+external_rows
+rows_with_source_id
+paired_count
+source_id_rate
+pair_rate
+flip_rate
+clean_acc_on_paired
+obf_acc_on_paired
+acc_drop_on_paired
+mean_prob_abs_delta
+mean_true_confidence_drop
+```
+
+其中：
+
+```text
+flip_rate = clean 预测类别 != obfuscated 预测类别 的比例
+
+true_confidence_drop =
+  clean view 中真实类别置信度
+  -
+  obfuscated view 中真实类别置信度
+```
+
+### 14.1 P1：label mismatch 检查
+
+为了保证 paired evaluation 的标签映射没有污染，配对脚本应检查：
+
+```text
+clean diagnostics 中的 label
+是否等于
+external diagnostics 中的 label
+```
+
+也就是：
+
+```python
+label_mismatch = int(clean_label != label)
+```
+
+并在 summary 中统计：
+
+```text
+label_mismatch_count
+label_mismatch_rate
+```
+
+如果：
+
+```text
+label_mismatch_rate > 0
+```
+
+说明 `source_id` 映射或 label CSV 生成可能存在问题，这批 Obfuscapk paired 结果不应直接用于论文报告。应先修复 mapping，再重新生成 external diagnostics 和 paired summary。
+
+建议论文使用结果前确认：
+
+```text
+source_id_rate 接近 1.0
+pair_rate 足够高
+label_mismatch_rate = 0
+```
+
+如果当前脚本尚未输出 `label_mismatch_count / label_mismatch_rate`，应先补齐该检查，再用于最终论文表格。
+
+---
+
+## 15. Obfuscapk 论文报告建议
+
+建议至少报告：
+
+```text
+尝试混淆 APK 数量
+成功混淆 APK 数量
+成功构建 AEG PT 数量
+进入 paired evaluation 的样本数量
+benign/malware 数量
+不同 scenario 的样本数量
+clean Macro-F1
+Obfuscapk Macro-F1
+F1 absolute drop
+F1 relative drop
 prediction flip rate
-ECE change
+true confidence drop
+label_mismatch_rate
 ```
 
-Suggested table:
+推荐表格：
+
+| Method     | Scenario | Paired Count | Flip Rate ↓ | Clean Acc | Obf Acc | Acc Drop ↓ | True Conf. Drop ↓ | Label Mismatch |
+| ---------- | -------: | -----------: | ----------: | --------: | ------: | ---------: | ----------------: | -------------: |
+| CE-only    |  overall |              |             |           |         |            |                   |                |
+| Plain-KL   |  overall |              |             |           |         |            |                   |                |
+| Compact-KL |  overall |              |             |           |         |            |                   |                |
+
+期望结论：
 
 ```text
-Method        Clean F1    Obfuscapk F1    Drop    Flip Rate    ECE
-CE-only
-Plain-KL
-Compact-KL
+Compact-KL 在真实混淆下 prediction flip rate 更低；
+Compact-KL 的 paired accuracy drop 更小；
+Compact-KL 的 true confidence drop 更小；
+所有用于论文报告的 paired 结果 label_mismatch_rate 应为 0。
 ```
 
-The expected thesis-level claim is:
+---
 
-```text
-Compact-KL should show a smaller performance drop and lower prediction flip rate under real obfuscation than CE-only and Plain-KL.
-```
+## 16. 测试与静态检查
 
-## Tests
-
-Run syntax checks:
+### 16.1 Python 语法检查
 
 ```bash
 python -m py_compile \
@@ -736,16 +919,17 @@ python -m py_compile \
   run.py \
   scripts/build_aeg_pts_direct.py \
   scripts/evaluate_aeg_checkpoint.py \
-  scripts/build_obfuscapk_label_csvs.py
+  scripts/build_obfuscapk_label_csvs.py \
+  scripts/summarize_obfuscapk_pairs.py
 ```
 
-Run smoke tests:
+### 16.2 pytest smoke test
 
 ```bash
 pytest tests/test_aeg_smoke.py
 ```
 
-Check experiment paths:
+### 16.3 runner dry-run
 
 ```bash
 python run.py final --dry-run
@@ -756,7 +940,7 @@ python run.py r3_fusion --dry-run
 python run.py all --dry-run
 ```
 
-The dry-run output should reference only the current experiment structure:
+dry-run 应只出现当前路径：
 
 ```text
 main/full_compact_kl_seed42.yaml
@@ -765,11 +949,13 @@ main/full_compact_kl_seed44.yaml
 loss/ce_only.yaml
 loss/plain_kl.yaml
 loss/compact_kl.yaml
+loss/compact_kl_w002.yaml
+loss/compact_kl_w010.yaml
 r1_graph/...
 r3_fusion/...
 ```
 
-It should not reference removed contrastive configs such as:
+不应出现旧路径：
 
 ```text
 full/ours.yaml
@@ -782,7 +968,7 @@ no_source_degraded_contrast.yaml
 no_cross_source_contrast.yaml
 ```
 
-Check Obfuscapk config loading:
+### 16.4 Obfuscapk 配置检查
 
 ```bash
 python - <<'PY'
@@ -791,22 +977,24 @@ from fusion.config_utils import load_config
 extract_cfg = load_config("config/extract_obfuscapk.yaml")
 eval_cfg = load_config("config/eval_obfuscapk.yaml")
 
-print(extract_cfg.keys())
+print(extract_cfg["data"]["splits"])
 print(eval_cfg["scenarios"].keys())
 PY
 ```
 
-## Thesis Experiment Mapping
+---
 
-### RQ1: Does source-aware APK evidence graph modeling help?
+## 17. 论文实验对应关系
 
-Use:
+### RQ1：源感知异构证据图是否有效？
+
+运行：
 
 ```bash
 python run.py r1_graph
 ```
 
-Compare:
+比较：
 
 ```text
 Full AEG
@@ -819,32 +1007,33 @@ No alignment
 No risk nodes
 ```
 
-### RQ2: Does reliability-aware KL consistency improve robustness?
+### RQ2：可靠性感知 KL 一致性是否提升鲁棒性？
 
-Use:
+运行：
 
 ```bash
 python run.py loss
 ```
 
-Compare:
+比较：
 
 ```text
 CE-only
-Plain KL
-Reliability-weighted KL
-Compact-KL weight variants
+Plain-KL
+Compact-KL
+Compact-KL w=0.02
+Compact-KL w=0.10
 ```
 
-### RQ3: Does reliability/conflict-aware fusion suppress Manifest shortcuts?
+### RQ3：可靠性 / 冲突感知 fusion 是否抑制 Manifest shortcut？
 
-Use:
+运行：
 
 ```bash
 python run.py r3_fusion
 ```
 
-Compare:
+比较：
 
 ```text
 Full fusion
@@ -853,7 +1042,7 @@ No conflict bias
 Mean fusion
 ```
 
-Focus on:
+重点分析：
 
 ```text
 manifest_noisy
@@ -863,11 +1052,9 @@ manifest_shuffled_blind
 manifest_missing
 ```
 
-### RQ4: Is the full method robust under synthetic degradation and missing evidence?
+### RQ4：完整方法在内部 synthetic robust views 下是否稳定？
 
-Use the robust-test metrics emitted by the full method.
-
-Report:
+使用 full method 的 robust-test 指标，报告：
 
 ```text
 clean
@@ -876,51 +1063,59 @@ graph_degraded
 api_graph_degraded
 manifest_noisy
 manifest_shuffled
-missing evidence
+api_missing
+graph_missing
+manifest_missing
 all_degraded
 ```
 
-### RQ5: Does the method generalize to real obfuscation?
+### RQ5：完整方法在真实混淆 Obfuscapk 外部测试下是否泛化？
 
-Use external Obfuscapk evaluation.
+使用：
 
-Report:
-
-```text
-Clean test Macro-F1
-Obfuscapk Macro-F1
-Absolute drop
-Relative drop
-Prediction flip rate
-ECE change
+```bash
+python scripts/evaluate_aeg_checkpoint.py ...
+python scripts/summarize_obfuscapk_pairs.py ...
 ```
 
-## Reproducibility Notes
+报告：
 
-Use fixed evaluation seeds for comparable robust evaluation:
+```text
+external Macro-F1
+paired flip rate
+paired accuracy drop
+true confidence drop
+label mismatch rate
+```
+
+---
+
+## 18. 复现实验建议
+
+建议固定：
 
 ```text
 eval.seed = 2026
 ```
 
-For three-seed reporting:
+三种 train seed：
 
 ```text
 train.seed = 42
 train.seed = 43
 train.seed = 44
-eval.seed   = 2026
 ```
 
-Recommended reporting strategy:
+推荐报告方式：
 
 ```text
-mean ± std over 3 train seeds for the full method
-single-seed screening for large ablation groups
-three-seed confirmation for the strongest baselines
+完整主方法：3 seeds mean ± std
+大规模消融：single seed 筛选
+核心 baseline：可补 3 seeds 验证
+Obfuscapk external evaluation：至少对 full method、CE-only、Plain-KL、Compact-KL 做对比
 ```
 
-Minimum thesis-ready experiment set:
+最低论文可用实验集合：
 
 ```text
 Full compact-KL, 3 seeds
@@ -937,4 +1132,16 @@ No reliability bias
 No conflict bias
 Mean fusion
 Obfuscapk external evaluation
+Obfuscapk paired flip-rate summary
 ```
+
+---
+
+## 19. 注意事项
+
+1. Obfuscapk 样本只用于最终外部测试，不进入 train/val。
+2. Obfuscapk 构建 PT 时必须使用 train split 冻结的 Manifest vocab。
+3. 不要只报告成功样本数量，要同时报告失败和过滤情况。
+4. paired evaluation 前必须检查 `source_id_rate`、`pair_rate` 和 `label_mismatch_rate`。
+5. 如果 `label_mismatch_rate > 0`，不要把 paired flip-rate 结果写进论文主表，应先修复 label mapping。
+6. 当前方法不要再写成 contrastive learning，应统一写成 reliability-aware multi-view KL consistency learning。

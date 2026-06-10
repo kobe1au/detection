@@ -129,6 +129,7 @@ def _pair_external_rows(
             "apk_name": obf.get("apk_name", ""),
             "label": label,
             "clean_label": clean_label,
+            "label_mismatch": int(clean_label != label),
             "pred_clean": pred_clean,
             "pred_obf": pred_obf,
             "flip": int(flip),
@@ -177,6 +178,7 @@ def _summarize_pairs(
 
     clean_acc = _safe_rate(clean_correct)
     obf_acc = _safe_rate(obf_correct)
+    label_mismatches = [bool(row.get("label_mismatch", 0)) for row in paired]
 
     return {
         "scenario": scenario_name,
@@ -195,6 +197,8 @@ def _summarize_pairs(
         "mean_prob_delta_obf_minus_clean": _safe_mean(prob_delta),
         "mean_prob_abs_delta": _safe_mean(prob_abs_delta),
         "mean_true_confidence_drop": _safe_mean(true_confidence_drop),
+        "label_mismatch_count": sum(1 for v in label_mismatches if v),
+        "label_mismatch_rate": _safe_rate(label_mismatches),
     }
 
 
