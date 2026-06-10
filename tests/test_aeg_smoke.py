@@ -682,7 +682,7 @@ def test_extract_behavior_hint_config_is_explicit_ablation():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 
     base = _load_config(Path("config/extract/extract_aeg.yaml"))
-    ablation = _load_config(Path("config/extract_aeg_behavior_hints.yaml"))
+    ablation = _load_config(Path("config/extract/extract_aeg_behavior_hints.yaml"))
     train_only = _load_config(Path("config/extract/extract_aeg_train_only.yaml"))
     assert base["graph"]["use_behavior_hints"] is False
     assert base["data"]["require_all_label_ids"] is True

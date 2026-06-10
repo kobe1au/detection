@@ -59,6 +59,8 @@ GROUPS = {
         "loss/ce_only.yaml",
         "loss/plain_kl.yaml",
         "loss/compact_kl.yaml",
+        "loss/compact_kl_w002.yaml",
+        "loss/compact_kl_w010.yaml",
         "r1_graph/code_only.yaml",
         "r1_graph/manifest_only.yaml",
         "r1_graph/no_edge_source.yaml",

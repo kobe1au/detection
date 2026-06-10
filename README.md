@@ -619,7 +619,7 @@ Report obfuscation success rate and extraction success rate
 
 ```bash
 python scripts/build_obfuscapk_label_csvs.py \
-  --config config/extract/extract_obfuscapk.yaml \
+  --config config/extract_obfuscapk.yaml \
   --clean-labels results/labels/test.csv \
   --output-dir results/labels_obfuscapk
 ```
@@ -629,12 +629,13 @@ The expected label CSVs should map obfuscated APKs back to their clean labels.
 Recommended columns:
 
 ```text
-clean_sha256
-obf_sha256
+id
+sha256
 label
-scenario
-success
-fail_reason
+year
+split
+source_id
+apk_name
 ```
 
 ### Step 2: Build AEG PT files for Obfuscapk scenarios
@@ -643,7 +644,7 @@ Use the frozen train vocabulary. Do not rebuild the Manifest vocabulary from Obf
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
-  --config config/extract/extract_obfuscapk.yaml \
+  --config config/extract_obfuscapk.yaml \
   --no-rebuild-vocab \
   --resume \
   --workers 4
@@ -665,18 +666,27 @@ scenarios:
   rebuild:
     pt_dir: D:/pts_obfuscapk/rebuild
     csv: results/labels_obfuscapk/rebuild.csv
-
   rename:
     pt_dir: D:/pts_obfuscapk/rename
     csv: results/labels_obfuscapk/rename.csv
-
-  string:
-    pt_dir: D:/pts_obfuscapk/string
-    csv: results/labels_obfuscapk/string.csv
-
-  mixed:
-    pt_dir: D:/pts_obfuscapk/mixed
-    csv: results/labels_obfuscapk/mixed.csv
+  string_encrypt:
+    pt_dir: D:/pts_obfuscapk/string_encrypt
+    csv: results/labels_obfuscapk/string_encrypt.csv
+  reflection:
+    pt_dir: D:/pts_obfuscapk/reflection
+    csv: results/labels_obfuscapk/reflection.csv
+  call_indirection:
+    pt_dir: D:/pts_obfuscapk/call_indirection
+    csv: results/labels_obfuscapk/call_indirection.csv
+  control_flow:
+    pt_dir: D:/pts_obfuscapk/control_flow
+    csv: results/labels_obfuscapk/control_flow.csv
+  junk_code:
+    pt_dir: D:/pts_obfuscapk/junk_code
+    csv: results/labels_obfuscapk/junk_code.csv
+  manifest_noise:
+    pt_dir: D:/pts_obfuscapk/manifest_noise
+    csv: results/labels_obfuscapk/manifest_noise.csv
 ```
 
 ### Recommended Obfuscapk Report
@@ -777,7 +787,7 @@ Check Obfuscapk config loading:
 python - <<'PY'
 from fusion.config_utils import load_config
 
-extract_cfg = load_config("config/extract/extract_obfuscapk.yaml")
+extract_cfg = load_config("config/extract_obfuscapk.yaml")
 eval_cfg = load_config("config/eval_obfuscapk.yaml")
 
 print(extract_cfg.keys())
