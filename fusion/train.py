@@ -258,15 +258,26 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
         return cache[key]
     try:
         payload = load_aeg_payload(key, validate=True)
+        node_x = payload.get("node_x")
+        if not isinstance(node_x, torch.Tensor) or node_x.ndim != 2:
+            raise ValueError(
+                f"Invalid node_x in {key}: expected 2D torch.Tensor, "
+                f"got {type(node_x).__name__}"
+            )
+
         metadata = {
             "package_name": str(payload.get("package_name") or "").strip().lower(),
             "schema_version": int(payload.get("schema_version", 0) or 0),
             "schema_fingerprint": str(payload.get("aeg_schema_fingerprint") or ""),
             "contract_version": int(payload.get("aeg_payload_contract_version", 0) or 0),
             "contract_fingerprint": str(payload.get("aeg_payload_contract_fingerprint") or ""),
+            "node_feature_dim": int(node_x.size(1)),
         }
     except Exception as exc:
-        raise ValueError(f"Failed to load AEG PT metadata from {key}: {type(exc).__name__}: {exc}") from exc
+        raise ValueError(
+            f"Failed to load AEG PT metadata from {key}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     cache[key] = metadata
     return metadata
 
@@ -274,7 +285,8 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
 def _validate_split_isolation(
     *datasets: AEGDataset,
     check_package: bool = True,
-) -> None:
+) -> int:
+    feature_dims: dict[int, list[tuple[str, str]]] = {}
     seen: dict[str, str] = {}
     conflicts: list[tuple[str, str, str]] = []
     package_seen: dict[str, tuple[str, str]] = {}
@@ -289,6 +301,10 @@ def _validate_split_isolation(
                 conflicts.append((sid, prev, dataset.split))
             seen[sid] = dataset.split
             metadata = _sample_build_metadata(path, metadata_cache)
+
+            dim = int(metadata["node_feature_dim"])
+            feature_dims.setdefault(dim, []).append((sid, dataset.split))
+
             if metadata["schema_version"] != AEG_SCHEMA_VERSION:
                 invalid_metadata.append((sid, dataset.split, f"schema_version={metadata['schema_version']}"))
             elif metadata["schema_fingerprint"] != AEG_SCHEMA_TABLE_FINGERPRINT:
@@ -308,14 +324,37 @@ def _validate_split_isolation(
                         package_seen.setdefault(package, (dataset.split, sid))
 
     if conflicts:
-        raise ValueError(f"Sample id overlap across splits: count={len(conflicts)} examples={conflicts[:5]}")
+        raise ValueError(
+            f"Sample id overlap across splits: "
+            f"count={len(conflicts)} examples={conflicts[:5]}"
+        )
+
     if invalid_metadata:
-        raise ValueError(f"Invalid AEG PT build metadata: count={len(invalid_metadata)} examples={invalid_metadata[:5]}")
+        raise ValueError(
+            f"Invalid AEG PT build metadata: "
+            f"count={len(invalid_metadata)} examples={invalid_metadata[:5]}"
+        )
+
+    if len(feature_dims) > 1:
+        examples = {
+            dim: vals[:3]
+            for dim, vals in sorted(feature_dims.items())
+        }
+        raise ValueError(
+            "Inconsistent node feature dimensions across PT files: "
+            f"{examples}"
+        )
+
     if package_conflicts:
         raise ValueError(
             "Package name overlap across splits: "
             f"count={len(package_conflicts)} examples={package_conflicts[:5]}"
         )
+
+    if not feature_dims:
+        raise ValueError("No AEG PT samples were found during split preflight validation")
+
+    return next(iter(feature_dims.keys()))
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -556,7 +595,15 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
     metadata_path = out_dir / "experiment_metadata.json"
 
     loss_cfg = cfg.get("loss", {}) or {}
-    loss_mode = str(loss_cfg.get("mode", "compact_kl"))
+    loss_mode = str(loss_cfg.get("mode", "compact_kl")).lower()
+    train_aug_requested = bool(robust_cfg.get("train_aug", True))
+
+    if loss_mode in {"plain_kl", "compact_kl"} and not train_aug_requested:
+        raise ValueError(
+            f"loss.mode={loss_mode} requires robust.train_aug=true."
+        )
+
+    train_aug_enabled = train_aug_requested and loss_mode in {"plain_kl", "compact_kl"}
     batch_size = int(train_cfg.get("batch_size", 24))
     
     resolved_config_path = str(Path(config_path).resolve()) if config_path else ""
@@ -603,11 +650,11 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
     _write_json(metadata_path, metadata)
 
     try:
-        train_ds = _make_dataset(cfg, "train", aug=bool(robust_cfg.get("train_aug", True)))
+        train_ds = _make_dataset(cfg, "train", aug=train_aug_enabled)
         val_ds = _make_dataset(cfg, "val", aug=False)
         test_ds = _make_dataset(cfg, "test", aug=False)
 
-        _validate_split_isolation(
+        node_input_dim = _validate_split_isolation(
             train_ds,
             val_ds,
             test_ds,
@@ -624,8 +671,6 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
         val_loader = _loader(cfg, val_ds, train=False)
         robust_val_loaders = _robust_val_loaders(cfg)
 
-        first_payload = load_aeg_payload(train_ds.samples[0][0], validate=True)
-        node_input_dim = int(first_payload["node_x"].size(1))
         model = build_model(cfg, node_input_dim).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from cProfile import label
 import csv
 import json
 import math
@@ -108,7 +109,7 @@ def _pair_external_rows(
         prob_obf = _to_float(obf.get("prob_malware"))
 
         flip = pred_clean != pred_obf
-        clean_correct = pred_clean == label
+        clean_correct = pred_clean == clean_label
         obf_correct = pred_obf == label
 
         # Confidence of the true class, useful for label-aware confidence drop.

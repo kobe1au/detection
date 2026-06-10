@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+from tensorboard import summary
 import torch
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
@@ -725,6 +726,39 @@ def test_summarize_obfuscapk_pairs(tmp_path):
     summary = (output_dir / "summary_pairs.csv").read_text(encoding="utf-8")
     assert "rebuild" in summary
     assert "flip_rate" in summary
+    assert "1.0" in summary
+    assert "label_mismatch_count" in summary
+    assert "label_mismatch_rate" in summary
+
+
+def test_summarize_obfuscapk_pairs_detects_label_mismatch(tmp_path):
+    clean = tmp_path / "diagnostics_test_clean.csv"
+    external_dir = tmp_path / "external"
+    output_dir = tmp_path / "pairs"
+    external_dir.mkdir()
+
+    src = "a" * 64
+    obf = "b" * 64
+
+    clean.write_text(
+        "sid,label,pred,prob_malware\n"
+        f"{src},1,1,0.90\n",
+        encoding="utf-8",
+    )
+
+    (external_dir / "diagnostics_test_external_rebuild.csv").write_text(
+        "sid,source_id,label,pred,prob_malware,scenario,apk_name\n"
+        f"{obf},{src},0,0,0.40,rebuild,sample.apk\n",
+        encoding="utf-8",
+    )
+
+    from scripts.summarize_obfuscapk_pairs import run
+
+    run(clean, external_dir, output_dir)
+
+    summary = (output_dir / "summary_pairs.csv").read_text(encoding="utf-8")
+    assert "label_mismatch_count" in summary
+    assert "label_mismatch_rate" in summary
     assert "1.0" in summary
 
 
