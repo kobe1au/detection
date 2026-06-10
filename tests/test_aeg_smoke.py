@@ -540,9 +540,10 @@ def test_kl_modes_require_augmented_view():
 
 def test_aeg_config_loads(tmp_path: Path):
     cfg_root = _prepare_local_aeg_experiment_configs(tmp_path)
-    cfg = load_config(cfg_root / "full/ours.yaml")
-    assert cfg["model"]["hidden_dim"] == 128
-    assert cfg["loss"]["clean_degraded_contrast_weight"] > 0.0
+    cfg = load_config(cfg_root / "main/full_compact_kl.yaml")
+    assert cfg["loss"]["mode"] == "compact_kl"
+    assert float(cfg["loss"]["consistency_weight"]) > 0.0
+    assert cfg["robust"]["train_aug"] is True
 
 
 def test_all_aeg_experiment_configs_load_and_have_unique_outputs(tmp_path: Path):
@@ -557,14 +558,14 @@ def test_all_aeg_experiment_configs_load_and_have_unique_outputs(tmp_path: Path)
         assert int(cfg["eval"]["seed"]) == 2026
 
 
-def test_aeg_configs_do_not_require_local_base_yaml(tmp_path: Path):
-    cfg_root = tmp_path / "aeg_robust"
-    shutil.copytree(Path("config/experiments/aeg_robust"), cfg_root)
+def test_aeg_configs_require_tracked_base_yaml(tmp_path: Path):
+    cfg_root = _prepare_local_aeg_experiment_configs(tmp_path)
     base_path = cfg_root / "base.yaml"
-    if base_path.exists():
-        base_path.unlink()
-    cfg = load_config(cfg_root / "full/ours.yaml")
-    assert cfg["train"]["output_dir"] == "results/aeg_robust/full/ours"
+    assert base_path.exists()
+
+    cfg = load_config(cfg_root / "main/full_compact_kl.yaml")
+    assert cfg["train"]["output_dir"] == "results/aeg_robust/main/full_compact_kl"
+    assert cfg["loss"]["mode"] == "compact_kl"
 
 
 def test_diagnostic_slice_summarizer(tmp_path: Path):
@@ -633,10 +634,18 @@ def test_diagnostic_slice_summarizer_handles_empty_selected_slices(tmp_path: Pat
     assert text.startswith("scenario,slice,num_samples")
 
 
-def test_run_groups_expose_isolated_innovation_experiments():
+def test_run_groups_expose_current_experiments():
     from run import resolve_target_specs
 
-    for group, minimum in (("i1", 5), ("i2", 5), ("i3", 6), ("full_seeds", 3)):
+    expected = {
+        "main": 1,
+        "loss": 5,
+        "r1_graph": 7,
+        "r3_fusion": 3,
+        "all": 14,
+    }
+
+    for group, minimum in expected.items():
         paths = resolve_target_specs([group])
         assert len(paths) >= minimum
         assert all(path.exists() for path in paths)
