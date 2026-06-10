@@ -735,7 +735,8 @@ python -m py_compile \
   fusion/perturbations.py \
   run.py \
   scripts/build_aeg_pts_direct.py \
-  scripts/evaluate_aeg_checkpoint.py
+  scripts/evaluate_aeg_checkpoint.py \
+  scripts/build_obfuscapk_label_csvs.py
 ```
 
 Run smoke tests:

@@ -678,6 +678,25 @@ def test_model_can_explicitly_adapt_node_dim_mismatch():
     assert torch.isfinite(extra["fused_emb"]).all()
 
 
+def test_obfuscapk_extract_config_loads():
+    from fusion.config_utils import load_config
+
+    cfg = load_config("config/extract_obfuscapk.yaml")
+    assert cfg["data"]["splits"] == [
+        "rebuild",
+        "rename",
+        "string_encrypt",
+        "reflection",
+        "call_indirection",
+        "control_flow",
+        "junk_code",
+        "manifest_noise",
+    ]
+    assert cfg["data"]["filter_to_label_csv"] is False
+    assert cfg["data"]["require_all_label_ids"] is False
+    assert cfg["manifest"]["rebuild_vocab"] is False
+
+
 def test_extract_behavior_hint_config_is_explicit_ablation():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 

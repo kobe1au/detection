@@ -1,4 +1,4 @@
-base: extract_aeg.yaml
+base: extract/extract_aeg.yaml
 
 data:
   splits:
