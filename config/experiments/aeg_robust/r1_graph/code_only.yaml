@@ -4,7 +4,11 @@ train:
   output_dir: results/aeg_robust/r1_graph/code_only
 
 model:
-  evidence_scope: code_only
+  masked_node_types:
+    - PERMISSION
+    - COMPONENT
+    - INTENT
+    - RISK_SEMANTIC
 
 loss:
   mode: compact_kl

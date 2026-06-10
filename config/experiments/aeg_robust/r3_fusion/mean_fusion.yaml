@@ -4,7 +4,7 @@ train:
   output_dir: results/aeg_robust/r3_fusion/mean_fusion
 
 model:
-  fusion_type: mean
+  fusion_mode: mean_pool
 
 loss:
   mode: compact_kl

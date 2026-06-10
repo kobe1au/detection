@@ -72,7 +72,6 @@ Thumbs.db
 .DS_Store
 
 # Local configuration files (P0-1: Config portability)
-config/experiments/**/base.yaml
 config/experiments/**/*.local.yaml
 *.local.yaml
 

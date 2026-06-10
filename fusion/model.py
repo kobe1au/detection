@@ -367,10 +367,22 @@ class AEGModel(nn.Module):
         # q_align is a soft correspondence-quality cue, not proof that API and
         # graph semantics must agree. It therefore modulates rather than gates
         # the code-side reliability.
-        code_rel = (
-            (r_api * r_graph).sqrt()
+        # code_rel = (
+        #     (r_api * r_graph).sqrt()
+        #     * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
+        # ).clamp(0.0, 1.0)
+
+        product = r_api.clamp_min(0.0) * r_graph.clamp_min(0.0)
+        code_rel_nonzero = (
+            product.clamp_min(1e-12).sqrt()
             * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
+        )
+        code_rel = torch.where(
+            product > 0,
+            code_rel_nonzero,
+            torch.zeros_like(code_rel_nonzero),
         ).clamp(0.0, 1.0)
+
         risk_rel = _masked_mean(node_quality.float().view(-1, 1), risk_nodes, data.batch, num_graphs).view(-1)
         global_rel = torch.stack([code_rel, r_manifest], dim=-1).amax(dim=-1)
         token_rel = torch.stack(

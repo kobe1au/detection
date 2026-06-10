@@ -4,7 +4,11 @@ train:
   output_dir: results/aeg_robust/r1_graph/no_alignment
 
 model:
-  use_alignment_edges: false
+  masked_edge_types:
+    - PERMISSION_RELATED_TO_API_FAMILY
+    - API_FAMILY_RELATED_TO_PERMISSION
+    - COMPONENT_MATCHES_METHOD
+    - METHOD_MATCHES_COMPONENT
 
 loss:
   mode: compact_kl
