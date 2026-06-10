@@ -2,7 +2,7 @@
 
 This repository implements a robust Android malware detection pipeline based on **source-aware APK evidence graphs** and **reliability-aware multi-view KL consistency learning**.
 
-The active mainline is no longer contrastive-learning based. The current training objective is:
+The current active mainline is **not contrastive learning**. The current objective is:
 
 ```text
 Cross-entropy classification
@@ -10,7 +10,7 @@ Cross-entropy classification
 + reliability-aware consistency weighting
 ```
 
-The supported loss modes are:
+Supported loss modes:
 
 ```text
 ce_only      CE only
@@ -18,9 +18,9 @@ plain_kl     CE + unweighted clean/degraded KL consistency
 compact_kl   CE + reliability-aware clean/degraded KL consistency
 ```
 
-## Main Ideas
+## Main Contributions
 
-This project is organized around three thesis-level ideas.
+This project is organized around three main ideas.
 
 1. **Source-aware APK heterogeneous evidence graph modeling**
 
@@ -28,7 +28,7 @@ This project is organized around three thesis-level ideas.
 
 2. **Reliability-aware multi-view KL consistency learning**
 
-   The model is trained on clean and degraded graph views. Instead of using InfoNCE or batch-wise contrastive loss, the current mainline uses KL consistency between clean and perturbed predictions. The consistency strength is adjusted according to view type, counterfactual weight, and observable code/Manifest reliability.
+   The model is trained with clean and degraded graph views. Instead of using InfoNCE or batch-wise contrastive learning, the current method uses KL consistency between clean and perturbed predictions. The consistency strength is adjusted according to view type, counterfactual weight, and observable code/Manifest reliability.
 
 3. **Counterfactual reliability-aware latent fusion with Manifest shortcut suppression**
 
@@ -42,6 +42,7 @@ extract/
 
 fusion/
   aeg_builder.py                    Builds versioned APK evidence graph payloads
+  config_utils.py                   YAML config loader with base inheritance
   constants.py                      Node, edge, source, and view definitions
   dataset.py                        AEG Dataset, augmentation, and PyG collation
   io_utils.py                       Safe AEG payload and checkpoint loading
@@ -53,14 +54,25 @@ fusion/
 
 scripts/
   build_aeg_pts_direct.py           APK -> AEG .pt builder
+  build_obfuscapk_label_csvs.py     Build labels for external Obfuscapk evaluation
+  evaluate_aeg_checkpoint.py        Evaluate a trained checkpoint on external PT scenarios
   validate_aeg_pts.py               PT/schema/contract validator
   summarize_aeg_diagnostics.py      Diagnostics summarization
 
 config/
-  extract_aeg.yaml                  APK -> AEG extraction config
+  extract/
+    extract_aeg.yaml
+    extract_aeg_vocab_train_only.yaml
+    extract_aeg_val_test.yaml
+    extract_aeg_train_only.yaml
+    extract_aeg_behavior_hints.yaml
+    extract_obfuscapk.yaml
+
+  eval_obfuscapk.yaml
+
   experiments/aeg_robust/
     base.yaml                       Shared experiment template
-    main/                           Full method
+    main/                           Full method, including seed42/43/44 configs
     loss/                           CE-only / Plain-KL / Compact-KL experiments
     r1_graph/                       Graph/source/evidence ablations
     r3_fusion/                      Reliability/fusion ablations
@@ -69,13 +81,44 @@ tests/
   test_aeg_smoke.py                 Smoke tests for payloads, model, losses, configs
 ```
 
+## Active Mainline
+
+The active mainline is:
+
+```text
+Source-aware AEG
++ reliability-aware latent fusion
++ CE / Plain-KL / Compact-KL objectives
++ robust validation and diagnostics
+```
+
+The old contrastive-learning objective is no longer active. Avoid using or reintroducing experiment names based on:
+
+```text
+InfoNCE
+multi-view contrastive learning
+clean-degraded contrast
+source-level contrast
+cross-source contrast
+counterfactual contrastive loss
+```
+
+Use the current terminology instead:
+
+```text
+multi-view KL consistency
+reliability-aware consistency weighting
+Manifest shortcut suppression
+source-aware evidence graph modeling
+```
+
 ## Build AEG PT Files
 
 Build or rebuild the Manifest vocabulary from the train split only:
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
-  --config config/extract_aeg.yaml \
+  --config config/extract/extract_aeg.yaml \
   --rebuild-vocab \
   --no-resume \
   --workers 8
@@ -85,7 +128,7 @@ Resume later without rebuilding the vocabulary:
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
-  --config config/extract_aeg.yaml \
+  --config config/extract/extract_aeg.yaml \
   --no-rebuild-vocab \
   --resume \
   --workers 8
@@ -95,7 +138,7 @@ If disk space cannot hold train PT files yet, build only the train-derived Manif
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
-  --config config/extract_aeg_vocab_train_only.yaml \
+  --config config/extract/extract_aeg_vocab_train_only.yaml \
   --rebuild-vocab \
   --vocab-only \
   --workers 8
@@ -105,7 +148,7 @@ Then generate validation and test PT files with the frozen train vocabulary:
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
-  --config config/extract_aeg_val_test.yaml \
+  --config config/extract/extract_aeg_val_test.yaml \
   --no-rebuild-vocab \
   --resume \
   --workers 8
@@ -115,7 +158,7 @@ Generate train PT files later without rebuilding the frozen Manifest vocabulary:
 
 ```bash
 python scripts/build_aeg_pts_direct.py \
-  --config config/extract_aeg_train_only.yaml \
+  --config config/extract/extract_aeg_train_only.yaml \
   --no-rebuild-vocab \
   --resume \
   --workers 8
@@ -125,11 +168,23 @@ Validate generated PT files before training:
 
 ```bash
 python scripts/validate_aeg_pts.py \
-  --config config/extract_aeg.yaml \
+  --config config/extract/extract_aeg.yaml \
   --sample-per-split 100
 ```
 
-Use `--all` for a full validation pass. The validator checks CSV/PT id consistency, node feature dimensions, schema versions, payload contract versions, and required tensor fields.
+Use `--all` for a full validation pass.
+
+The validator checks:
+
+```text
+CSV/PT id consistency
+node feature dimensions
+schema versions
+payload contract versions
+required tensor fields
+split isolation
+package-name isolation when enabled
+```
 
 ## Data Integrity and Trust Boundaries
 
@@ -144,10 +199,13 @@ sample id overlap across train/val/test
 package_name overlap across train/val/test when enabled
 schema version mismatch
 payload contract mismatch
-invalid tensor shapes or missing required fields
+invalid tensor shapes
+missing required fields
 ```
 
-AEG payload loading uses `load_aeg_payload()` in fail-closed mode. It first tries safe tensor loading and validates the payload contract after deserialization. This validation is not a substitute for artifact provenance. For untrusted PT files, verify external checksums or signatures before loading.
+AEG payload loading uses `load_aeg_payload()` in fail-closed mode. It first tries safe tensor loading and validates the payload contract after deserialization.
+
+This validation is not a substitute for artifact provenance. For untrusted PT files, verify external checksums or signatures before loading.
 
 ## Experiment Configuration
 
@@ -174,7 +232,7 @@ data:
     csv: results/labels/test.csv
 ```
 
-The default training loss in `base.yaml` is the full method:
+The default training loss in `base.yaml` should use the full method:
 
 ```yaml
 loss:
@@ -201,21 +259,47 @@ loss:
   mode: ce_only
 ```
 
-## Train the Full Method
+Recommended explicit model block for reproducibility:
 
-Run the full reliability-aware KL method:
+```yaml
+model:
+  hidden_dim: 128
+  layers: 2
+  dropout: 0.15
+  num_latents: 16
+  fusion_mode: latent
+  num_classes: 2
 
-```bash
-python -m fusion.train --config config/experiments/aeg_robust/main/full_compact_kl.yaml
+  use_relation_types: true
+  use_node_types: true
+  use_node_source: true
+  use_edge_source: true
+  use_node_quality: true
+  use_edge_quality: true
+
+  reliability_bias_weight: 1.0
+  conflict_bias_weight: 0.5
+  source_bias_weight: 1.0
+
+  allow_node_dim_adapt: false
 ```
 
-Or use the compact experiment runner:
+## Train the Full Method
+
+Run the default full method with seed 42:
+
+```bash
+python -m fusion.train \
+  --config config/experiments/aeg_robust/main/full_compact_kl_seed42.yaml
+```
+
+Run through the experiment runner:
 
 ```bash
 python run.py final
 ```
 
-Equivalent aliases include:
+Equivalent aliases:
 
 ```bash
 python run.py ours
@@ -244,6 +328,7 @@ Useful groups:
 
 ```bash
 python run.py main
+python run.py full_seeds
 python run.py loss
 python run.py r1_graph
 python run.py r3_fusion
@@ -259,7 +344,8 @@ python run.py all --dry-run
 Expected active groups:
 
 ```text
-main        Full compact-KL method
+main        Full compact-KL method, seed42
+full_seeds  Full compact-KL method, seed42/43/44
 loss        CE-only, Plain-KL, Compact-KL, and consistency-weight variants
 r1_graph    Graph/source/evidence ablations
 r3_fusion   Reliability and fusion ablations
@@ -276,6 +362,12 @@ The old `i1/i2/i3` and contrastive-loss experiment names are no longer part of t
 python run.py final
 ```
 
+Primary config:
+
+```text
+config/experiments/aeg_robust/main/full_compact_kl_seed42.yaml
+```
+
 Full method:
 
 ```text
@@ -285,10 +377,18 @@ Reliability-weighted clean/degraded KL consistency
 Robust validation checkpoint selection
 ```
 
-Primary config:
+For three-seed reporting:
+
+```bash
+python run.py full_seeds
+```
+
+Expected configs:
 
 ```text
-config/experiments/aeg_robust/main/full_compact_kl.yaml
+config/experiments/aeg_robust/main/full_compact_kl_seed42.yaml
+config/experiments/aeg_robust/main/full_compact_kl_seed43.yaml
+config/experiments/aeg_robust/main/full_compact_kl_seed44.yaml
 ```
 
 ### 2. Loss Ablation
@@ -337,7 +437,7 @@ no_alignment
 no_risk_nodes
 ```
 
-The strict single-source baselines use `masked_node_types` rather than an inactive high-level field.
+The strict single-source baselines use `masked_node_types`.
 
 For example, `code_only` masks Manifest-side and derived risk nodes:
 
@@ -424,7 +524,9 @@ Brier score
 Robustness drop / degradation rate
 ```
 
-The default checkpoint metric is `robust_composite`, which combines clean validation performance and representative robust validation views. Test and robust-test metrics are computed only after the best checkpoint is selected.
+The default checkpoint metric is `robust_composite`, which combines clean validation performance and representative robust validation views.
+
+Test and robust-test metrics are computed only after the best checkpoint is selected.
 
 ## Outputs
 
@@ -440,7 +542,7 @@ diagnostics_test_clean.csv
 diagnostics_test_<view>_<strength>.csv
 ```
 
-`summary.json` contains the compact final metrics.
+`summary.json` contains compact final metrics.
 
 `history.csv` contains per-epoch training and validation metrics.
 
@@ -495,36 +597,119 @@ Summarize diagnostics after a run:
 
 ```bash
 python scripts/summarize_aeg_diagnostics.py \
-  --input-dir results/aeg_robust/main/full_compact_kl \
+  --input-dir results/aeg_robust/main/full_compact_kl_seed42 \
   --min-count 20
 ```
 
-## External Obfuscation Evaluation
+## External Obfuscapk Evaluation
 
-For a real Obfuscapk-style benchmark, generate scenario PT files with the external extraction config, map obfuscated APK hashes back to clean test labels, and evaluate a trained checkpoint without retraining.
+Internal robust views are useful for controlled mechanism evaluation, but they are still synthetic. For external robustness, use an Obfuscapk-style benchmark as a held-out evaluation set.
 
-Example workflow:
+Recommended design:
+
+```text
+Do not train on Obfuscapk samples
+Do not tune hyperparameters on Obfuscapk samples
+Use Obfuscapk only for final external robustness evaluation
+Use the frozen train Manifest vocabulary
+Report obfuscation success rate and extraction success rate
+```
+
+### Step 1: Build Obfuscapk label CSVs
 
 ```bash
 python scripts/build_obfuscapk_label_csvs.py \
-  --config config/extract_obfuscapk.yaml \
+  --config config/extract/extract_obfuscapk.yaml \
   --clean-labels results/labels/test.csv \
   --output-dir results/labels_obfuscapk
-
-python scripts/evaluate_aeg_checkpoint.py \
-  --checkpoint results/aeg_robust/main/full_compact_kl/best.pt \
-  --config config/eval_obfuscapk.yaml \
-  --output-dir results/aeg_robust/main/full_compact_kl/external
 ```
 
-Report external robustness as:
+The expected label CSVs should map obfuscated APKs back to their clean labels.
+
+Recommended columns:
 
 ```text
-Clean test Macro-F1
-Obfuscated test Macro-F1
-Absolute drop
-Relative drop
+clean_sha256
+obf_sha256
+label
+scenario
+success
+fail_reason
+```
+
+### Step 2: Build AEG PT files for Obfuscapk scenarios
+
+Use the frozen train vocabulary. Do not rebuild the Manifest vocabulary from Obfuscapk data.
+
+```bash
+python scripts/build_aeg_pts_direct.py \
+  --config config/extract/extract_obfuscapk.yaml \
+  --no-rebuild-vocab \
+  --resume \
+  --workers 4
+```
+
+### Step 3: Evaluate a trained checkpoint
+
+```bash
+python scripts/evaluate_aeg_checkpoint.py \
+  --checkpoint results/aeg_robust/main/full_compact_kl_seed42/best.pt \
+  --config config/eval_obfuscapk.yaml \
+  --output-dir results/aeg_robust/main/full_compact_kl_seed42/external
+```
+
+`config/eval_obfuscapk.yaml` should contain a `scenarios` mapping, for example:
+
+```yaml
+scenarios:
+  rebuild:
+    pt_dir: D:/pts_obfuscapk/rebuild
+    csv: results/labels_obfuscapk/rebuild.csv
+
+  rename:
+    pt_dir: D:/pts_obfuscapk/rename
+    csv: results/labels_obfuscapk/rename.csv
+
+  string:
+    pt_dir: D:/pts_obfuscapk/string
+    csv: results/labels_obfuscapk/string.csv
+
+  mixed:
+    pt_dir: D:/pts_obfuscapk/mixed
+    csv: results/labels_obfuscapk/mixed.csv
+```
+
+### Recommended Obfuscapk Report
+
+Report:
+
+```text
+number of attempted APKs
+number of successfully obfuscated APKs
+number of successfully converted AEG PTs
+benign/malware counts
+per-scenario sample counts
+clean test Macro-F1
+obfuscated test Macro-F1
+absolute F1 drop
+relative F1 drop
+prediction flip rate
 ECE change
+```
+
+Suggested table:
+
+```text
+Method        Clean F1    Obfuscapk F1    Drop    Flip Rate    ECE
+CE-only
+Plain-KL
+Compact-KL
+```
+
+The expected thesis-level claim is:
+
+```text
+Compact-KL should show a smaller performance drop and lower prediction flip rate under real obfuscation than CE-only and Plain-KL.
 ```
 
 ## Tests
@@ -538,7 +723,9 @@ python -m py_compile \
   fusion/model.py \
   fusion/dataset.py \
   fusion/perturbations.py \
-  run.py
+  run.py \
+  scripts/build_aeg_pts_direct.py \
+  scripts/evaluate_aeg_checkpoint.py
 ```
 
 Run smoke tests:
@@ -551,6 +738,7 @@ Check experiment paths:
 
 ```bash
 python run.py final --dry-run
+python run.py full_seeds --dry-run
 python run.py loss --dry-run
 python run.py r1_graph --dry-run
 python run.py r3_fusion --dry-run
@@ -560,7 +748,9 @@ python run.py all --dry-run
 The dry-run output should reference only the current experiment structure:
 
 ```text
-main/full_compact_kl.yaml
+main/full_compact_kl_seed42.yaml
+main/full_compact_kl_seed43.yaml
+main/full_compact_kl_seed44.yaml
 loss/ce_only.yaml
 loss/plain_kl.yaml
 loss/compact_kl.yaml
@@ -581,9 +771,21 @@ no_source_degraded_contrast.yaml
 no_cross_source_contrast.yaml
 ```
 
-## Thesis Experiment Mapping
+Check Obfuscapk config loading:
 
-Recommended result sections:
+```bash
+python - <<'PY'
+from fusion.config_utils import load_config
+
+extract_cfg = load_config("config/extract/extract_obfuscapk.yaml")
+eval_cfg = load_config("config/eval_obfuscapk.yaml")
+
+print(extract_cfg.keys())
+print(eval_cfg["scenarios"].keys())
+PY
+```
+
+## Thesis Experiment Mapping
 
 ### RQ1: Does source-aware APK evidence graph modeling help?
 
@@ -667,29 +869,39 @@ missing evidence
 all_degraded
 ```
 
-### RQ5: Does the method generalize to real obfuscation or temporal drift?
+### RQ5: Does the method generalize to real obfuscation?
 
-Use external Obfuscapk evaluation or year-based test slices if available.
+Use external Obfuscapk evaluation.
 
-## Notes on Reproducibility
-
-Use fixed seeds for comparable experiments:
+Report:
 
 ```text
-train.seed = 42
+Clean test Macro-F1
+Obfuscapk Macro-F1
+Absolute drop
+Relative drop
+Prediction flip rate
+ECE change
+```
+
+## Reproducibility Notes
+
+Use fixed evaluation seeds for comparable robust evaluation:
+
+```text
 eval.seed = 2026
 ```
 
-For three-seed reporting, create separate configs such as:
+For three-seed reporting:
 
 ```text
-main/full_compact_kl_seed43.yaml
-main/full_compact_kl_seed44.yaml
+train.seed = 42
+train.seed = 43
+train.seed = 44
+eval.seed   = 2026
 ```
 
-Keep `eval.seed` fixed across seeds so robust-view sampling is comparable.
-
-Recommended minimum report:
+Recommended reporting strategy:
 
 ```text
 mean ± std over 3 train seeds for the full method
@@ -697,33 +909,21 @@ single-seed screening for large ablation groups
 three-seed confirmation for the strongest baselines
 ```
 
-## Active Mainline
-
-The active mainline is:
+Minimum thesis-ready experiment set:
 
 ```text
-Source-aware AEG
-+ reliability-aware latent fusion
-+ CE / Plain-KL / Compact-KL objectives
-+ robust validation and diagnostics
-```
-
-The old contrastive-learning objective is no longer active. Avoid using or reintroducing experiment names based on:
-
-```text
-InfoNCE
-multi-view contrastive learning
-clean-degraded contrast
-source-level contrast
-cross-source contrast
-counterfactual contrastive loss
-```
-
-Use the current terminology instead:
-
-```text
-multi-view KL consistency
-reliability-aware consistency weighting
-Manifest shortcut suppression
-source-aware evidence graph modeling
+Full compact-KL, 3 seeds
+CE-only
+Plain-KL
+Compact-KL
+Code-only
+Manifest-only
+No edge source
+No node quality
+No alignment
+No risk nodes
+No reliability bias
+No conflict bias
+Mean fusion
+Obfuscapk external evaluation
 ```

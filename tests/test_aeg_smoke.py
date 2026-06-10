@@ -540,7 +540,7 @@ def test_kl_modes_require_augmented_view():
 
 def test_aeg_config_loads(tmp_path: Path):
     cfg_root = _prepare_local_aeg_experiment_configs(tmp_path)
-    cfg = load_config(cfg_root / "main/full_compact_kl.yaml")
+    cfg = load_config(cfg_root / "main/full_compact_kl_seed42.yaml")
     assert cfg["loss"]["mode"] == "compact_kl"
     assert float(cfg["loss"]["consistency_weight"]) > 0.0
     assert cfg["robust"]["train_aug"] is True
@@ -563,8 +563,8 @@ def test_aeg_configs_require_tracked_base_yaml(tmp_path: Path):
     base_path = cfg_root / "base.yaml"
     assert base_path.exists()
 
-    cfg = load_config(cfg_root / "main/full_compact_kl.yaml")
-    assert cfg["train"]["output_dir"] == "results/aeg_robust/main/full_compact_kl"
+    cfg = load_config(cfg_root / "main/full_compact_kl_seed42.yaml")
+    assert cfg["train"]["output_dir"] == "results/aeg_robust/main/full_compact_kl_seed42"
     assert cfg["loss"]["mode"] == "compact_kl"
 
 
@@ -681,9 +681,9 @@ def test_model_can_explicitly_adapt_node_dim_mismatch():
 def test_extract_behavior_hint_config_is_explicit_ablation():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 
-    base = _load_config(Path("config/extract_aeg.yaml"))
+    base = _load_config(Path("config/extract/extract_aeg.yaml"))
     ablation = _load_config(Path("config/extract_aeg_behavior_hints.yaml"))
-    train_only = _load_config(Path("config/extract_aeg_train_only.yaml"))
+    train_only = _load_config(Path("config/extract/extract_aeg_train_only.yaml"))
     assert base["graph"]["use_behavior_hints"] is False
     assert base["data"]["require_all_label_ids"] is True
     assert train_only["data"]["require_all_label_ids"] is True
@@ -694,7 +694,7 @@ def test_extract_behavior_hint_config_is_explicit_ablation():
     required_dim = int(ablation["graph"]["vocab_size"]) * 2 + 3 + 4
     assert int(ablation["aeg"]["node_feature_dim"]) >= required_dim
 
-    broken = _load_config(Path("config/extract_aeg.yaml"))
+    broken = _load_config(Path("config/extract/extract_aeg.yaml"))
     broken["graph"]["use_behavior_hints"] = True
     broken["aeg"]["node_feature_dim"] = 128
     args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=False)
@@ -706,7 +706,7 @@ def test_val_test_extraction_keeps_train_vocab_guard_path():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 
     args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=False)
-    cfg = _parse_config(_load_config(Path("config/extract_aeg_val_test.yaml")), args)
+    cfg = _parse_config(_load_config(Path("config/extract/extract_aeg_val_test.yaml")), args)
     assert cfg["splits"] == ["val", "test"]
     assert str(cfg["train_label_csv_for_vocab"]).replace("\\", "/").endswith("results/labels/train.csv")
 
@@ -793,7 +793,7 @@ def test_aeg_builder_filters_jobs_to_label_csv(tmp_path: Path):
 def test_vocab_only_automatically_scans_train_only():
     from scripts.build_aeg_pts_direct import _load_config, _parse_config
 
-    raw = _load_config(Path("config/extract_aeg.yaml"))
+    raw = _load_config(Path("config/extract/extract_aeg.yaml"))
     args = argparse.Namespace(workers=1, resume=False, rebuild_vocab=True, vocab_only=True)
     cfg = _parse_config(raw, args)
     assert cfg["splits"] == ["train"]
