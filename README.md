@@ -18,6 +18,8 @@ plain_kl     交叉熵 + 普通 clean/degraded KL 一致性
 compact_kl   交叉熵 + 可靠性感知 clean/degraded KL 一致性
 ```
 
+运行环境使用 Python 3.10 或 3.11；当前固定的 `torch==2.2.0` 不支持本机默认的 Python 3.13。
+
 ---
 
 ## 1. 方法概述
@@ -159,11 +161,11 @@ config/
   eval_obfuscapk.yaml
 
   experiments/aeg_robust/
-    base.yaml                           共享实验模板
+    base.yaml                           中性 AEG-only 公共模板
     main/                               full compact-KL 主方法 seed42/43/44
-    loss/                               CE-only / Plain-KL / Compact-KL 消融
-    r1_graph/                           图结构 / 证据源 / 质量信息消融
-    r3_fusion/                          可靠性 / 冲突感知 fusion 消融
+    stage1/                             创新点1：AEG 表示与结构消融
+    stage2/                             创新点2：可靠性 / 冲突感知 fusion
+    stage3/                             创新点3：Plain-KL / Compact-KL
 
 tests/
   test_aeg_smoke.py                     payload / model / loss / config / runner smoke tests
@@ -172,6 +174,8 @@ tests/
 ---
 
 ## 4. 构建 AEG PT 数据
+
+当前 AEG schema 为 v7。v7 将可靠性重新定义为提取完整性，不再使用 API 数量、图规模或 Manifest 词表覆盖率作为质量捷径；旧 schema PT 必须重新构建。
 
 ### 4.1 使用 train split 重建 Manifest 词表并构建 PT
 
@@ -284,36 +288,35 @@ data:
     csv: results/labels/test.csv
 ```
 
-当前推荐的主方法 loss：
+`base.yaml` 是严格中性基线：
 
 ```yaml
-loss:
-  mode: compact_kl
-  ce_weight: 1.0
-  consistency_weight: 0.05
-  aug_ce_weight: 0.0
-```
+train:
+  checkpoint_metric: macro_f1
 
-对于 `plain_kl` 和 `compact_kl`，训练增强必须开启：
-
-```yaml
-robust:
-  train_aug: true
-```
-
-对于 `ce_only`，可以关闭增强，避免多跑一次 forward：
-
-```yaml
 robust:
   train_aug: false
 
 loss:
   mode: ce_only
+
+model:
+  fusion_mode: masked_mean
+  reliability_bias_weight: 0.0
+  conflict_bias_weight: 0.0
+  source_bias_weight: 0.0
 ```
 
-推荐显式保留 model block，以保证论文复现性：
+创新点2配置显式切换到 latent fusion；创新点3配置才开启训练扰动和 KL：
 
 ```yaml
+robust:
+  train_aug: true
+
+loss:
+  mode: compact_kl
+  consistency_weight: 0.05
+
 model:
   hidden_dim: 128
   layers: 2
@@ -375,7 +378,8 @@ config/experiments/aeg_robust/
 
 ```bash
 python run.py final
-python run.py ce_only
+python run.py aeg_only
+python run.py fusion
 python run.py plain_kl
 python run.py compact_kl
 ```
@@ -385,9 +389,9 @@ python run.py compact_kl
 ```bash
 python run.py main
 python run.py full_seeds
-python run.py loss
-python run.py r1_graph
-python run.py r3_fusion
+python run.py stage1
+python run.py stage2
+python run.py stage3
 python run.py all
 ```
 
@@ -402,13 +406,13 @@ python run.py all --dry-run
 ```text
 main        full compact-KL seed42
 full_seeds  full compact-KL seed42/43/44
-loss        CE-only / Plain-KL / Compact-KL / consistency weight sweep
-r1_graph    图结构、证据源、节点/边质量、对齐边、风险节点消融
-r3_fusion   可靠性 bias、冲突 bias、mean fusion 消融
-all         full seeds + loss + graph ablation + fusion ablation
+stage1      AEG-only CE：单源基线与图结构消融，排除创新点2/3
+stage2      完整 AEG + CE：latent / reliability / conflict / source fusion
+stage3      完整 AEG + 完整 fusion：CE / Plain-KL / Compact-KL
+all         按 stage1 -> stage2 -> stage3 -> full seeds 运行
 ```
 
-旧的 `i1/i2/i3`、`full/ours.yaml`、`multiview_contrast.yaml` 不再是当前实验入口。
+旧组名 `r1_graph`、`r3_fusion`、`loss` 仍作为兼容 alias，分别映射到 stage1、stage2、stage3。
 
 ---
 
@@ -440,99 +444,83 @@ config/experiments/aeg_robust/main/full_compact_kl_seed43.yaml
 config/experiments/aeg_robust/main/full_compact_kl_seed44.yaml
 ```
 
-### 9.2 Loss 消融
+### 9.2 Stage 1：单独验证源感知 AEG
 
 ```bash
-python run.py loss
+python run.py stage1
 ```
 
 比较：
 
 ```text
+API-only CE
+Graph-only CE
+Manifest-only CE
+AEG-only CE
+AEG no source metadata CE
+AEG no relation types CE
+AEG no quality CE
+AEG no alignment CE
+AEG no risk CE
+```
+
+所有配置必须保持：
+
+```text
 CE-only
-Plain-KL
-Compact-KL
+masked_mean
+无训练扰动
+无 reliability / conflict / source fusion bias
+```
+
+严格解释边界：当前 Graph-only 分支仍来自敏感 API 中心子图，因此它验证的是“只保留图结构/方法证据后的增益”，不是完全独立于 API 选择过程的纯调用图基线。论文中不得把它描述为 API-independent graph baseline。No-alignment 同时移除显式跨源对齐边和 Manifest-to-risk 边，但保留代码侧 risk 表达；No-risk 则删除全部 risk 节点。
+
+### 9.3 Stage 2：引入可靠性与冲突感知 fusion
+
+```bash
+python run.py stage2
+```
+
+包括：
+
+```text
+latent content only
+reliability only
+conflict only
+source-score bias only
+no reliability
+no conflict
+no source-score bias
+full fusion
+```
+
+Stage 2 仍然只使用 CE 且不使用训练扰动，确保鲁棒变化来自 fusion 本身。
+
+这里的 `conflict` 实际是跨源语义分歧代理，不是可观测的逻辑矛盾。由于两源证据可能天然互补，只有当 conflict 消融和盲扰动实验共同证明其有效时，才能将它作为创新点；否则应降级为诊断量，不能过度宣称“冲突检测”。
+
+### 9.4 Stage 3：引入可靠性感知多视图 KL
+
+```bash
+python run.py stage3
+```
+
+比较：
+
+```text
+Full fusion CE
+Full fusion Plain-KL
+Full fusion Compact-KL
 Compact-KL w=0.02
 Compact-KL w=0.10
 ```
 
-核心结论应证明：
+核心结论应检验：
 
 ```text
-Plain-KL 相比 CE-only 提升鲁棒性；
-Compact-KL 相比 Plain-KL 在退化视图下更稳定；
-过强或过弱 consistency weight 都可能影响性能。
+Plain-KL 是否提升退化视图稳定性；
+Compact-KL 是否优于等权 Plain-KL；
+consistency weight 是否存在稳定区间。
 ```
-
-### 9.3 图结构与证据源消融
-
-```bash
-python run.py r1_graph
-```
-
-包括：
-
-```text
-code_only
-manifest_only
-no_edge_source
-no_node_quality
-no_edge_quality
-no_alignment
-no_risk_nodes
-```
-
-严格单源实验使用 `masked_node_types`。
-
-`code_only` 通常 mask：
-
-```yaml
-model:
-  masked_node_types:
-    - PERMISSION
-    - COMPONENT
-    - INTENT
-    - RISK_SEMANTIC
-```
-
-`manifest_only` 通常 mask：
-
-```yaml
-model:
-  masked_node_types:
-    - METHOD
-    - API_FAMILY
-    - STRING_HINT
-    - RISK_SEMANTIC
-```
-
-`no_risk_nodes` 单独验证派生风险语义节点的贡献。
-
-### 9.4 Fusion 消融
-
-```bash
-python run.py r3_fusion
-```
-
-包括：
-
-```text
-no_reliability_bias
-no_conflict_bias
-mean_fusion
-```
-
-重点观察：
-
-```text
-manifest_noisy
-manifest_shuffled
-manifest_noisy_blind
-manifest_shuffled_blind
-manifest_missing
-```
-
-目标是证明可靠性与冲突感知 fusion 可以降低 Manifest shortcut 依赖。
 
 ---
 
@@ -567,7 +555,7 @@ Brier Score
 Robustness Drop
 ```
 
-checkpoint 选择建议使用 `robust_composite`，即 clean validation 与代表性 robust validation 的综合指标。
+递进式主实验统一使用 clean validation Macro-F1 选择 checkpoint，避免鲁棒场景泄漏进模型选择。`robust_composite` 只适合额外的部署导向实验，不应与递进式主表直接比较。
 
 ---
 
@@ -934,9 +922,9 @@ pytest tests/test_aeg_smoke.py
 ```bash
 python run.py final --dry-run
 python run.py full_seeds --dry-run
-python run.py loss --dry-run
-python run.py r1_graph --dry-run
-python run.py r3_fusion --dry-run
+python run.py stage1 --dry-run
+python run.py stage2 --dry-run
+python run.py stage3 --dry-run
 python run.py all --dry-run
 ```
 
@@ -946,13 +934,9 @@ dry-run 应只出现当前路径：
 main/full_compact_kl_seed42.yaml
 main/full_compact_kl_seed43.yaml
 main/full_compact_kl_seed44.yaml
-loss/ce_only.yaml
-loss/plain_kl.yaml
-loss/compact_kl.yaml
-loss/compact_kl_w002.yaml
-loss/compact_kl_w010.yaml
-r1_graph/...
-r3_fusion/...
+stage1/...
+stage2/...
+stage3/...
 ```
 
 不应出现旧路径：
@@ -986,60 +970,62 @@ PY
 
 ## 17. 论文实验对应关系
 
-### RQ1：源感知异构证据图是否有效？
+### RQ1：源感知异构证据图是否有效，且其鲁棒性瓶颈是什么？
 
 运行：
 
 ```bash
-python run.py r1_graph
+python run.py stage1
 ```
 
 比较：
 
 ```text
-Full AEG
-Code-only
+AEG-only CE
+API-only CE
+Graph-only CE
 Manifest-only
-No edge source
-No node quality
-No edge quality
+No source metadata
+No relation types
+No quality
 No alignment
-No risk nodes
+No risk
 ```
 
-### RQ2：可靠性感知 KL 一致性是否提升鲁棒性？
+### RQ2：可靠性 / 冲突感知 fusion 是否缓解来源依赖？
 
 运行：
 
 ```bash
-python run.py loss
+python run.py stage2
 ```
 
 比较：
 
 ```text
-CE-only
-Plain-KL
-Compact-KL
-Compact-KL w=0.02
-Compact-KL w=0.10
+Latent content only
+Reliability only
+Conflict only
+Source only
+No reliability / no conflict / no source-score bias
+Full fusion CE
 ```
 
-### RQ3：可靠性 / 冲突感知 fusion 是否抑制 Manifest shortcut？
+### RQ3：可靠性感知 KL 一致性是否进一步提升鲁棒性？
 
 运行：
 
 ```bash
-python run.py r3_fusion
+python run.py stage3
 ```
 
 比较：
 
 ```text
-Full fusion
-No reliability bias
-No conflict bias
-Mean fusion
+Full fusion CE
+Full fusion Plain-KL
+Full fusion Compact-KL
+Compact-KL weight sweep
 ```
 
 重点分析：
@@ -1119,18 +1105,21 @@ Obfuscapk external evaluation：至少对 full method、CE-only、Plain-KL、Com
 
 ```text
 Full compact-KL, 3 seeds
-CE-only
+AEG-only CE
+Full fusion CE
 Plain-KL
 Compact-KL
-Code-only
+API-only
+Graph-only
 Manifest-only
-No edge source
-No node quality
+No source metadata
+No relation types
+No quality
 No alignment
-No risk nodes
+No risk
 No reliability bias
 No conflict bias
-Mean fusion
+No source bias
 Obfuscapk external evaluation
 Obfuscapk paired flip-rate summary
 ```
@@ -1145,3 +1134,5 @@ Obfuscapk paired flip-rate summary
 4. paired evaluation 前必须检查 `source_id_rate`、`pair_rate` 和 `label_mismatch_rate`。
 5. 如果 `label_mismatch_rate > 0`，不要把 paired flip-rate 结果写进论文主表，应先修复 label mapping。
 6. 当前方法不要再写成 contrastive learning，应统一写成 reliability-aware multi-view KL consistency learning。
+7. Graph-only 仍受敏感 API 中心子图选择影响，不得宣称为 API-independent baseline。
+8. `code_manifest_conflict` 是语义分歧代理；没有消融和盲扰动证据时，不得宣称模型识别了真实逻辑冲突。

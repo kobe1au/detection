@@ -1,14 +1,12 @@
-base: ../base.yaml
+base: ../stage2/full_fusion_ce.yaml
 
 train:
   seed: 42
   output_dir: results/aeg_robust/main/full_compact_kl_seed42
 
-eval:
-  seed: 2026
+robust:
+  train_aug: true
 
 loss:
   mode: compact_kl
-  ce_weight: 1.0
   consistency_weight: 0.05
-  aug_ce_weight: 0.0

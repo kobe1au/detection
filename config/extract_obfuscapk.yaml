@@ -37,7 +37,7 @@ data:
 
 manifest:
   # Always reuse the canonical train-only vocabulary.
-  vocab_path: config/manifest_vocab_aeg.yaml
+  vocab_path: config/extract/manifest_vocab_aeg.yaml
   rebuild_vocab: false
 
 execution:

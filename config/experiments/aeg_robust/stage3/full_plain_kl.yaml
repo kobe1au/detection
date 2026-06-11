@@ -1,0 +1,11 @@
+base: ../stage2/full_fusion_ce.yaml
+
+train:
+  output_dir: results/aeg_robust/stage3/full_plain_kl
+
+robust:
+  train_aug: true
+
+loss:
+  mode: plain_kl
+  consistency_weight: 0.05

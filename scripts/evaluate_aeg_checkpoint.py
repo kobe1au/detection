@@ -14,7 +14,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from fusion.dataset import AEGDataset  # noqa: E402
-from fusion.constants import AEG_PAYLOAD_CONTRACT_FINGERPRINT  # noqa: E402
 from fusion.io_utils import load_aeg_payload, load_checkpoint  # noqa: E402
 from fusion.model import build_model  # noqa: E402
 from fusion.train import _device, _loader, _write_rows, evaluate  # noqa: E402
@@ -115,9 +114,6 @@ def run(checkpoint: Path, scenario_config: Path, output_dir: Path) -> None:
     cfg = dict(ckpt.get("cfg") or {})
     if not cfg:
         raise ValueError("Checkpoint does not contain its training config")
-    checkpoint_contract = str(ckpt.get("aeg_payload_contract_fingerprint") or "")
-    if checkpoint_contract and checkpoint_contract != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
-        raise ValueError("Checkpoint AEG payload contract does not match the current code")
     scenarios = (_load_yaml(scenario_config).get("scenarios") or {})
     if not scenarios:
         raise ValueError("Evaluation config requires a non-empty scenarios mapping")

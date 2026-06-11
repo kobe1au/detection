@@ -1,0 +1,8 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/stage2/latent_source_bias_ce
+
+model:
+  fusion_mode: latent
+  source_bias_weight: 1.0

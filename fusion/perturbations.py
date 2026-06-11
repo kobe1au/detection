@@ -81,11 +81,32 @@ def _soft_degrade_nodes(data: Data, mask: torch.Tensor, strength: float, *, zero
             data.node_semantic[mask] = 0.0
         return
     data.node_quality[mask] = data.node_quality[mask] * (1.0 - strength)
-    if hasattr(data, "node_semantic"):
-        data.node_semantic[mask] = data.node_semantic[mask] * (1.0 - strength)
+    _degrade_semantic(data, mask, strength, noise=noise)
     data.x[mask] = data.x[mask] * (1.0 - 0.5 * strength)
     if noise:
         data.x[mask] = data.x[mask] + torch.randn_like(data.x[mask]) * strength * 0.1
+
+
+def _degrade_semantic(
+    data: Data,
+    mask: torch.Tensor,
+    strength: float,
+    *,
+    zero: bool = False,
+    noise: bool = False,
+) -> None:
+    if not hasattr(data, "node_semantic") or mask.numel() == 0 or not bool(mask.any()):
+        return
+    strength = _clamp_strength(strength)
+    if zero:
+        data.node_semantic[mask] = 0.0
+    elif noise:
+        semantic = data.node_semantic[mask]
+        data.node_semantic[mask] = (
+            semantic * (1.0 - strength) + torch.rand_like(semantic) * strength
+        ).clamp_min(0.0)
+    else:
+        data.node_semantic[mask] = data.node_semantic[mask] * (1.0 - strength)
 
 
 def _soft_degrade_edges(data: Data, mask: torch.Tensor, strength: float, *, zero: bool = False) -> None:
@@ -236,6 +257,34 @@ def refresh_risk_node_quality(data: Data) -> None:
             data.node_semantic[risk_idx] = 0.0
 
 
+def _manifest_only_risk_mask(data: Data) -> torch.Tensor:
+    mask = torch.zeros((int(data.x.size(0)),), dtype=torch.bool, device=data.x.device)
+    if not hasattr(data, "edge_type") or not hasattr(data, "edge_quality") or data.edge_index.numel() == 0:
+        return mask
+    risk_nodes = torch.where(_node_mask(data, node_types={NODE_TYPES["RISK_SEMANTIC"]}))[0]
+    if risk_nodes.numel() == 0:
+        return mask
+    edge_type = data.edge_type.to(data.x.device)
+    edge_quality = data.edge_quality.to(data.x.device).float().view(-1)
+    src, dst = data.edge_index.to(data.x.device).long()
+    code_types = torch.tensor(
+        [EDGE_TYPES["METHOD_HAS_RISK"], EDGE_TYPES["RISK_OBSERVED_IN_METHOD"]],
+        device=data.x.device,
+    )
+    manifest_types = torch.tensor(
+        [EDGE_TYPES["MANIFEST_HAS_RISK"], EDGE_TYPES["RISK_DECLARED_BY_MANIFEST"]],
+        device=data.x.device,
+    )
+    live = edge_quality > 0
+    for risk_idx in risk_nodes.tolist():
+        incident = ((src == risk_idx) | (dst == risk_idx)) & live
+        has_code = bool((incident & torch.isin(edge_type, code_types)).any())
+        has_manifest = bool((incident & torch.isin(edge_type, manifest_types)).any())
+        if has_manifest and not has_code:
+            mask[risk_idx] = True
+    return mask
+
+
 def _degrade_api(data: Data, strength: float, *, missing: bool = False) -> None:
     # STRING_HINT evidence is derived from both method names and API tokens.
     # Until provenance is separable, degrade it with either code modality to
@@ -274,8 +323,8 @@ def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noi
         # without being explicitly told that manifest is corrupted
         if bool(manifest_nodes.any()):
             strength = _clamp_strength(strength)
-            if hasattr(data, "node_semantic"):
-                data.node_semantic[manifest_nodes] = data.node_semantic[manifest_nodes] * (1.0 - strength)
+            _degrade_semantic(data, manifest_nodes, strength, noise=noisy)
+            _degrade_semantic(data, _manifest_only_risk_mask(data), strength, noise=noisy)
             data.x[manifest_nodes] = data.x[manifest_nodes] * (1.0 - 0.5 * strength)
             if noisy:
                 data.x[manifest_nodes] = data.x[manifest_nodes] + torch.randn_like(data.x[manifest_nodes]) * strength * 0.1
@@ -286,6 +335,7 @@ def _degrade_manifest(data: Data, strength: float, *, missing: bool = False, noi
 
     # Non-blind mode: normal degradation with pert_manifest update
     _soft_degrade_nodes(data, manifest_nodes, strength, zero=missing, noise=noisy)
+    _degrade_semantic(data, _manifest_only_risk_mask(data), strength, zero=missing, noise=noisy)
     _soft_degrade_edges(data, manifest_edges, strength, zero=missing)
     clear_aggregate_apk_semantic(data)
     # ⚠️ Only set pert_manifest in non-blind mode

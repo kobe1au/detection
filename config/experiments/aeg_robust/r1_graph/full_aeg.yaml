@@ -1,8 +1,0 @@
-base: ../base.yaml
-
-train:
-  output_dir: results/aeg_robust/r1_graph/full_aeg
-
-loss:
-  mode: compact_kl
-  consistency_weight: 0.05

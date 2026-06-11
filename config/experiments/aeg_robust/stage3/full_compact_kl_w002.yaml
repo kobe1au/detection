@@ -1,0 +1,7 @@
+base: ../main/full_compact_kl_seed42.yaml
+
+train:
+  output_dir: results/aeg_robust/stage3/full_compact_kl_w002
+
+loss:
+  consistency_weight: 0.02

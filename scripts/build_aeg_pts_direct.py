@@ -18,7 +18,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from fusion.config_utils import load_config as _load_config  # noqa: E402
-from fusion.constants import AEG_PAYLOAD_CONTRACT_VERSION, AEG_SCHEMA_VERSION, stable_table_hash  # noqa: E402
+from fusion.constants import (  # noqa: E402
+    AEG_PAYLOAD_CONTRACT_VERSION,
+    AEG_SCHEMA_VERSION,
+    stable_table_hash,
+)
 from fusion.io_utils import load_aeg_payload  # noqa: E402
 from fusion.payload_contract import validate_aeg_payload  # noqa: E402
 
@@ -484,7 +488,7 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     out_dirs = _resolve_out_dirs(data, out_root, splits)
     label_csvs = _resolve_label_csvs(data, splits)
     train_label_csv_for_vocab = _resolve_optional_train_label_csv(data)
-    vocab_path = _resolve_path(manifest.get("vocab_path", "config/manifest_vocab_aeg.yaml"))
+    vocab_path = _resolve_path(manifest.get("vocab_path", "config/extract/manifest_vocab_aeg.yaml"))
     rebuild_vocab = bool(args.rebuild_vocab if args.rebuild_vocab is not None else manifest.get("rebuild_vocab", False))
     resume = bool(args.resume if args.resume is not None else execution.get("resume", True))
     vocab_will_be_built = rebuild_vocab or not vocab_path.exists()
@@ -507,7 +511,7 @@ def _parse_config(raw: dict[str, Any], args: argparse.Namespace) -> dict[str, An
             raise ValueError(
                 "graph.use_behavior_hints=true requires aeg.node_feature_dim >= "
                 f"{required_dim} (2 * graph.vocab_size + 3 + 4); got {node_feature_dim}. "
-                "Use config/extract_aeg_behavior_hints.yaml or disable behavior hints."
+                "Use config/extract/extract_aeg_behavior_hints.yaml or disable behavior hints."
             )
     workers = int(args.workers or execution.get("workers", 1))
     hash_workers = int(execution.get("hash_workers", min(workers, 4)))
@@ -691,18 +695,15 @@ def _validate_vocab_matches_train_csv(vocab: dict[str, Any], cfg: dict[str, Any]
         return
     train_ids = sorted(_read_label_ids(train_label_csv))
     expected_count = len(train_ids)
-    expected_fingerprint = stable_table_hash(train_ids)
     metadata = vocab.get("metadata") or {}
     try:
         observed_count = int(metadata.get("source_sample_count"))
     except (TypeError, ValueError):
         observed_count = -1
-    observed_fingerprint = str(metadata.get("source_id_fingerprint") or "")
-    if observed_count != expected_count or observed_fingerprint != expected_fingerprint:
+    if observed_count != expected_count:
         raise ValueError(
             "Manifest vocab metadata does not match the configured train CSV. "
             f"expected_count={expected_count} observed_count={observed_count} "
-            f"expected_fingerprint={expected_fingerprint} observed_fingerprint={observed_fingerprint}. "
             "Rebuild the Manifest vocab from the current train split."
         )
 
@@ -724,11 +725,7 @@ def _out_path(job: dict[str, Any], cfg: dict[str, Any]) -> Path:
 
 
 def _resume_existing(job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, str] | None:
-    """Check if existing PT file is compatible (relaxed validation without fingerprint).
-
-    Only validates schema compatibility, not code identity. This allows code changes
-    (comments, refactoring, training logic) without invalidating all PT files.
-    """
+    """Check if an existing PT matches required versions and tensor structure."""
     if not cfg["resume"]:
         return None
     out_path = _out_path(job, cfg)
@@ -740,7 +737,6 @@ def _resume_existing(job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, str]
         # ✅ Check schema version (affects PT structure)
         if existing.get("schema_version") != AEG_SCHEMA_VERSION:
             return None
-
         # ✅ Check contract version (required fields list)
         if existing.get("aeg_payload_contract_version") != AEG_PAYLOAD_CONTRACT_VERSION:
             return None
@@ -759,9 +755,6 @@ def _resume_existing(job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, str]
                     "edge_source", "node_quality", "edge_quality", "node_semantic"]
         if not all(field in existing for field in required):
             return None
-
-        # ⚠️ Fingerprint check removed - only structural compatibility matters
-        # This allows code refactoring/optimization without invalidating PT files
 
         return _index_row(job, out_path, "ok", "resume")
     except Exception:
@@ -997,7 +990,6 @@ def run(args: argparse.Namespace) -> None:
     if cfg["vocab_only"]:
         print(f"Manifest vocab ready: {cfg['vocab_path']}")
         return
-
     resume_rows: list[dict[str, str]] = []
     pending_jobs: list[dict[str, Any]] = []
     for job in jobs:

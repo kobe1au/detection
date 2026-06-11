@@ -1,0 +1,7 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/stage1/aeg_no_relation_types_ce
+
+model:
+  use_relation_types: false

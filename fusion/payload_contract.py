@@ -6,10 +6,8 @@ from typing import Any
 import torch
 
 from fusion.constants import (
-    AEG_PAYLOAD_CONTRACT_FINGERPRINT,
     AEG_PAYLOAD_CONTRACT_VERSION,
     AEG_REQUIRED_PAYLOAD_FIELDS,
-    AEG_SCHEMA_TABLE_FINGERPRINT,
     AEG_SCHEMA_TABLES,
     AEG_SCHEMA_VERSION,
     NUM_EDGE_TYPES,
@@ -62,20 +60,16 @@ def validate_aeg_payload(
         raise AEGPayloadContractError(
             f"AEG schema version mismatch: got={payload['schema_version']} expected={AEG_SCHEMA_VERSION}"
         )
-    if payload["aeg_schema_fingerprint"] != AEG_SCHEMA_TABLE_FINGERPRINT:
-        raise AEGPayloadContractError("AEG schema table fingerprint mismatch")
     if int(payload["aeg_payload_contract_version"]) != AEG_PAYLOAD_CONTRACT_VERSION:
         raise AEGPayloadContractError("AEG payload contract version mismatch")
-    if payload["aeg_payload_contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
-        raise AEGPayloadContractError("AEG payload contract fingerprint mismatch")
     if str(payload["sid"]).lower() != str(payload["sha256"]).lower():
         raise AEGPayloadContractError("AEG sid and sha256 do not match")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["sha256"]).lower()) is None:
         raise AEGPayloadContractError("AEG sha256 must be a 64-character hexadecimal digest")
 
     meta = payload["aeg_meta"]
-    if not isinstance(meta, dict) or meta.get("schema_fingerprint") != AEG_SCHEMA_TABLE_FINGERPRINT:
-        raise AEGPayloadContractError("AEG payload has invalid aeg_meta schema fingerprint")
+    if not isinstance(meta, dict):
+        raise AEGPayloadContractError("AEG payload has invalid aeg_meta")
     for key, expected in AEG_SCHEMA_TABLES.items():
         if dict(meta.get(key) or {}) != expected:
             raise AEGPayloadContractError(f"AEG payload has invalid aeg_meta {key}")

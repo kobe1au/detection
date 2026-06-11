@@ -311,14 +311,15 @@ def build_aeg_payload(
     q_align = compute_align_quality(q_api, q_graph, method_api_edge_index, num_methods, num_api)
 
     builder = _GraphBuilder(node_feature_dim)
-    apk_sem = (
-        sanitize_semantic_counts(api_semantic_counts_from_type_ids(api_type_ids))
-        + sanitize_semantic_counts(manifest_payload.get("manifest_category_counts"))
-    )
     # Quality is represented by node_quality and graph-level q_* fields. Keep
-    # node_x content-only so quality ablations cannot recover the same signal
-    # through a duplicated feature channel.
-    apk_node = builder.add_node("APK", "derived", max(q_api, q_graph, q_manifest), apk_sem)
+    # the APK anchor content-free so it cannot leak pre-aggregated API/Manifest
+    # semantics back into source-isolated branches.
+    apk_node = builder.add_node(
+        "APK",
+        "derived",
+        max(q_api, q_graph, q_manifest),
+        torch.zeros(SEMANTIC_CATEGORY_DIM),
+    )
 
     method_nodes = []
     method_sem = torch.zeros((num_methods, SEMANTIC_CATEGORY_DIM), dtype=torch.float32)

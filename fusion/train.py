@@ -236,6 +236,10 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
     train_seed = int(train_cfg.get("seed", 42))
     eval_seed = int((cfg.get("eval", {}) or {}).get("seed", 2026))
     generator.manual_seed(train_seed if train else eval_seed)
+    loader_kwargs: dict[str, Any] = {}
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = int(train_cfg.get("prefetch_factor", 2))
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -249,6 +253,7 @@ def _loader(cfg: dict[str, Any], dataset: AEGDataset, *, train: bool) -> DataLoa
         generator=generator,
         worker_init_fn=_seed_worker if workers > 0 else None,
         collate_fn=aeg_collate_fn,
+        **loader_kwargs,
     )
 
 
@@ -268,9 +273,7 @@ def _sample_build_metadata(path: Path, cache: dict[Path, dict[str, Any]]) -> dic
         metadata = {
             "package_name": str(payload.get("package_name") or "").strip().lower(),
             "schema_version": int(payload.get("schema_version", 0) or 0),
-            "schema_fingerprint": str(payload.get("aeg_schema_fingerprint") or ""),
             "contract_version": int(payload.get("aeg_payload_contract_version", 0) or 0),
-            "contract_fingerprint": str(payload.get("aeg_payload_contract_fingerprint") or ""),
             "node_feature_dim": int(node_x.size(1)),
         }
     except Exception as exc:
@@ -307,12 +310,8 @@ def _validate_split_isolation(
 
             if metadata["schema_version"] != AEG_SCHEMA_VERSION:
                 invalid_metadata.append((sid, dataset.split, f"schema_version={metadata['schema_version']}"))
-            elif metadata["schema_fingerprint"] != AEG_SCHEMA_TABLE_FINGERPRINT:
-                invalid_metadata.append((sid, dataset.split, "schema_fingerprint_mismatch"))
             elif metadata["contract_version"] != AEG_PAYLOAD_CONTRACT_VERSION:
                 invalid_metadata.append((sid, dataset.split, f"contract_version={metadata['contract_version']}"))
-            elif metadata["contract_fingerprint"] != AEG_PAYLOAD_CONTRACT_FINGERPRINT:
-                invalid_metadata.append((sid, dataset.split, "contract_fingerprint_mismatch"))
 
             if check_package:
                 package = metadata["package_name"]
@@ -359,8 +358,9 @@ def _validate_split_isolation(
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     out = dict(batch)
-    out["clean"] = batch["clean"].to(device)
-    out["aug"] = batch["aug"].to(device)
+    non_blocking = device.type == "cuda"
+    out["clean"] = batch["clean"].to(device, non_blocking=non_blocking)
+    out["aug"] = batch["aug"].to(device, non_blocking=non_blocking)
     return out
 
 
@@ -407,7 +407,8 @@ def train_one_epoch(
         optimizer.step()
 
         for key, value in parts.items():
-            totals[key] = totals.get(key, 0.0) + float(value)
+            if isinstance(value, (int, float)):
+                totals[key] = totals.get(key, 0.0) + float(value)
         steps += 1
 
     if steps == 0:
@@ -435,7 +436,7 @@ def evaluate(
     preds: list[int] = []
     rows: list[dict[str, Any]] = []
     for batch in tqdm(loader, desc=split_name, leave=False):
-        data = batch[batch_key].to(device)
+        data = batch[batch_key].to(device, non_blocking=(device.type == "cuda"))
         logits, extra = model(data)
         prob = torch.softmax(logits, dim=-1)[:, 1].detach().cpu()
         pred = logits.argmax(dim=-1).detach().cpu()
@@ -598,11 +599,6 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
     loss_mode = str(loss_cfg.get("mode", "compact_kl")).lower()
     train_aug_requested = bool(robust_cfg.get("train_aug", True))
 
-    if loss_mode in {"plain_kl", "compact_kl"} and not train_aug_requested:
-        raise ValueError(
-            f"loss.mode={loss_mode} requires robust.train_aug=true."
-        )
-
     train_aug_enabled = train_aug_requested and loss_mode in {"plain_kl", "compact_kl"}
     batch_size = int(train_cfg.get("batch_size", 24))
     
@@ -650,6 +646,16 @@ def run(cfg: dict[str, Any], *, config_path: str | Path | None = None) -> dict[s
     _write_json(metadata_path, metadata)
 
     try:
+        if loss_mode not in {"ce_only", "plain_kl", "compact_kl"}:
+            raise ValueError(
+                f"Unsupported loss.mode={loss_mode!r}. "
+                "Expected one of: ce_only, plain_kl, compact_kl."
+            )
+        if loss_mode in {"plain_kl", "compact_kl"} and not train_aug_requested:
+            raise ValueError(
+                f"loss.mode={loss_mode} requires robust.train_aug=true."
+            )
+
         train_ds = _make_dataset(cfg, "train", aug=train_aug_enabled)
         val_ds = _make_dataset(cfg, "val", aug=False)
         test_ds = _make_dataset(cfg, "test", aug=False)

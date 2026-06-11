@@ -350,7 +350,8 @@ def _copy_manifest_content(target: Data, donor: Data | None, *, blind: bool = Fa
         target.q_manifest = donor.q_manifest.clone()
         target.pert_manifest = torch.tensor([1.0], dtype=torch.float32, device=target.x.device)
 
-    _zero_shuffled_manifest_edges(target)
+    if not blind:
+        _zero_shuffled_manifest_edges(target)
     clear_aggregate_apk_semantic(target)
     refresh_apk_node_quality(target)
     refresh_risk_node_quality(target)

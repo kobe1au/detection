@@ -112,7 +112,7 @@ def validate_one_pt(path: Path, *, expected_dim: int) -> tuple[bool, list[str], 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, default=Path("config/extract_aeg.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("config/extract/extract_aeg.yaml"))
     parser.add_argument("--sample-per-split", type=int, default=100)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--seed", type=int, default=42)

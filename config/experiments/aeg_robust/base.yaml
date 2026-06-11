@@ -3,16 +3,16 @@ data:
   enforce_package_isolation: true
 
   train:
-    pt_dir: D:/pts_aeg/train
-    csv: results/labels/train.csv
+    pt_dir: /root/autodl-tmp/pts/train
+    csv: labels/train.csv
 
   val:
-    pt_dir: D:/pts_aeg/val
-    csv: results/labels/val.csv
+    pt_dir: /root/autodl-tmp/pts/val
+    csv: labels/val.csv
 
   test:
-    pt_dir: D:/pts_aeg/test
-    csv: results/labels/test.csv
+    pt_dir: /root/autodl-tmp/pts/test
+    csv: labels/test.csv
 
 train:
   seed: 42
@@ -21,16 +21,19 @@ train:
 
   epochs: 60
   patience: 8
-  batch_size: 24
-  eval_batch_size: 48
+  batch_size: 32
+  eval_batch_size: 96
 
   lr: 0.0003
   weight_decay: 0.01
   grad_clip: 1.0
 
-  checkpoint_metric: robust_composite
-  num_workers: 0
-  pin_memory: false
+  # Select every staged method on clean validation only. Robust test metrics
+  # remain post-hoc evidence instead of leaking into checkpoint selection.
+  checkpoint_metric: macro_f1
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
 
 eval:
   seed: 2026
@@ -53,7 +56,7 @@ eval:
     - 0.5
 
   robust_val:
-    enabled: true
+    enabled: false
     clean_weight: 0.5
     scenarios:
       - name: api_graph_degraded
@@ -70,8 +73,10 @@ eval:
         weight: 0.3
 
 robust:
-  train_aug: true
-  perturb_prob: 0.5
+  train_aug: false
+  # When an innovation-3 config enables training augmentation, every sample
+  # receives a real degraded view instead of wasting a second clean forward.
+  perturb_prob: 1.0
   perturb_strengths:
     - 0.1
     - 0.3
@@ -83,15 +88,17 @@ robust:
     - api_graph_degraded
     - manifest_noisy
     - manifest_shuffled
+    - manifest_noisy_blind
+    - manifest_shuffled_blind
     - manifest_missing
     - all_degraded
 
   manifest_donor_mode: cyclic
 
 loss:
-  mode: compact_kl
+  mode: ce_only
   ce_weight: 1.0
-  consistency_weight: 0.05
+  consistency_weight: 0.0
   aug_ce_weight: 0.0
 
 model:
@@ -99,7 +106,7 @@ model:
   layers: 2
   dropout: 0.15
   num_latents: 16
-  fusion_mode: latent
+  fusion_mode: masked_mean
   num_classes: 2
 
   use_relation_types: true
@@ -109,8 +116,8 @@ model:
   use_node_quality: true
   use_edge_quality: true
 
-  reliability_bias_weight: 1.0
-  conflict_bias_weight: 0.5
-  source_bias_weight: 1.0
+  reliability_bias_weight: 0.0
+  conflict_bias_weight: 0.0
+  source_bias_weight: 0.0
 
   allow_node_dim_adapt: false

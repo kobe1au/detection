@@ -1,0 +1,8 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/stage1/aeg_no_source_metadata_ce
+
+model:
+  use_node_source: false
+  use_edge_source: false

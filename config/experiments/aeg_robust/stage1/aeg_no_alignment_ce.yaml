@@ -1,0 +1,13 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/stage1/aeg_no_alignment_ce
+
+model:
+  masked_edge_types:
+    - PERMISSION_RELATED_TO_API_FAMILY
+    - API_FAMILY_RELATED_TO_PERMISSION
+    - COMPONENT_MATCHES_METHOD
+    - METHOD_MATCHES_COMPONENT
+    - MANIFEST_HAS_RISK
+    - RISK_DECLARED_BY_MANIFEST

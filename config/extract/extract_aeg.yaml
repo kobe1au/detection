@@ -43,7 +43,7 @@ api:
   include_descriptor: false
 
 manifest:
-  vocab_path: config/manifest_vocab_aeg.yaml
+  vocab_path: config/extract/manifest_vocab_aeg.yaml
   rebuild_vocab: false
   manifest_dim: 256
   max_permissions: 128

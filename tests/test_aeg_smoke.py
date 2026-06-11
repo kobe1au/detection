@@ -11,20 +11,20 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
-from tensorboard import summary
 import torch
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 
 from fusion.aeg_builder import _compress_method_feature, build_aeg_payload
-from fusion.constants import AEG_SCHEMA_VERSION, EDGE_TYPES, NODE_TYPES, VIEW_TYPES
+from fusion.constants import AEG_SCHEMA_VERSION, EDGE_TYPES, NODE_TYPES, SOURCE_TYPES, VIEW_TYPES
 from fusion.dataset import AEGDataset, AEGDatasetConfigError, aeg_collate_fn, payload_to_data
 from fusion.io_utils import load_aeg_payload, load_checkpoint
-from fusion.losses import compute_aeg_loss
+from fusion.losses import _consistency_weight, _weighted_symmetric_kl, compute_aeg_loss
 from fusion.manifest_features import build_manifest_vocab, extract_manifest_record, vectorize_manifest_record
 from fusion.model import AEGModel, build_model
 from fusion.perturbations import apply_aeg_view
 from fusion.payload_contract import validate_aeg_payload
+from fusion.quality import compute_api_quality, compute_graph_quality
 from fusion.train import _validate_split_isolation, load_config, run
 import fusion.train as train_module
 
@@ -184,7 +184,7 @@ def test_aeg_perturbation_updates_reliability():
     _, extra = AEGModel(node_input_dim=data.x.size(1), hidden_dim=16, layers=1, num_latents=2)(
         Batch.from_data_list([data])
     )
-    expected = (data.q_api * data.q_graph).sqrt() * (0.5 + 0.5 * data.q_align)
+    expected = 0.5 * (data.q_api + data.q_graph)
     assert torch.allclose(extra["code_reliability"].cpu(), expected.view(-1), atol=1e-6)
 
 
@@ -325,11 +325,13 @@ def test_manifest_shuffle_blind_keeps_reliability_scalars(tmp_path: Path):
     data_a = payload_to_data(payload_a, label=1)
     data_b = payload_to_data(payload_b, label=0)
     aug = apply_aeg_view(data_a, view="manifest_shuffled_blind", strength=1.0)
+    edge_quality_before = aug.edge_quality.clone()
     batch = aeg_collate_fn([{"clean": data_a, "aug": aug, "manifest_donor": data_b}])
     shuffled = batch["aug"].to_data_list()[0]
     assert shuffled.view_type_id.item() == VIEW_TYPES["manifest_shuffled_blind"]
     assert torch.allclose(shuffled.q_manifest.cpu(), data_a.q_manifest.cpu())
     assert shuffled.pert_manifest.item() == data_a.pert_manifest.item()
+    assert torch.equal(shuffled.edge_quality.cpu(), edge_quality_before.cpu())
     _, extra = AEGModel(node_input_dim=shuffled.x.size(1), hidden_dim=16, layers=1, num_latents=2)(
         Batch.from_data_list([shuffled])
     )
@@ -338,10 +340,14 @@ def test_manifest_shuffle_blind_keeps_reliability_scalars(tmp_path: Path):
 
 def test_manifest_noisy_blind_does_not_change_reliability_scalars():
     data = payload_to_data(_payload(), label=1)
+    manifest_mask = data.node_source == SOURCE_TYPES["manifest"]
+    semantic_before = data.node_semantic[manifest_mask].clone()
+    torch.manual_seed(7)
     aug = apply_aeg_view(data, view="manifest_noisy_blind", strength=0.7)
     assert aug.view_type_id.item() == VIEW_TYPES["manifest_noisy_blind"]
     assert torch.allclose(aug.q_manifest.cpu(), data.q_manifest.cpu())
     assert torch.allclose(aug.pert_manifest.cpu(), data.pert_manifest.cpu())
+    assert not torch.allclose(aug.node_semantic[manifest_mask].cpu(), semantic_before.cpu())
 
 
 def test_manifest_shuffle_default_donor_is_label_agnostic():
@@ -398,6 +404,76 @@ def test_reliability_uses_raw_quality_and_single_perturbation_factor():
     assert torch.allclose(extra["r_api"], clean.q_api.view(-1) * 0.5, atol=1e-6)
 
 
+def test_code_reliability_survives_one_missing_code_branch():
+    clean = payload_to_data(_payload(), label=1)
+    model = AEGModel(node_input_dim=clean.x.size(1), hidden_dim=16, layers=1, num_latents=2, dropout=0.0)
+
+    api_missing = apply_aeg_view(clean, view="api_missing", strength=1.0)
+    _, api_extra = model(Batch.from_data_list([api_missing]))
+    assert torch.allclose(api_extra["code_reliability"], api_missing.q_graph.view(-1), atol=1e-6)
+
+    graph_missing = apply_aeg_view(clean, view="graph_missing", strength=1.0)
+    _, graph_extra = model(Batch.from_data_list([graph_missing]))
+    assert torch.allclose(graph_extra["code_reliability"], graph_missing.q_api.view(-1), atol=1e-6)
+
+
+def test_alignment_quality_does_not_leak_into_code_reliability():
+    payload_low = _payload()
+    payload_high = dict(payload_low)
+    payload_low["q_align"] = torch.tensor([0.0])
+    payload_high["q_align"] = torch.tensor([1.0])
+    batch = Batch.from_data_list(
+        [payload_to_data(payload_low, label=1), payload_to_data(payload_high, label=1)]
+    )
+    model = AEGModel(node_input_dim=batch.x.size(1), hidden_dim=16, layers=1, num_latents=2, dropout=0.0)
+    _, extra = model(batch)
+    assert torch.allclose(extra["code_reliability"][0], extra["code_reliability"][1], atol=1e-6)
+
+
+def test_masked_mean_and_latent_fusion_exclude_unavailable_tokens():
+    data = apply_aeg_view(payload_to_data(_payload(), label=1), view="manifest_missing", strength=1.0)
+    batch = Batch.from_data_list([data])
+    for mode in ("masked_mean", "latent"):
+        model = AEGModel(
+            node_input_dim=data.x.size(1),
+            hidden_dim=16,
+            layers=1,
+            num_latents=2,
+            dropout=0.0,
+            fusion_mode=mode,
+        )
+        _, extra = model(batch)
+        attention = extra["attention_mass"]
+        assert torch.allclose(attention.sum(dim=-1), torch.ones(1), atol=1e-6)
+        assert attention[0, 2].item() == 0.0
+        assert attention[0, 3].item() == 0.0
+
+
+def test_global_token_content_is_neutral_across_available_evidence():
+    data = payload_to_data(_payload(), label=1)
+    model = AEGModel(
+        node_input_dim=data.x.size(1),
+        hidden_dim=16,
+        layers=1,
+        num_latents=2,
+        dropout=0.0,
+        fusion_mode="latent",
+    )
+    _, extra = model(Batch.from_data_list([data]))
+    base = torch.stack(
+        [
+            extra["method_emb"],
+            extra["api_family_emb"],
+            extra["permission_emb"],
+            extra["component_emb"],
+            extra["risk_emb"],
+            extra["string_hint_emb"],
+        ],
+        dim=1,
+    )
+    assert torch.allclose(extra["global_emb"], base.mean(dim=1), atol=1e-6)
+
+
 def test_model_ablation_switches_keep_missing_evidence_masked():
     data = apply_aeg_view(payload_to_data(_payload(), label=1), view="api_missing", strength=1.0)
     model = AEGModel(
@@ -435,6 +511,26 @@ def test_model_structural_ablation_masks_configured_nodes_and_edges():
     assert EDGE_TYPES["PERMISSION_RELATED_TO_API_FAMILY"] in set(model.masked_edge_type_ids.cpu().tolist())
     _, extra = model(Batch.from_data_list([data]))
     assert torch.allclose(extra["risk_emb"].cpu(), torch.zeros_like(extra["risk_emb"].cpu()), atol=1e-6)
+
+
+def test_graph_only_semantic_ablation_removes_api_derived_method_semantics():
+    data_a = payload_to_data(_payload(), label=1)
+    data_b = data_a.clone()
+    method_mask = data_b.node_type == NODE_TYPES["METHOD"]
+    data_b.node_semantic[method_mask] = data_b.node_semantic[method_mask] + 10.0
+    model = AEGModel(
+        node_input_dim=data_a.x.size(1),
+        hidden_dim=16,
+        layers=1,
+        num_latents=2,
+        dropout=0.0,
+        fusion_mode="masked_mean",
+        masked_node_semantic_types=["METHOD"],
+    )
+    model.eval()
+    _, extra_a = model(Batch.from_data_list([data_a]))
+    _, extra_b = model(Batch.from_data_list([data_b]))
+    assert torch.allclose(extra_a["method_emb"], extra_b["method_emb"], atol=1e-6)
 
 
 def test_manifest_record_extracts_package_name(monkeypatch, tmp_path: Path):
@@ -524,6 +620,45 @@ def test_loss_modes_are_supported():
         assert parts["loss_mode"] == mode
 
 
+def test_consistency_weights_control_absolute_loss_strength():
+    clean = torch.tensor([[3.0, 0.0], [3.0, 0.0]])
+    aug = torch.tensor([[0.0, 3.0], [0.0, 3.0]])
+    full = _weighted_symmetric_kl(clean, aug, torch.ones(2))
+    quarter = _weighted_symmetric_kl(clean, aug, torch.full((2,), 0.25))
+    assert torch.allclose(quarter, full * 0.25, atol=1e-6)
+
+
+def test_plain_kl_skips_clean_augmentation_fallback():
+    clean = torch.tensor([[3.0, 0.0]], requires_grad=True)
+    aug = torch.tensor([[0.0, 3.0]], requires_grad=True)
+    extra = {"view_type_id": torch.tensor([VIEW_TYPES["clean"]])}
+    _, parts = compute_aeg_loss(
+        clean,
+        torch.tensor([0]),
+        {},
+        aug_logits=aug,
+        aug_extra=extra,
+        loss_cfg={"mode": "plain_kl", "consistency_weight": 1.0},
+    )
+    assert parts["consistency"] == 0.0
+
+
+def test_compact_kl_uses_augmented_surviving_reliability():
+    ref = torch.zeros((1, 2))
+    clean_extra = {
+        "code_reliability": torch.tensor([1.0]),
+        "manifest_reliability": torch.tensor([1.0]),
+    }
+    aug_extra = {
+        "code_reliability": torch.tensor([0.2]),
+        "manifest_reliability": torch.tensor([0.3]),
+        "cf_weight": torch.tensor([1.0]),
+        "view_type_id": torch.tensor([VIEW_TYPES["all_degraded"]]),
+    }
+    weight = _consistency_weight(clean_extra, aug_extra, ref)
+    assert torch.allclose(weight, torch.tensor([0.2]), atol=1e-6)
+
+
 def test_kl_modes_require_augmented_view():
     payload = _payload()
     batch = Batch.from_data_list([payload_to_data(payload, label=1)])
@@ -545,6 +680,36 @@ def test_aeg_config_loads(tmp_path: Path):
     assert cfg["loss"]["mode"] == "compact_kl"
     assert float(cfg["loss"]["consistency_weight"]) > 0.0
     assert cfg["robust"]["train_aug"] is True
+
+
+def test_staged_configs_isolate_innovations(tmp_path: Path):
+    cfg_root = _prepare_local_aeg_experiment_configs(tmp_path)
+
+    stage1 = load_config(cfg_root / "stage1/aeg_only_ce.yaml")
+    assert stage1["loss"]["mode"] == "ce_only"
+    assert stage1["robust"]["train_aug"] is False
+    assert stage1["model"]["fusion_mode"] == "masked_mean"
+    assert stage1["model"]["reliability_bias_weight"] == 0.0
+    assert stage1["model"]["conflict_bias_weight"] == 0.0
+    assert stage1["model"]["source_bias_weight"] == 0.0
+
+    graph_only = load_config(cfg_root / "stage1/graph_only_ce.yaml")
+    assert "METHOD" in graph_only["model"]["masked_node_semantic_types"]
+
+    no_alignment = load_config(cfg_root / "stage1/aeg_no_alignment_ce.yaml")
+    assert "MANIFEST_HAS_RISK" in no_alignment["model"]["masked_edge_types"]
+    assert "RISK_DECLARED_BY_MANIFEST" in no_alignment["model"]["masked_edge_types"]
+
+    stage2 = load_config(cfg_root / "stage2/full_fusion_ce.yaml")
+    assert stage2["loss"]["mode"] == "ce_only"
+    assert stage2["robust"]["train_aug"] is False
+    assert stage2["model"]["fusion_mode"] == "latent"
+    assert stage2["model"]["reliability_bias_weight"] > 0.0
+    assert stage2["model"]["conflict_bias_weight"] > 0.0
+
+    stage3 = load_config(cfg_root / "main/full_compact_kl_seed42.yaml")
+    assert stage3["loss"]["mode"] == "compact_kl"
+    assert stage3["robust"]["train_aug"] is True
 
 
 def test_all_aeg_experiment_configs_load_and_have_unique_outputs(tmp_path: Path):
@@ -641,9 +806,9 @@ def test_run_groups_expose_current_experiments():
     expected = {
         "main": 1,
         "loss": 5,
-        "r1_graph": 7,
-        "r3_fusion": 3,
-        "all": 14,
+        "r1_graph": 9,
+        "r3_fusion": 8,
+        "all": 23,
     }
 
     for group, minimum in expected.items():
@@ -800,6 +965,7 @@ def test_extract_behavior_hint_config_is_explicit_ablation():
     assert ablation["graph"]["use_behavior_hints"] is True
     required_dim = int(ablation["graph"]["vocab_size"]) * 2 + 3 + 4
     assert int(ablation["aeg"]["node_feature_dim"]) >= required_dim
+    assert Path(base["manifest"]["vocab_path"]).exists()
 
     broken = _load_config(Path("config/extract/extract_aeg.yaml"))
     broken["graph"]["use_behavior_hints"] = True
@@ -818,8 +984,7 @@ def test_val_test_extraction_keeps_train_vocab_guard_path():
     assert str(cfg["train_label_csv_for_vocab"]).replace("\\", "/").endswith("results/labels/train.csv")
 
 
-def test_manifest_vocab_fingerprint_must_match_train_csv(tmp_path: Path):
-    from fusion.constants import stable_table_hash
+def test_manifest_vocab_sample_count_must_match_train_csv(tmp_path: Path):
     from scripts.build_aeg_pts_direct import _validate_vocab_matches_train_csv
 
     train_ids = ["a" * 64, "b" * 64]
@@ -834,7 +999,6 @@ def test_manifest_vocab_fingerprint_must_match_train_csv(tmp_path: Path):
     bad_vocab = {
         "metadata": {
             "source_sample_count": 1,
-            "source_id_fingerprint": "bad",
         }
     }
     with pytest.raises(ValueError, match="does not match the configured train CSV"):
@@ -843,7 +1007,6 @@ def test_manifest_vocab_fingerprint_must_match_train_csv(tmp_path: Path):
     good_vocab = {
         "metadata": {
             "source_sample_count": len(train_ids),
-            "source_id_fingerprint": stable_table_hash(sorted(train_ids)),
         }
     }
     _validate_vocab_matches_train_csv(good_vocab, cfg)
@@ -1032,8 +1195,48 @@ def test_quality_is_not_duplicated_inside_node_content_features():
     api_family = node_type == NODE_TYPES["API_FAMILY"]
     permission = node_type == NODE_TYPES["PERMISSION"]
     assert torch.all(node_x[apk] == 0)
+    assert torch.all(payload["node_semantic"][apk] == 0)
     assert torch.all(node_x[api_family, 2:] == 0)
     assert torch.all(node_x[permission, 1:] == 0)
+
+
+def test_quality_scores_do_not_reward_evidence_volume():
+    short_api = compute_api_quality(torch.tensor([1]), torch.tensor([1]), torch.tensor([1]))
+    long_api = compute_api_quality(torch.arange(100), torch.zeros(100), torch.zeros(100))
+    assert short_api == long_api == 1.0
+
+    small_x = torch.ones((1, 4))
+    large_x = torch.ones((100, 4))
+    small_graph = compute_graph_quality(torch.empty((2, 0), dtype=torch.long), 1, small_x)
+    large_edges = torch.stack([torch.arange(99), torch.arange(1, 100)])
+    large_graph = compute_graph_quality(large_edges, 100, large_x)
+    assert small_graph == large_graph == 1.0
+
+
+def test_manifest_quality_separates_parse_integrity_from_availability():
+    record = _manifest_record()
+    for key in (
+        "permissions",
+        "activities",
+        "services",
+        "receivers",
+        "providers",
+        "intent_actions",
+        "intent_categories",
+        "uses_features",
+    ):
+        record[key] = []
+    record["component_count"] = 0
+    vocab = build_manifest_vocab([record], max_permissions=8, max_intents=8, max_features=4)
+
+    empty = vectorize_manifest_record(record, vocab, manifest_dim=32)
+    assert empty["q_manifest"].item() == 1.0
+    assert empty["pert_manifest"].item() == 0.0
+
+    record["parse_error"] = "broken manifest"
+    failed = vectorize_manifest_record(record, vocab, manifest_dim=32)
+    assert failed["q_manifest"].item() == 0.0
+    assert failed["pert_manifest"].item() == 0.0
 
 
 def test_generated_payload_contract_validation():
@@ -1043,6 +1246,16 @@ def test_generated_payload_contract_validation():
     cfg = {"node_feature_dim": int(payload["node_x"].size(1))}
     job = {"sha256": payload["sid"]}
     _validate_payload_for_save(payload, cfg, job)
+    without_fingerprints = dict(payload)
+    for key in (
+        "aeg_schema_fingerprint",
+        "aeg_build_fingerprint",
+        "aeg_payload_contract_fingerprint",
+    ):
+        without_fingerprints.pop(key, None)
+    without_fingerprints["aeg_meta"] = dict(without_fingerprints["aeg_meta"])
+    without_fingerprints["aeg_meta"]["schema_fingerprint"] = "ignored"
+    _validate_payload_for_save(without_fingerprints, cfg, job)
     broken = dict(payload)
     broken["edge_quality"] = torch.empty((0,), dtype=torch.float32)
     with pytest.raises(ValueError, match="edge_quality"):
@@ -1147,54 +1360,6 @@ def test_package_name_overlap_across_splits_is_rejected(tmp_path: Path):
         _validate_split_isolation(train_ds, val_ds, check_package=True)
 
 
-def test_run_rejects_contrastive_batch_size_one(tmp_path: Path):
-    payload_train = _variant_payload("a" * 64, package_name="com.example.train", split="train")
-    payload_val = _variant_payload("b" * 64, package_name="com.example.val", split="val")
-    payload_test = _variant_payload("c" * 64, package_name="com.example.test", split="test")
-
-    train_dir, train_csv = _write_split(tmp_path, "train", [(payload_train, 1)])
-    val_dir, val_csv = _write_split(tmp_path, "val", [(payload_val, 0)])
-    test_dir, test_csv = _write_split(tmp_path, "test", [(payload_test, 1)])
-
-    cfg = {
-        "data": {
-            "strict_integrity": True,
-            "enforce_package_isolation": True,
-            "train": {"pt_dir": str(train_dir), "csv": str(train_csv)},
-            "val": {"pt_dir": str(val_dir), "csv": str(val_csv)},
-            "test": {"pt_dir": str(test_dir), "csv": str(test_csv)},
-        },
-        "train": {
-            "output_dir": str(tmp_path / "run_batch1"),
-            "batch_size": 1,
-            "eval_batch_size": 1,
-            "epochs": 1,
-            "patience": 1,
-            "num_workers": 0,
-            "device": "cpu",
-        },
-        "model": {
-            "node_input_dim": 32,
-            "hidden_dim": 16,
-            "layers": 1,
-            "num_latents": 2,
-            "dropout": 0.0,
-            "num_classes": 2,
-        },
-        "loss": {
-            "clean_degraded_contrast_weight": 0.1,
-            "source_degraded_contrast_weight": 0.0,
-            "cross_source_contrast_weight": 0.0,
-        },
-        "robust": {"train_aug": False},
-        "eval": {"robust_eval": False},
-    }
-
-    with pytest.raises(ValueError, match="batch_size >= 2"):
-        run(cfg)
-
-
-
 def test_run_writes_failed_metadata_before_early_validation_errors(tmp_path: Path):
     payload_train = _variant_payload("a" * 64, package_name="com.example.train", split="train")
     payload_val = _variant_payload("b" * 64, package_name="com.example.val", split="val")
@@ -1232,16 +1397,12 @@ def test_run_writes_failed_metadata_before_early_validation_errors(tmp_path: Pat
             "dropout": 0.0,
             "num_classes": 2,
         },
-        "loss": {
-            "clean_degraded_contrast_weight": 0.1,
-            "source_degraded_contrast_weight": 0.0,
-            "cross_source_contrast_weight": 0.0,
-        },
+        "loss": {"mode": "compact_kl"},
         "robust": {"train_aug": False},
         "eval": {"robust_eval": False},
     }
 
-    with pytest.raises(ValueError, match="batch_size >= 2"):
+    with pytest.raises(ValueError, match="requires robust.train_aug=true"):
         run(cfg, config_path=config_path)
 
     metadata = json.loads((output_dir / "experiment_metadata.json").read_text(encoding="utf-8"))
@@ -1249,7 +1410,7 @@ def test_run_writes_failed_metadata_before_early_validation_errors(tmp_path: Pat
     assert metadata["config_path"] == str(config_path.resolve())
     assert metadata["output_dir"] == str(output_dir.resolve())
     assert metadata["error"]["type"] == "ValueError"
-    assert "batch_size >= 2" in metadata["error"]["message"]
+    assert "requires robust.train_aug=true" in metadata["error"]["message"]
 
 
 
@@ -1296,11 +1457,7 @@ def test_run_writes_completed_metadata_and_outputs(tmp_path: Path, monkeypatch: 
             "dropout": 0.0,
             "num_classes": 2,
         },
-        "loss": {
-            "clean_degraded_contrast_weight": 0.0,
-            "source_degraded_contrast_weight": 0.0,
-            "cross_source_contrast_weight": 0.0,
-        },
+        "loss": {"mode": "ce_only"},
         "robust": {"train_aug": False},
         "eval": {"robust_eval": False},
     }
@@ -1399,11 +1556,7 @@ def test_run_rejects_zero_training_batches_with_drop_last(tmp_path: Path):
             "dropout": 0.0,
             "num_classes": 2,
         },
-        "loss": {
-            "clean_degraded_contrast_weight": 0.1,
-            "source_degraded_contrast_weight": 0.0,
-            "cross_source_contrast_weight": 0.0,
-        },
+        "loss": {"mode": "ce_only"},
         "robust": {"train_aug": False},
         "eval": {"robust_eval": False},
     }

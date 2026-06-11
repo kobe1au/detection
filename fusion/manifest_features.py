@@ -445,10 +445,7 @@ def vectorize_manifest_record(
         manifest_x = torch.cat([manifest_x, torch.zeros((manifest_dim - manifest_x.numel(),), dtype=torch.float32)])
 
     parse_error = str(record.get("parse_error") or "")
-    has_manifest = not parse_error and (
-        len(permissions) + len(intents) + len(features) + int(record.get("component_count", 0) or 0) > 0
-    )
-    coverage_values = []
+    parse_ok = not parse_error
     coverage_meta = {}
     for name, tokens, index in (
         ("permission", permissions, perm_index),
@@ -462,15 +459,9 @@ def vectorize_manifest_record(
             else 1.0
         )
         coverage_meta[f"{name}_vocab_coverage"] = float(coverage)
-        if unique_tokens:
-            coverage_values.append(float(coverage))
-    if has_manifest and coverage_values:
-        # Parser success contributes the base score. Vocabulary coverage
-        # modulates quality but must not mark a valid, OOV-heavy Manifest as
-        # unavailable.
-        q_manifest = 0.5 + 0.5 * (sum(coverage_values) / len(coverage_values))
-    else:
-        q_manifest = 1.0 if has_manifest else 0.0
+    # Reliability is extraction integrity, not vocabulary familiarity. Keep
+    # coverage as diagnostics, but do not let OOV patterns become a shortcut.
+    q_manifest = 1.0 if parse_ok else 0.0
 
     return {
         "manifest_x": manifest_x,
@@ -484,7 +475,9 @@ def vectorize_manifest_record(
         "manifest_intent_category_map": intent_category_map.float(),
         "manifest_stats": stats.float(),
         "q_manifest": torch.tensor([q_manifest], dtype=torch.float32),
-        "pert_manifest": torch.tensor([0.0 if has_manifest else 1.0], dtype=torch.float32),
+        # Natural absence or parse failure is not a synthetic perturbation.
+        # Availability and q_manifest carry those two cases separately.
+        "pert_manifest": torch.tensor([0.0], dtype=torch.float32),
         "manifest_meta": {
             "apk_name": record.get("apk_name", ""),
             "sha256": record.get("sha256", ""),

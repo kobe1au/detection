@@ -16,62 +16,59 @@ ALIASES = {
     "ours": "main/full_compact_kl_seed42.yaml",
     "full": "main/full_compact_kl_seed42.yaml",
     "final": "main/full_compact_kl_seed42.yaml",
-    "compact": "loss/compact_kl.yaml",
-    "compact_kl": "loss/compact_kl.yaml",
-    "plain_kl": "loss/plain_kl.yaml",
-    "ce_only": "loss/ce_only.yaml",
+    "compact": "main/full_compact_kl_seed42.yaml",
+    "compact_kl": "main/full_compact_kl_seed42.yaml",
+    "plain_kl": "stage3/full_plain_kl.yaml",
+    "ce_only": "stage2/full_fusion_ce.yaml",
+    "aeg_only": "stage1/aeg_only_ce.yaml",
+    "fusion": "stage2/full_fusion_ce.yaml",
 }
 
+STAGE1 = [
+    "stage1/api_only_ce.yaml",
+    "stage1/graph_only_ce.yaml",
+    "stage1/manifest_only_ce.yaml",
+    "stage1/aeg_only_ce.yaml",
+    "stage1/aeg_no_source_metadata_ce.yaml",
+    "stage1/aeg_no_relation_types_ce.yaml",
+    "stage1/aeg_no_quality_ce.yaml",
+    "stage1/aeg_no_alignment_ce.yaml",
+    "stage1/aeg_no_risk_ce.yaml",
+]
+STAGE2 = [
+    "stage2/latent_content_ce.yaml",
+    "stage2/latent_reliability_ce.yaml",
+    "stage2/latent_conflict_ce.yaml",
+    "stage2/latent_source_bias_ce.yaml",
+    "stage2/latent_no_reliability_ce.yaml",
+    "stage2/latent_no_conflict_ce.yaml",
+    "stage2/latent_no_source_bias_ce.yaml",
+    "stage2/full_fusion_ce.yaml",
+]
+STAGE3 = [
+    "stage2/full_fusion_ce.yaml",
+    "stage3/full_plain_kl.yaml",
+    "main/full_compact_kl_seed42.yaml",
+    "stage3/full_compact_kl_w002.yaml",
+    "stage3/full_compact_kl_w010.yaml",
+]
+FULL_SEEDS = [
+    "main/full_compact_kl_seed42.yaml",
+    "main/full_compact_kl_seed43.yaml",
+    "main/full_compact_kl_seed44.yaml",
+]
+
 GROUPS = {
-    "main": [
-        "main/full_compact_kl_seed42.yaml",
-    ],
-    "loss": [
-        "loss/ce_only.yaml",
-        "loss/plain_kl.yaml",
-        "loss/compact_kl.yaml",
-        "loss/compact_kl_w002.yaml",
-        "loss/compact_kl_w010.yaml",
-    ],
-    "r1_graph": [
-        "r1_graph/code_only.yaml",
-        "r1_graph/manifest_only.yaml",
-        "r1_graph/no_edge_source.yaml",
-        "r1_graph/no_node_quality.yaml",
-        "r1_graph/no_edge_quality.yaml",
-        "r1_graph/no_alignment.yaml",
-        "r1_graph/no_risk_nodes.yaml",
-    ],
-    "r3_fusion": [
-        "r3_fusion/no_reliability_bias.yaml",
-        "r3_fusion/no_conflict_bias.yaml",
-        "r3_fusion/mean_fusion.yaml",
-    ],
-    "full_seeds": [
-        "main/full_compact_kl_seed42.yaml",
-        "main/full_compact_kl_seed43.yaml",
-        "main/full_compact_kl_seed44.yaml",
-    ],
-    "all": [
-        "main/full_compact_kl_seed42.yaml",
-        "main/full_compact_kl_seed43.yaml",
-        "main/full_compact_kl_seed44.yaml",
-        "loss/ce_only.yaml",
-        "loss/plain_kl.yaml",
-        "loss/compact_kl.yaml",
-        "loss/compact_kl_w002.yaml",
-        "loss/compact_kl_w010.yaml",
-        "r1_graph/code_only.yaml",
-        "r1_graph/manifest_only.yaml",
-        "r1_graph/no_edge_source.yaml",
-        "r1_graph/no_node_quality.yaml",
-        "r1_graph/no_edge_quality.yaml",
-        "r1_graph/no_alignment.yaml",
-        "r1_graph/no_risk_nodes.yaml",
-        "r3_fusion/no_reliability_bias.yaml",
-        "r3_fusion/no_conflict_bias.yaml",
-        "r3_fusion/mean_fusion.yaml",
-    ],
+    "stage1": STAGE1,
+    "stage2": STAGE2,
+    "stage3": STAGE3,
+    "main": ["main/full_compact_kl_seed42.yaml"],
+    "full_seeds": FULL_SEEDS,
+    # Backward-compatible group names now follow the staged experiment plan.
+    "r1_graph": STAGE1,
+    "r3_fusion": STAGE2,
+    "loss": STAGE3,
+    "all": [*STAGE1, *STAGE2, *STAGE3, *FULL_SEEDS],
 }
 
 

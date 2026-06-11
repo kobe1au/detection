@@ -1,0 +1,17 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/stage1/graph_only_ce
+
+model:
+  # METHOD semantic categories are API-derived; remove them so this branch
+  # retains only structural method-call evidence.
+  masked_node_semantic_types:
+    - METHOD
+  masked_node_types:
+    - API_FAMILY
+    - PERMISSION
+    - INTENT
+    - COMPONENT
+    - RISK_SEMANTIC
+    - STRING_HINT

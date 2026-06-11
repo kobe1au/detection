@@ -71,8 +71,13 @@ def _masked_presence(mask: torch.Tensor, batch: torch.Tensor, num_graphs: int, r
         )
     return (out > 0).to(dtype=ref.dtype)
 
-def _masked_semantic_mean(data: Batch, mask: torch.Tensor, num_graphs: int) -> torch.Tensor:
-    sem = getattr(data, "node_semantic", None)
+def _masked_semantic_mean(
+    data: Batch,
+    mask: torch.Tensor,
+    num_graphs: int,
+    semantic: torch.Tensor | None = None,
+) -> torch.Tensor:
+    sem = semantic if isinstance(semantic, torch.Tensor) else getattr(data, "node_semantic", None)
     if not isinstance(sem, torch.Tensor) or sem.numel() == 0:
         return data.x.new_zeros((num_graphs, SEMANTIC_CATEGORY_DIM))
     return _masked_mean(sem.float(), mask, data.batch, num_graphs)
@@ -172,6 +177,7 @@ class LatentReliabilityFusion(nn.Module):
         conflict: torch.Tensor,
         token_source: torch.Tensor,
         token_conflict_sensitivity: torch.Tensor,
+        token_available: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, _, dim = tokens.shape
         query = self.q_proj(self.latents).unsqueeze(0).expand(bsz, -1, -1)
@@ -185,6 +191,14 @@ class LatentReliabilityFusion(nn.Module):
         scores = scores + self.source_bias_weight * source_bias
         conflict_sensitivity = token_conflict_sensitivity.to(device=scores.device, dtype=scores.dtype).view(1, 1, -1)
         scores = scores - self.conflict_bias_weight * conflict.view(-1, 1, 1) * conflict_sensitivity
+        available = token_available.to(device=scores.device).bool()
+        if available.ndim != 2 or available.shape != tokens.shape[:2]:
+            raise ValueError("token_available must have shape [batch, num_tokens]")
+        safe_available = available.clone()
+        no_available = ~safe_available.any(dim=-1)
+        if bool(no_available.any()):
+            safe_available[no_available, -1] = True
+        scores = scores.masked_fill(~safe_available.unsqueeze(1), torch.finfo(scores.dtype).min)
 
         attn = torch.softmax(scores, dim=-1)
         fused_latents = torch.einsum("bls,bsd->bld", attn, value)
@@ -214,6 +228,7 @@ class AEGModel(nn.Module):
         use_relation_types: bool = True,
         fusion_mode: str = "latent",
         masked_node_types: list[str | int] | tuple[str | int, ...] | None = None,
+        masked_node_semantic_types: list[str | int] | tuple[str | int, ...] | None = None,
         masked_edge_types: list[str | int] | tuple[str | int, ...] | None = None,
         allow_node_dim_adapt: bool = False,
     ) -> None:
@@ -225,7 +240,9 @@ class AEGModel(nn.Module):
         self.use_edge_quality = bool(use_edge_quality)
         self.allow_node_dim_adapt = bool(allow_node_dim_adapt)
         self.fusion_mode = str(fusion_mode or "latent").lower()
-        if self.fusion_mode not in {"latent", "mean_pool"}:
+        if self.fusion_mode == "mean_pool":
+            self.fusion_mode = "masked_mean"
+        if self.fusion_mode not in {"latent", "masked_mean"}:
             raise ValueError(f"Unsupported fusion_mode: {fusion_mode!r}")
         masked_node_ids = torch.tensor(
             _resolve_type_ids(masked_node_types, NODE_TYPES, kind="node"),
@@ -235,7 +252,12 @@ class AEGModel(nn.Module):
             _resolve_type_ids(masked_edge_types, EDGE_TYPES, kind="edge"),
             dtype=torch.long,
         )
+        masked_node_semantic_ids = torch.tensor(
+            _resolve_type_ids(masked_node_semantic_types, NODE_TYPES, kind="node semantic"),
+            dtype=torch.long,
+        )
         self.register_buffer("masked_node_type_ids", masked_node_ids, persistent=False)
+        self.register_buffer("masked_node_semantic_type_ids", masked_node_semantic_ids, persistent=False)
         self.register_buffer("masked_edge_type_ids", masked_edge_ids, persistent=False)
         self.input_proj = nn.Linear(int(node_input_dim), hidden_dim)
         self.node_type_emb = nn.Embedding(NUM_NODE_TYPES, hidden_dim)
@@ -286,7 +308,15 @@ class AEGModel(nn.Module):
             edge_quality = torch.where(mask, torch.zeros_like(edge_quality), edge_quality)
         return edge_quality
 
-    def _initial_node_state(self, data: Batch) -> torch.Tensor:
+    def _effective_node_semantic(self, data: Batch) -> torch.Tensor:
+        semantic = data.node_semantic.float()
+        if self.masked_node_semantic_type_ids.numel() > 0:
+            masked_ids = self.masked_node_semantic_type_ids.to(device=data.x.device)
+            mask = torch.isin(data.node_type.long().to(data.x.device), masked_ids).view(-1, 1)
+            semantic = torch.where(mask, torch.zeros_like(semantic), semantic)
+        return semantic
+
+    def _initial_node_state(self, data: Batch, semantic: torch.Tensor) -> torch.Tensor:
         x = data.x.float()
         if x.size(1) != self.input_proj.in_features:
             if not self.allow_node_dim_adapt:
@@ -303,7 +333,6 @@ class AEGModel(nn.Module):
         node_type = data.node_type.long().clamp(0, NUM_NODE_TYPES - 1)
         node_source = data.node_source.long().clamp(0, NUM_SOURCE_TYPES - 1)
         quality = self._effective_node_quality(data)
-        semantic = data.node_semantic.float()
         h = self.input_proj(x) + self.semantic_proj(semantic)
         if self.use_node_types:
             h = h + self.node_type_emb(node_type)
@@ -318,7 +347,8 @@ class AEGModel(nn.Module):
         if not hasattr(data, "batch"):
             data.batch = data.x.new_zeros((data.x.size(0),), dtype=torch.long)
         num_graphs = _batch_size(data)
-        h = self._initial_node_state(data)
+        node_semantic = self._effective_node_semantic(data)
+        h = self._initial_node_state(data, node_semantic)
         edge_type = data.edge_type.long().to(data.x.device)
         edge_quality = self._effective_edge_quality(data)
         edge_source = data.edge_source.long().to(data.x.device)
@@ -361,12 +391,11 @@ class AEGModel(nn.Module):
         component_emb = _masked_mean(h, component_nodes, data.batch, num_graphs)
         risk_emb = _masked_mean(h, risk_nodes, data.batch, num_graphs)
         string_hint_emb = _masked_mean(h, string_hint_nodes, data.batch, num_graphs)
-        global_emb = _masked_mean(h, node_alive_mask, data.batch, num_graphs)
         code_emb = 0.5 * (method_emb + api_family_emb)
         manifest_emb = 0.5 * (permission_emb + component_emb)
 
-        code_sem = _masked_semantic_mean(data, source_code, num_graphs)
-        manifest_sem = _masked_semantic_mean(data, source_manifest, num_graphs)
+        code_sem = _masked_semantic_mean(data, source_code, num_graphs, node_semantic)
+        manifest_sem = _masked_semantic_mean(data, source_manifest, num_graphs, node_semantic)
         sim = F.cosine_similarity(code_sem, manifest_sem, dim=-1).clamp(0.0, 1.0)
         both_semantic_available = (
             (code_sem.norm(dim=-1) > 1e-8)
@@ -386,19 +415,16 @@ class AEGModel(nn.Module):
         r_api = q_api.clamp(0.0, 1.0) * (1.0 - pert_api)
         r_graph = q_graph.clamp(0.0, 1.0) * (1.0 - pert_graph)
         r_manifest = q_manifest.clamp(0.0, 1.0) * (1.0 - pert_manifest)
-        # q_align is a soft correspondence-quality cue, not proof that API and
-        # graph semantics must agree. It therefore modulates rather than gates
-        # the code-side reliability.
-
-        product = r_api.clamp_min(0.0) * r_graph.clamp_min(0.0)
-        code_rel_nonzero = (
-            product.clamp_min(1e-12).sqrt()
-            * (0.5 + 0.5 * q_align.clamp(0.0, 1.0))
-        )
+        # API and graph are complementary code evidence, not a strict pair.
+        # Average only available branches so one missing branch does not erase
+        # reliability carried by the other. Alignment remains explicit graph
+        # evidence and does not silently leak into a no-alignment ablation.
+        code_rel_numerator = r_graph * method_avail + r_api * api_family_avail
+        code_rel_denominator = method_avail + api_family_avail
         raw_code_rel = torch.where(
-            product > 0,
-            code_rel_nonzero,
-            torch.zeros_like(code_rel_nonzero),
+            code_rel_denominator > 0,
+            code_rel_numerator / code_rel_denominator.clamp_min(1.0),
+            torch.zeros_like(code_rel_numerator),
         ).clamp(0.0, 1.0)
 
         code_rel = (raw_code_rel * code_avail).clamp(0.0, 1.0)
@@ -411,8 +437,7 @@ class AEGModel(nn.Module):
             num_graphs,
         ).view(-1)
 
-        global_rel = torch.stack([code_rel, manifest_rel], dim=-1).amax(dim=-1)
-        token_rel = torch.stack(
+        base_token_rel = torch.stack(
             [
                 r_graph * method_avail,
                 r_api * api_family_avail,
@@ -420,14 +445,38 @@ class AEGModel(nn.Module):
                 manifest_rel * component_avail,
                 risk_rel * risk_avail,
                 r_api * string_hint_avail,
-                global_rel,
             ],
             dim=-1,
         ).clamp(0.0, 1.0)
-        tokens = torch.stack(
-            [method_emb, api_family_emb, permission_emb, component_emb, risk_emb, string_hint_emb, global_emb],
+        base_token_available = torch.stack(
+            [
+                method_avail,
+                api_family_avail,
+                permission_avail,
+                component_avail,
+                risk_avail,
+                string_hint_avail,
+            ],
+            dim=-1,
+        )
+        base_tokens = torch.stack(
+            [method_emb, api_family_emb, permission_emb, component_emb, risk_emb, string_hint_emb],
             dim=1,
         )
+        # Keep global content neutral so reliability-only/no-reliability
+        # ablations differ only through the explicit attention bias. Reliability
+        # is carried separately by global_rel.
+        global_weight = base_token_available
+        global_emb = (base_tokens * global_weight.unsqueeze(-1)).sum(dim=1) / global_weight.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1.0)
+        global_avail = base_token_available.amax(dim=-1)
+        global_rel = (base_token_rel * base_token_available).sum(dim=-1) / base_token_available.sum(
+            dim=-1
+        ).clamp_min(1.0)
+        tokens = torch.cat([base_tokens, global_emb.unsqueeze(1)], dim=1)
+        token_rel = torch.cat([(base_token_rel * base_token_available), (global_rel * global_avail).unsqueeze(-1)], dim=-1)
+        token_available = torch.cat([base_token_available, global_avail.unsqueeze(-1)], dim=-1)
         token_source = torch.tensor(
             [
                 SOURCE_TYPES["code"],
@@ -441,16 +490,21 @@ class AEGModel(nn.Module):
             dtype=torch.long,
             device=data.x.device,
         )
-        # Direct Manifest tokens are fully conflict-sensitive. Mixed derived
-        # tokens are only softly suppressed because they may also contain
-        # valid code-side evidence.
+        # The neutral global token is fully conflict-sensitive so
+        # it cannot become a bypass for polluted Manifest evidence.
         token_conflict_sensitivity = torch.tensor(
-            [0.0, 0.0, 1.0, 1.0, 0.5, 0.0, 0.25],
+            [0.0, 0.0, 1.0, 1.0, 0.5, 0.0, 1.0],
             device=data.x.device,
         )
-        if self.fusion_mode == "mean_pool":
-            fused = tokens.mean(dim=1)
-            attention_mass = tokens.new_full((num_graphs, tokens.size(1)), 1.0 / tokens.size(1))
+        if self.fusion_mode == "masked_mean":
+            # Innovation-1 baseline: neutral pooling over observable evidence,
+            # without reliability, conflict, source bias, or a global shortcut.
+            masked = base_token_available.unsqueeze(-1)
+            fused = (base_tokens * masked).sum(dim=1) / masked.sum(dim=1).clamp_min(1.0)
+            attention_mass = tokens.new_zeros((num_graphs, tokens.size(1)))
+            attention_mass[:, : base_tokens.size(1)] = base_token_available / base_token_available.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0)
         else:
             fused, attention_mass = self.fusion(
                 tokens,
@@ -458,6 +512,7 @@ class AEGModel(nn.Module):
                 conflict,
                 token_source,
                 token_conflict_sensitivity,
+                token_available,
             )
         logits = self.classifier(fused)
         effective_view = _graph_scalar(data, "effective_view_type_id", 0.0)
@@ -519,6 +574,7 @@ def build_model(cfg: dict[str, Any], node_input_dim: int) -> AEGModel:
         use_relation_types=bool(model_cfg.get("use_relation_types", True)),
         fusion_mode=str(model_cfg.get("fusion_mode", "latent")),
         masked_node_types=model_cfg.get("masked_node_types"),
+        masked_node_semantic_types=model_cfg.get("masked_node_semantic_types"),
         masked_edge_types=model_cfg.get("masked_edge_types"),
         allow_node_dim_adapt=bool(model_cfg.get("allow_node_dim_adapt", False)),
     )

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 
 from fusion.constants import QualityConstants
@@ -21,28 +19,10 @@ def compute_api_quality(
     if n <= 0:
         return 0.0
 
-    count_score = min(1.0, n / QualityConstants.API_COUNT_NORM)
-    diversity_score = min(
-        1.0,
-        float(api_ids.unique().numel()) / max(n, 1) * QualityConstants.API_DIVERSITY_SCALE,
-    )
-
-    if isinstance(api_in_graph_mask, torch.Tensor) and api_in_graph_mask.numel() == n:
-        coverage_score = float(api_in_graph_mask.float().view(-1).mean().item())
-    else:
-        coverage_score = 0.0
-
-    if isinstance(api_type_ids, torch.Tensor) and api_type_ids.numel() == n:
-        type_score = float((api_type_ids.long().view(-1) > 0).float().mean().item())
-    else:
-        type_score = 0.0
-
-    return clamp01(
-        QualityConstants.API_COUNT_WEIGHT * count_score
-        + QualityConstants.API_DIVERSITY_WEIGHT * diversity_score
-        + QualityConstants.API_COVERAGE_WEIGHT * coverage_score
-        + QualityConstants.API_TYPE_WEIGHT * type_score
-    )
+    # Quality must describe extraction integrity, not behavior richness. Counts,
+    # diversity, graph coverage, and taxonomy coverage are evidence/alignment
+    # signals and can be class-correlated, so they must not enter reliability.
+    return 1.0
 
 
 def compute_graph_quality(edge_index, num_nodes: int, node_features=None, real_node_mask=None) -> float:
@@ -55,13 +35,14 @@ def compute_graph_quality(edge_index, num_nodes: int, node_features=None, real_n
     if num_nodes <= 0:
         return 0.0
 
+    structure_score = 0.0
     if isinstance(edge_index, torch.Tensor) and edge_index.ndim == 2 and edge_index.size(0) == 2:
-        num_edges = int(edge_index.size(1))
-    else:
-        num_edges = 0
+        if edge_index.numel() == 0:
+            structure_score = 1.0
+        else:
+            endpoints = edge_index.long().view(-1)
+            structure_score = float(((endpoints >= 0) & (endpoints < num_nodes)).float().mean().item())
 
-    node_score = 1.0 - math.exp(-num_nodes / QualityConstants.GRAPH_NODE_NORM)
-    edge_score = 1.0 - math.exp(-num_edges / max(num_nodes, 1))
     feature_score = 1.0
     if isinstance(node_features, torch.Tensor) and node_features.ndim == 2:
         if isinstance(real_node_mask, torch.Tensor) and real_node_mask.numel() == node_features.size(0):
@@ -72,12 +53,10 @@ def compute_graph_quality(edge_index, num_nodes: int, node_features=None, real_n
             feature_score = 0.0
         else:
             finite_rows = torch.isfinite(real).all(dim=1)
-            active_rows = real.abs().sum(dim=1) > 1e-8
-            feature_score = float((finite_rows & active_rows).float().mean().item())
+            feature_score = float(finite_rows.float().mean().item())
 
     return clamp01(
-        QualityConstants.GRAPH_NODE_WEIGHT * node_score
-        + QualityConstants.GRAPH_EDGE_WEIGHT * edge_score
+        QualityConstants.GRAPH_STRUCTURE_WEIGHT * structure_score
         + QualityConstants.GRAPH_FEATURE_WEIGHT * feature_score
     )
 
@@ -155,12 +134,7 @@ def compute_manifest_quality(
     manifest_stats=None,
     manifest_meta=None,
 ) -> float:
-    """Estimate extraction integrity, without rewarding feature richness.
-
-    A feature-rich Manifest is not inherently higher quality or more
-    malicious. New PT files therefore store parser/vocabulary coverage
-    metadata and use it here. Legacy files fall back to binary availability.
-    """
+    """Estimate extraction integrity without rewarding feature richness."""
     meta = manifest_meta if isinstance(manifest_meta, dict) else {}
     if meta.get("parse_error"):
         return 0.0

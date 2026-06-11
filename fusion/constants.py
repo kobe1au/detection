@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-AEG_SCHEMA_VERSION = 6
+AEG_SCHEMA_VERSION = 7
 AEG_EXTRACTION_PIPELINE_VERSION = 1
 AEG_PAYLOAD_CONTRACT_VERSION = 1
 
@@ -107,24 +107,15 @@ STRING_HINT_KEYWORDS = {
 
 
 class QualityConstants:
-    """Heuristic quality normalizers used when building AEG records.
+    """Integrity-quality weights used when building AEG records.
 
     These values describe extraction integrity, not maliciousness. They are
     intentionally conservative because the downstream model should learn from
     typed evidence, not from inflated quality shortcuts.
     """
 
-    API_COUNT_NORM = 200.0
-    API_DIVERSITY_SCALE = 4.0
-    API_COUNT_WEIGHT = 0.35
-    API_DIVERSITY_WEIGHT = 0.20
-    API_COVERAGE_WEIGHT = 0.25
-    API_TYPE_WEIGHT = 0.20
-
-    GRAPH_NODE_NORM = 120.0
-    GRAPH_NODE_WEIGHT = 0.35
-    GRAPH_EDGE_WEIGHT = 0.35
-    GRAPH_FEATURE_WEIGHT = 0.30
+    GRAPH_STRUCTURE_WEIGHT = 0.50
+    GRAPH_FEATURE_WEIGHT = 0.50
 
     ALIGN_NODE_COVER_WEIGHT = 0.50
     ALIGN_API_COVER_WEIGHT = 0.50
@@ -147,10 +138,7 @@ AEG_SCHEMA_TABLE_FINGERPRINT = stable_table_hash(AEG_SCHEMA_TABLES)
 
 AEG_REQUIRED_PAYLOAD_FIELDS = (
     "schema_version",
-    "aeg_schema_fingerprint",
-    "aeg_build_fingerprint",
     "aeg_payload_contract_version",
-    "aeg_payload_contract_fingerprint",
     "aeg_meta",
     "sid",
     "sha256",

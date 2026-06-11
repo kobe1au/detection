@@ -1,0 +1,9 @@
+base: ../base.yaml
+
+train:
+  output_dir: results/aeg_robust/stage2/latent_no_reliability_ce
+
+model:
+  fusion_mode: latent
+  conflict_bias_weight: 0.5
+  source_bias_weight: 1.0

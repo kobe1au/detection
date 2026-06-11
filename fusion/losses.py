@@ -52,7 +52,10 @@ def _weighted_symmetric_kl(
 
     weight = weight.clamp(0.0, 1.0)
 
-    return (per_sample * weight).sum() / weight.sum().clamp_min(1.0)
+    # Divide by batch size so reliability/counterfactual weights control the
+    # absolute strength of the consistency constraint instead of merely
+    # reweighting samples relative to one another.
+    return (per_sample * weight).mean()
 
 
 def _extra_vector(
@@ -81,6 +84,19 @@ def _view_tensor(names: list[str], ref: torch.Tensor) -> torch.Tensor:
         return torch.empty((0,), device=ref.device, dtype=torch.long)
 
     return torch.tensor(values, device=ref.device, dtype=torch.long)
+
+
+def _actual_augmentation_weight(
+    aug_extra: dict[str, torch.Tensor],
+    ref: torch.Tensor,
+) -> torch.Tensor:
+    view = aug_extra.get("view_type_id")
+    if not isinstance(view, torch.Tensor):
+        return ref.new_ones((ref.size(0),))
+    view = view.to(device=ref.device).view(-1).long()
+    if view.numel() != ref.size(0):
+        return ref.new_ones((ref.size(0),))
+    return (view != VIEW_TYPES["clean"]).to(dtype=ref.dtype)
 
 
 def _consistency_weight(
@@ -113,8 +129,12 @@ def _consistency_weight(
     if view.numel() != ref.size(0):
         return base
 
-    code_rel = _extra_vector(clean_extra, "code_reliability", ref, 1.0).clamp(0.0, 1.0)
-    manifest_rel = _extra_vector(clean_extra, "manifest_reliability", ref, 1.0).clamp(0.0, 1.0)
+    clean_code_rel = _extra_vector(clean_extra, "code_reliability", ref, 1.0).clamp(0.0, 1.0)
+    clean_manifest_rel = _extra_vector(clean_extra, "manifest_reliability", ref, 1.0).clamp(0.0, 1.0)
+    aug_code_rel = _extra_vector(aug_extra, "code_reliability", ref, 1.0).clamp(0.0, 1.0)
+    aug_manifest_rel = _extra_vector(aug_extra, "manifest_reliability", ref, 1.0).clamp(0.0, 1.0)
+    surviving_code_rel = torch.minimum(clean_code_rel, aug_code_rel)
+    surviving_manifest_rel = torch.minimum(clean_manifest_rel, aug_manifest_rel)
 
     conditional = torch.ones_like(base)
 
@@ -144,18 +164,19 @@ def _consistency_weight(
 
     if manifest_views.numel() > 0:
         manifest_mask = torch.isin(view, manifest_views)
-        # Manifest 被扰动时，一致性约束主要依赖 clean view 的 code reliability。
-        conditional = torch.where(manifest_mask, code_rel, conditional)
+        # Manifest 被扰动时，一致性约束依赖两视图中存活的 code reliability。
+        conditional = torch.where(manifest_mask, surviving_code_rel, conditional)
 
     if code_views.numel() > 0:
         code_mask = torch.isin(view, code_views)
-        # Code/API/graph 被扰动时，一致性约束主要依赖 clean view 的 manifest reliability。
-        conditional = torch.where(code_mask, manifest_rel, conditional)
+        # Code/API/graph 被扰动时，一致性约束依赖两视图中存活的 Manifest reliability。
+        conditional = torch.where(code_mask, surviving_manifest_rel, conditional)
 
     if "all_degraded" in VIEW_TYPES:
         all_mask = view == VIEW_TYPES["all_degraded"]
         # 全部退化时，两侧都可靠才强约束。
-        conditional = torch.where(all_mask, torch.minimum(code_rel, manifest_rel), conditional)
+        all_rel = torch.minimum(surviving_code_rel, surviving_manifest_rel)
+        conditional = torch.where(all_mask, all_rel, conditional)
 
     return (base * conditional).clamp(0.0, 1.0)
 
@@ -214,7 +235,9 @@ def compute_aeg_loss(
             aug_ce = F.cross_entropy(aug_logits, labels)
 
         if mode == "plain_kl":
-            weight = clean_logits.new_ones((clean_logits.size(0),))
+            # Plain-KL treats every actual degraded view equally, but skips the
+            # clean fallback when no augmentation was sampled.
+            weight = _actual_augmentation_weight(aug_extra, clean_logits)
             consistency = _weighted_symmetric_kl(clean_logits, aug_logits, weight)
 
         elif mode == "compact_kl":
